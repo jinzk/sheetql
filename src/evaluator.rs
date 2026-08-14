@@ -96,22 +96,44 @@ pub fn eval_expr(
             negated,
             expr,
             pattern,
+            escape_char,
             ..
         } => {
             let value = eval_expr(ctx, expr, current)?;
             let pattern = eval_expr(ctx, pattern, current)?;
-            let matched = like_values(&value, &pattern, false)?;
+            if value.is_null() || pattern.is_null() {
+                return Ok(Value::Null);
+            }
+            let escape = match escape_char {
+                Some(v) => match eval_sql_value(&v.value) {
+                    Ok(Value::Text(s)) => s.chars().next(),
+                    _ => None,
+                },
+                None => None,
+            };
+            let matched = like_values(&value, &pattern, false, escape)?;
             Ok(Value::Bool(if *negated { !matched } else { matched }))
         }
         Expr::ILike {
             negated,
             expr,
             pattern,
+            escape_char,
             ..
         } => {
             let value = eval_expr(ctx, expr, current)?;
             let pattern = eval_expr(ctx, pattern, current)?;
-            let matched = like_values(&value, &pattern, true)?;
+            if value.is_null() || pattern.is_null() {
+                return Ok(Value::Null);
+            }
+            let escape = match escape_char {
+                Some(v) => match eval_sql_value(&v.value) {
+                    Ok(Value::Text(s)) => s.chars().next(),
+                    _ => None,
+                },
+                None => None,
+            };
+            let matched = like_values(&value, &pattern, true, escape)?;
             Ok(Value::Bool(if *negated { !matched } else { matched }))
         }
         Expr::Case {
@@ -482,48 +504,70 @@ fn trim_string(value: &str, side: TrimWhereField, what: Option<&str>) -> String 
     }
 }
 
-fn like_values(value: &Value, pattern: &Value, case_insensitive: bool) -> Result<bool, String> {
+fn like_values(value: &Value, pattern: &Value, case_insensitive: bool, escape: Option<char>) -> Result<bool, String> {
     if value.is_null() || pattern.is_null() {
         return Ok(false);
     }
     let text = value.to_display_string();
     let pattern_text = pattern.to_display_string();
-    Ok(like_match(&text, &pattern_text, case_insensitive))
+    Ok(like_match(&text, &pattern_text, case_insensitive, escape))
 }
 
-pub fn like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Option<char>) -> bool {
     let text: Vec<char> = if case_insensitive {
         text.to_lowercase().chars().collect()
     } else {
         text.chars().collect()
     };
-    let pattern: Vec<char> = if case_insensitive {
-        pattern.to_lowercase().chars().collect()
+    let pattern_norm: String = if case_insensitive {
+        pattern.to_lowercase()
     } else {
-        pattern.chars().collect()
+        pattern.to_string()
     };
 
-    let mut dp = vec![vec![false; pattern.len() + 1]; text.len() + 1];
+    enum Token {
+        Percent,
+        Underscore,
+        Literal(char),
+    }
+
+    let mut tokens: Vec<Token> = Vec::new();
+    let mut chars = pattern_norm.chars().peekable();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            if let Some(next) = chars.next() {
+                tokens.push(Token::Literal(next));
+            }
+            // A trailing escape character with nothing after it is ignored.
+        } else if c == '%' {
+            tokens.push(Token::Percent);
+        } else if c == '_' {
+            tokens.push(Token::Underscore);
+        } else {
+            tokens.push(Token::Literal(c));
+        }
+    }
+
+    let n = tokens.len();
+    let mut dp = vec![vec![false; n + 1]; text.len() + 1];
     dp[0][0] = true;
-    for j in 0..pattern.len() {
-        if pattern[j] == '%' {
+    for j in 0..n {
+        if matches!(tokens[j], Token::Percent) {
             dp[0][j + 1] = dp[0][j];
         }
     }
 
     for i in 0..text.len() {
-        for j in 0..pattern.len() {
-            if pattern[j] == '%' {
-                dp[i + 1][j + 1] = dp[i + 1][j] || dp[i][j + 1];
-            } else if pattern[j] == '_' {
-                dp[i + 1][j + 1] = dp[i][j];
-            } else {
-                dp[i + 1][j + 1] = dp[i][j] && text[i] == pattern[j];
+        for j in 0..n {
+            match tokens[j] {
+                Token::Percent => dp[i + 1][j + 1] = dp[i + 1][j] || dp[i][j + 1],
+                Token::Underscore => dp[i + 1][j + 1] = dp[i][j],
+                Token::Literal(ch) => dp[i + 1][j + 1] = dp[i][j] && text[i] == ch,
             }
         }
     }
 
-    dp[text.len()][pattern.len()]
+    dp[text.len()][n]
 }
 
 fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {

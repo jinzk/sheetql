@@ -1,4 +1,4 @@
-<h1 align="center">Sheetql - Spreadsheet Query Language</h1></br>
+<h1 align="center">SheetQL - Spreadsheet Query Language</h1></br>
 
 <p align="center">
 Sheetql is a tool that allows you to run SQL-like queries on <code>xls</code>, <code>xlsx</code> and <code>csv</code> files.
@@ -22,8 +22,8 @@ cargo build
 ### Usage
 
 ```
-Sheetql is a SQL like query language to run on xls, xlsx and csv files
-Usage: Sheetql [OPTIONS]
+SheetQL is a SQL like query language to run on xls, xlsx and csv files
+Usage: sheetql [OPTIONS]
 
 Options:
   -f,  --files <paths>        Paths to xls/xlsx/csv files to query
@@ -39,17 +39,17 @@ Options:
 
 Option details:
 
-| Option | Description |
-| ------ | ----------- |
-| `-f, --files` | One or more paths to `xls` / `xlsx` / `xlsm` / `csv` files. Pass multiple files separated by spaces. |
-| `-q, --query` | Run a single query and exit. Without it, Sheetql starts an interactive REPL. |
-| `-p, --pagination` | Print large results page by page (table format only). |
-| `-ps, --pagesize` | Number of rows per page when `-p` is enabled. Defaults to `10`. |
-| `-o, --output` | Output format: `render` (default), `json`, `csv`, `yaml`. |
-| `-s, --save` | Write the `--query` result to `<path>` as CSV. Only valid with `--query` (REPL prints an error). |
-| `-a, --analysis` | Print the row count and execution time after the result. |
-| `-h, --help` | Print help. |
-| `-v, --version` | Print the current version. |
+| Option               | Description                                                                                                 |
+| -------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `-f, --files`      | One or more paths to`xls` / `xlsx` / `xlsm` / `csv` files. Pass multiple files separated by spaces. |
+| `-q, --query`      | Run a single query and exit. Without it, Sheetql starts an interactive REPL.                                |
+| `-p, --pagination` | Print large results page by page (table format only).                                                       |
+| `-ps, --pagesize`  | Number of rows per page when`-p` is enabled. Defaults to `10`.                                          |
+| `-o, --output`     | Output format:`render` (default), `json`, `csv`, `yaml`.                                            |
+| `-s, --save`       | Write the`--query` result to `<path>` as CSV. Only valid with `--query` (REPL prints an error).       |
+| `-a, --analysis`   | Print the row count and execution time after the result.                                                    |
+| `-h, --help`       | Print help.                                                                                                 |
+| `-v, --version`    | Print the current version.                                                                                  |
 
 Run a single query:
 
@@ -83,12 +83,12 @@ data/report.xlsx   (sheets: "Sales", "Sheet 2")
 
 Each file is loaded as one database; each sheet (or a single CSV) is a table inside that database:
 
-| File               | Sheet   | Database            | Table     |
-| ------------------ | ------- | ------------------- | --------- |
-| `data/sales.csv`   | -       | `data_sales_csv`    | `sales`   |
-| `data/customers.csv` | -     | `data_customers_csv` | `customers` |
-| `data/report.xlsx` | Sales   | `data_report_xlsx`  | `sales`   |
-| `data/report.xlsx` | Sheet 2 | `data_report_xlsx`  | `sheet_2` |
+| File                   | Sheet   | Database               | Table         |
+| ---------------------- | ------- | ---------------------- | ------------- |
+| `data/sales.csv`     | -       | `data_sales_csv`     | `sales`     |
+| `data/customers.csv` | -       | `data_customers_csv` | `customers` |
+| `data/report.xlsx`   | Sales   | `data_report_xlsx`   | `sales`     |
+| `data/report.xlsx`   | Sheet 2 | `data_report_xlsx`   | `sheet_2`   |
 
 Sample queries:
 
@@ -120,11 +120,11 @@ All keywords and identifiers are case-insensitive, similar to SQL.
 
 Each file becomes a database whose name is the sanitized full path (as given, including the extension), lowercased. Inside a database, a CSV has one table named after the file stem; a spreadsheet has one table per sheet, named after the sheet.
 
-| Input                      | Database              | Table                   |
-| -------------------------- | --------------------- | ----------------------- |
-| `data/sales.csv`           | `data_sales_csv`      | `sales`                 |
-| `C:\data\sales.csv`        | `c__data_sales_csv`   | `sales`                 |
-| `data/report.xlsx` (Sales) | `data_report_xlsx`    | `sales`                 |
+| Input                        | Database              | Table     |
+| ---------------------------- | --------------------- | --------- |
+| `data/sales.csv`           | `data_sales_csv`    | `sales` |
+| `C:\data\sales.csv`        | `c__data_sales_csv` | `sales` |
+| `data/report.xlsx` (Sales) | `data_report_xlsx`  | `sales` |
 
 Rules:
 
@@ -156,10 +156,10 @@ Cell values are inferred automatically. CSV cells are parsed as `Integer`, `Floa
 
 | Type    | Examples            |
 | ------- | ------------------- |
-| Integer | `42`, `-7`          |
-| Float   | `3.14`, `1.5e3`     |
-| Boolean | `true`, `false`     |
-| Text    | `Alice`, `NY`       |
+| Integer | `42`, `-7`      |
+| Float   | `3.14`, `1.5e3` |
+| Boolean | `true`, `false` |
+| Text    | `Alice`, `NY`   |
 | NULL    | empty cells         |
 
 `DESCRIBE <table>` shows each column with its inferred type.
@@ -170,7 +170,7 @@ Cell values are inferred automatically. CSV cells are parsed as `Integer`, `Floa
 
 - `SELECT` projections, `*`, `table.*` and column aliases (`AS`)
 - `FROM` with multiple tables and `JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN`, including comma-separated tables, with `ON` and `USING`
-- `WHERE` with comparisons, `AND` / `OR` / `NOT`, `LIKE` / `ILIKE`, `IN`, `BETWEEN`, `IS NULL`, `IS TRUE` / `IS FALSE`, `CASE`, `CAST`
+- `WHERE` with comparisons, `AND` / `OR` / `NOT`, `LIKE` / `ILIKE`, `IN`, `BETWEEN`, `IS NULL`, `IS TRUE` / `IS FALSE`, `CASE`, `CAST`. `LIKE` / `ILIKE` support `%` (any sequence) and `_` (single char) wildcards plus an optional `ESCAPE '<char>'` clause; a `NULL` operand yields `NULL` (not `false`).
 - `GROUP BY` with aggregate functions, and `HAVING`
 - `ORDER BY` with `ASC` / `DESC`
 - `LIMIT` / `OFFSET` and `SELECT DISTINCT`
@@ -180,43 +180,43 @@ Not yet supported: subqueries, `UNION` / set operations, window functions, `INSE
 
 ### Scalar functions
 
-| Function | Arguments | Description |
-| -------- | --------- | ----------- |
-| `LEN` / `LENGTH` | 1 | Length of a text value |
-| `LOWER` / `LCASE` | 1 | Convert to lowercase |
-| `UPPER` / `UCASE` | 1 | Convert to uppercase |
-| `TRIM` | 1 | Trim leading and trailing whitespace |
-| `CONCAT` | 2+ | Concatenate values |
-| `SUBSTRING` / `SUBSTR` | 2 or 3 | Extract a substring (`text, start[, length]`, 1-based) |
-| `REPLACE` | 3 | Replace occurrences of a substring |
-| `LEFT` | 2 | First `n` characters of a text value |
-| `RIGHT` | 2 | Last `n` characters of a text value |
-| `INSTR` | 2 | 1-based position of a substring (0 if not found) |
-| `STARTSWITH` / `ENDSWITH` | 2 | Whether text starts/ends with the given prefix/suffix (returns boolean) |
-| `SPLIT` | 3 | Split text by a separator and return the n-th part (1-based; `NULL` if out of range) |
-| `ABS` | 1 | Absolute value |
-| `ROUND` | 1 or 2 | Round a number, optionally to `n` decimal places |
-| `FLOOR` | 1 | Round down |
-| `CEIL` / `CEILING` | 1 | Round up |
-| `MOD` | 2 | Remainder of integer division |
-| `POWER` / `POW` | 2 | Raise a number to a power |
-| `SQRT` | 1 | Square root |
-| `GREATEST` | 2+ | Largest value among arguments |
-| `LEAST` | 2+ | Smallest value among arguments |
-| `NOW` / `CURRENT_TIMESTAMP` | 0 | Current local date and time |
-| `DATE` | 0 or 1 | Current date, or the date part of a value |
-| `IFNULL` / `ISNULL` | 2 | First value if not `NULL`, otherwise the second |
-| `COALESCE` | 2+ | First non-`NULL` value |
+| Function                        | Arguments | Description                                                                           |
+| ------------------------------- | --------- | ------------------------------------------------------------------------------------- |
+| `LEN` / `LENGTH`            | 1         | Length of a text value                                                                |
+| `LOWER` / `LCASE`           | 1         | Convert to lowercase                                                                  |
+| `UPPER` / `UCASE`           | 1         | Convert to uppercase                                                                  |
+| `TRIM`                        | 1         | Trim leading and trailing whitespace                                                  |
+| `CONCAT`                      | 2+        | Concatenate values                                                                    |
+| `SUBSTRING` / `SUBSTR`      | 2 or 3    | Extract a substring (`text, start[, length]`, 1-based)                              |
+| `REPLACE`                     | 3         | Replace occurrences of a substring                                                    |
+| `LEFT`                        | 2         | First`n` characters of a text value                                                 |
+| `RIGHT`                       | 2         | Last`n` characters of a text value                                                  |
+| `INSTR`                       | 2         | 1-based position of a substring (0 if not found)                                      |
+| `STARTSWITH` / `ENDSWITH`   | 2         | Whether text starts/ends with the given prefix/suffix (returns boolean)               |
+| `SPLIT`                       | 3         | Split text by a separator and return the n-th part (1-based;`NULL` if out of range) |
+| `ABS`                         | 1         | Absolute value                                                                        |
+| `ROUND`                       | 1 or 2    | Round a number, optionally to`n` decimal places                                     |
+| `FLOOR`                       | 1         | Round down                                                                            |
+| `CEIL` / `CEILING`          | 1         | Round up                                                                              |
+| `MOD`                         | 2         | Remainder of integer division                                                         |
+| `POWER` / `POW`             | 2         | Raise a number to a power                                                             |
+| `SQRT`                        | 1         | Square root                                                                           |
+| `GREATEST`                    | 2+        | Largest value among arguments                                                         |
+| `LEAST`                       | 2+        | Smallest value among arguments                                                        |
+| `NOW` / `CURRENT_TIMESTAMP` | 0         | Current local date and time                                                           |
+| `DATE`                        | 0 or 1    | Current date, or the date part of a value                                             |
+| `IFNULL` / `ISNULL`         | 2         | First value if not`NULL`, otherwise the second                                      |
+| `COALESCE`                    | 2+        | First non-`NULL` value                                                              |
 
 ### Aggregate functions
 
-| Function | Description |
-| -------- | ----------- |
+| Function                       | Description                          |
+| ------------------------------ | ------------------------------------ |
 | `COUNT(*)` / `COUNT(expr)` | Number of rows / non-`NULL` values |
-| `SUM(expr)` | Sum of numeric values |
-| `AVG(expr)` | Average of numeric values |
-| `MIN(expr)` | Minimum value |
-| `MAX(expr)` | Maximum value |
+| `SUM(expr)`                  | Sum of numeric values                |
+| `AVG(expr)`                  | Average of numeric values            |
+| `MIN(expr)`                  | Minimum value                        |
+| `MAX(expr)`                  | Maximum value                        |
 
 ---
 
@@ -297,6 +297,7 @@ Both options always produce CSV (header + comma-separated rows), regardless of `
 ---
 
 ### License
+
 ```
 MIT License
 

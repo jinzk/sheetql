@@ -11,7 +11,7 @@ pub(crate) fn run_show_databases(
     let rows = schema
         .database_names()
         .into_iter()
-        .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false)))
+        .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false, None)))
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
     Ok(crate::engine::QueryResult { columns, rows })
@@ -44,7 +44,7 @@ pub(crate) fn run_show_tables(
     let rows = database
         .table_names()
         .into_iter()
-        .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false)))
+        .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false, None)))
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
     Ok(crate::engine::QueryResult { columns, rows })
