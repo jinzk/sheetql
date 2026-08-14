@@ -388,11 +388,11 @@ fn compute_order_keys(
     row: &[Value],
 ) -> Result<Vec<Value>, String> {
     let mut keys = vec![];
-    if let Some(order) = &query.order_by {
-        if let OrderByKind::Expressions(exprs) = &order.kind {
-            for order_expr in exprs {
-                keys.push(eval_expr(ctx, &order_expr.expr, row)?);
-            }
+    if let Some(order) = &query.order_by
+        && let OrderByKind::Expressions(exprs) = &order.kind
+    {
+        for order_expr in exprs {
+            keys.push(eval_expr(ctx, &order_expr.expr, row)?);
         }
     }
     Ok(keys)
@@ -1144,6 +1144,42 @@ mod tests {
     }
 
     #[test]
+    fn right_join_keeps_unmatched_right_rows() {
+        let mut database = Database::named("test");
+        database.add_table(Table {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![Value::Int(1), Value::Text("Alice".into())],
+                vec![Value::Int(2), Value::Text("Bob".into())],
+            ],
+        });
+        database.add_table(Table {
+            name: "orders".to_string(),
+            columns: vec!["order_id".to_string(), "customer_id".to_string()],
+            rows: vec![
+                vec![Value::Int(101), Value::Int(1)],
+                vec![Value::Int(102), Value::Int(99)],
+            ],
+        });
+        let mut schema = Schema::new();
+        schema.add_database(database);
+        schema.set_current_database("test").unwrap();
+
+        let result = run(
+            &mut schema,
+            "SELECT p.name, o.order_id FROM people p RIGHT JOIN orders o ON p.id = o.customer_id",
+        );
+        // Alice matches order 101; order 102 has no matching person and is kept with NULL.
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            result.rows[0],
+            vec![Value::Text("Alice".into()), Value::Int(101)]
+        );
+        assert_eq!(result.rows[1], vec![Value::Null, Value::Int(102)]);
+    }
+
+    #[test]
     fn using_join_matches_on_shared_column() {
         let mut schema = make_schema();
         let mut regions_db = Database::named("regions_db");
@@ -1195,6 +1231,50 @@ mod tests {
         let result = run(&mut schema, "SELECT 1 + 2 AS three, LOWER('ABC') AS low");
         assert_eq!(result.rows[0][0], Value::Int(3));
         assert_eq!(result.rows[0][1], Value::Text("abc".to_string()));
+    }
+
+    #[test]
+    fn left_right_instr_string_functions() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT LEFT('Hello', 2) AS l, RIGHT('Hello', 2) AS r, \
+             INSTR('Hello', 'll') AS pos, INSTR('Hello', 'zz') AS nf",
+        );
+        assert_eq!(result.rows[0][0], Value::Text("He".to_string()));
+        assert_eq!(result.rows[0][1], Value::Text("lo".to_string()));
+        assert_eq!(result.rows[0][2], Value::Int(3));
+        assert_eq!(result.rows[0][3], Value::Int(0));
+    }
+
+    #[test]
+    fn now_and_date_functions() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT NOW() AS n, DATE() AS d, DATE('2026/08/14 10:30:00') AS p",
+        );
+        let now = result.rows[0][0].to_display_string();
+        assert_eq!(now.len(), 19, "got: {now}");
+        let today = result.rows[0][1].to_display_string();
+        assert_eq!(today.len(), 10, "got: {today}");
+        assert_eq!(result.rows[0][2], Value::Text("2026-08-14".to_string()));
+    }
+
+    #[test]
+    fn power_sqrt_math_functions() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT POWER(2, 10) AS p, SQRT(16) AS s");
+        assert_eq!(result.rows[0][0], Value::Float(1024.0));
+        assert_eq!(result.rows[0][1], Value::Float(4.0));
+    }
+
+    #[test]
+    fn greatest_least_functions() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT GREATEST(3, 7, 5) AS g, LEAST(3, 7, 5) AS l");
+        assert_eq!(result.rows[0][0], Value::Int(7));
+        assert_eq!(result.rows[0][1], Value::Int(3));
     }
 
     #[test]

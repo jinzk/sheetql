@@ -130,12 +130,11 @@ impl Schema {
                 Ok((database, table))
             }
             None => {
-                if let Some(current) = &self.current {
-                    if let Some(database) = self.get_database(current) {
-                        if let Some(table) = database.get_table(table) {
-                            return Ok((database, table));
-                        }
-                    }
+                if let Some(current) = &self.current
+                    && let Some(database) = self.get_database(current)
+                    && let Some(table) = database.get_table(table)
+                {
+                    return Ok((database, table));
                 }
                 let mut found: Vec<&Database> = vec![];
                 for database in &self.databases {

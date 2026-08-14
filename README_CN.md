@@ -187,11 +187,20 @@ DESCRIBE sales
 | `CONCAT` | 2+ | 拼接值 |
 | `SUBSTRING` / `SUBSTR` | 2 或 3 | 提取子串（`文本, 起始[, 长度]`，从 1 开始） |
 | `REPLACE` | 3 | 替换子串出现 |
+| `LEFT` | 2 | 返回文本前 `n` 个字符 |
+| `RIGHT` | 2 | 返回文本后 `n` 个字符 |
+| `INSTR` | 2 | 返回子串位置（从 1 开始，未找到返回 0） |
 | `ABS` | 1 | 绝对值 |
-| `ROUND` | 1 或 2 | 四舍五入，可选保留 `n` 位小数 |
+| `ROUND` | 1 或 2 | 四舍五入，可指定小数位 `n` |
 | `FLOOR` | 1 | 向下取整 |
 | `CEIL` / `CEILING` | 1 | 向上取整 |
 | `MOD` | 2 | 整数除法余数 |
+| `POWER` / `POW` | 2 | 求幂 |
+| `SQRT` | 1 | 平方根 |
+| `GREATEST` | 2+ | 返回参数中的最大值 |
+| `LEAST` | 2+ | 返回参数中的最小值 |
+| `NOW` / `CURRENT_TIMESTAMP` | 0 | 当前本地日期和时间 |
+| `DATE` | 0 或 1 | 当前日期，或提取值的日期部分 |
 | `IFNULL` / `ISNULL` | 2 | 第一个值非 `NULL` 时返回它，否则返回第二个 |
 | `COALESCE` | 2+ | 返回第一个非 `NULL` 值 |
 

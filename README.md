@@ -187,11 +187,20 @@ Not yet supported: subqueries, `UNION` / set operations, window functions, `INSE
 | `CONCAT` | 2+ | Concatenate values |
 | `SUBSTRING` / `SUBSTR` | 2 or 3 | Extract a substring (`text, start[, length]`, 1-based) |
 | `REPLACE` | 3 | Replace occurrences of a substring |
+| `LEFT` | 2 | First `n` characters of a text value |
+| `RIGHT` | 2 | Last `n` characters of a text value |
+| `INSTR` | 2 | 1-based position of a substring (0 if not found) |
 | `ABS` | 1 | Absolute value |
 | `ROUND` | 1 or 2 | Round a number, optionally to `n` decimal places |
 | `FLOOR` | 1 | Round down |
 | `CEIL` / `CEILING` | 1 | Round up |
 | `MOD` | 2 | Remainder of integer division |
+| `POWER` / `POW` | 2 | Raise a number to a power |
+| `SQRT` | 1 | Square root |
+| `GREATEST` | 2+ | Largest value among arguments |
+| `LEAST` | 2+ | Smallest value among arguments |
+| `NOW` / `CURRENT_TIMESTAMP` | 0 | Current local date and time |
+| `DATE` | 0 or 1 | Current date, or the date part of a value |
 | `IFNULL` / `ISNULL` | 2 | First value if not `NULL`, otherwise the second |
 | `COALESCE` | 2+ | First non-`NULL` value |
 

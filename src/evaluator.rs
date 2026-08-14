@@ -536,10 +536,10 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
             if let Some(parsed) = value.as_i64() {
                 return Ok(Value::Int(parsed));
             }
-            if let Some(text) = value.as_text() {
-                if let Ok(parsed) = text.parse::<i64>() {
-                    return Ok(Value::Int(parsed));
-                }
+            if let Some(text) = value.as_text()
+                && let Ok(parsed) = text.parse::<i64>()
+            {
+                return Ok(Value::Int(parsed));
             }
             Err(format!("Cannot cast `{}` to integer", value))
         }
@@ -549,10 +549,10 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
             if let Some(parsed) = value.as_f64() {
                 return Ok(Value::Float(parsed));
             }
-            if let Some(text) = value.as_text() {
-                if let Ok(parsed) = text.parse::<f64>() {
-                    return Ok(Value::Float(parsed));
-                }
+            if let Some(text) = value.as_text()
+                && let Ok(parsed) = text.parse::<f64>()
+            {
+                return Ok(Value::Float(parsed));
             }
             Err(format!("Cannot cast `{}` to float", value))
         }
@@ -769,6 +769,81 @@ fn eval_function(ctx: &EvalContext, func: &Function, current: &[Value]) -> Resul
                     % values[1].as_i64().ok_or("MOD expects numeric values")?,
             ))
         }
+        "left" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 2)?;
+            let text: Vec<char> = values[0].to_display_string().chars().collect();
+            let count = values[1].as_i64().ok_or("LEFT length must be a number")?.max(0) as usize;
+            Ok(Value::Text(text.iter().take(count).collect()))
+        }
+        "right" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 2)?;
+            let text: Vec<char> = values[0].to_display_string().chars().collect();
+            let count = values[1].as_i64().ok_or("RIGHT length must be a number")?.max(0) as usize;
+            let start = text.len().saturating_sub(count);
+            Ok(Value::Text(text.iter().skip(start).collect()))
+        }
+        "instr" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 2)?;
+            let haystack = values[0].to_display_string();
+            let needle = values[1].to_display_string();
+            let position = haystack
+                .find(&needle)
+                .map(|index| haystack[..index].chars().count() as i64 + 1)
+                .unwrap_or(0);
+            Ok(Value::Int(position))
+        }
+        "now" | "current_timestamp" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 0)?;
+            Ok(Value::Text(now_string()))
+        }
+        "date" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            if values.is_empty() {
+                return Ok(Value::Text(today_string()));
+            }
+            require_arity(&name, &values, 1)?;
+            Ok(Value::Text(extract_date(&values[0].to_display_string())))
+        }
+        "power" | "pow" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 2)?;
+            let base = values[0].as_f64().ok_or("POWER base must be a number")?;
+            let exponent = values[1].as_f64().ok_or("POWER exponent must be a number")?;
+            Ok(Value::Float(base.powf(exponent)))
+        }
+        "sqrt" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 1)?;
+            let number = values[0].as_f64().ok_or("SQRT expects a numeric value")?;
+            if number < 0.0 {
+                return Err("SQRT expects a non-negative value".to_string());
+            }
+            Ok(Value::Float(number.sqrt()))
+        }
+        "greatest" | "least" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            if values.is_empty() {
+                return Err(format!("Function `{name}` expects at least 1 argument"));
+            }
+            if values.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
+            let mut best = values[0].clone();
+            for value in &values[1..] {
+                let ordering = values_partial_cmp(&best, value)
+                    .ok_or_else(|| format!("Cannot compare values for `{name}`"))?;
+                if (name == "greatest" && ordering == std::cmp::Ordering::Less)
+                    || (name == "least" && ordering == std::cmp::Ordering::Greater)
+                {
+                    best = value.clone();
+                }
+            }
+            Ok(best)
+        }
         _ => Err(format!("Unknown function `{name}`")),
     }
 }
@@ -781,6 +856,40 @@ fn require_arity(name: &str, values: &[Value], expected: usize) -> Result<(), St
         ));
     }
     Ok(())
+}
+
+fn now_string() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn today_string() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+fn extract_date(input: &str) -> String {
+    let trimmed = input.trim();
+    let bytes = trimmed.as_bytes();
+    let is_digit = |byte: u8| byte.is_ascii_digit();
+    let valid = bytes.len() >= 10
+        && is_digit(bytes[0])
+        && is_digit(bytes[1])
+        && is_digit(bytes[2])
+        && is_digit(bytes[3])
+        && matches!(bytes[4], b'-' | b'/' | b'.')
+        && is_digit(bytes[5])
+        && is_digit(bytes[6])
+        && matches!(bytes[7], b'-' | b'/' | b'.')
+        && is_digit(bytes[8])
+        && is_digit(bytes[9]);
+    if !valid {
+        return trimmed.to_string();
+    }
+    let month = trimmed[5..7].parse::<u32>().unwrap_or(0);
+    let day = trimmed[8..10].parse::<u32>().unwrap_or(0);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return trimmed.to_string();
+    }
+    format!("{}-{}-{}", &trimmed[0..4], &trimmed[5..7], &trimmed[8..10])
 }
 
 fn eval_scalar_args(ctx: &EvalContext, args: &FnArgs, current: &[Value]) -> Result<Vec<Value>, String> {
