@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use calamine::{Data as Cell, Reader, Xls, Xlsx};
+use calamine::{Data as Cell, ExcelDateTime, Reader, Xls, Xlsx};
 
 use crate::database::Database;
 use crate::database::Schema;
@@ -226,7 +226,17 @@ fn cell_value(cell: &Cell) -> Value {
         Cell::Float(value) => Value::Float(*value),
         Cell::String(value) => Value::Text(value.clone()),
         Cell::Bool(value) => Value::Bool(*value),
-        Cell::DateTime(_) | Cell::DateTimeIso(_) | Cell::DurationIso(_) => Value::Text(cell.to_string()),
+        Cell::DateTime(value) => Value::Text(format_excel_datetime(value)),
+        Cell::DateTimeIso(_) | Cell::DurationIso(_) => Value::Text(cell.to_string()),
+    }
+}
+
+fn format_excel_datetime(value: &ExcelDateTime) -> String {
+    let (year, month, day, hour, minute, second, milli) = value.to_ymd_hms_milli();
+    if hour == 0 && minute == 0 && second == 0 && milli == 0 {
+        format!("{year}/{month}/{day}")
+    } else {
+        format!("{year}/{month}/{day} {hour}:{minute}:{second}")
     }
 }
 
@@ -245,6 +255,19 @@ mod tests {
         assert_eq!(parse_cell("Alice"), Value::Text("Alice".to_string()));
         assert_eq!(parse_cell("0012"), Value::Int(12));
         assert_eq!(parse_cell("a1b2"), Value::Text("a1b2".to_string()));
+    }
+
+    #[test]
+    fn datetime_cell_becomes_readable_date_not_serial() {
+        let serial = calamine::ExcelDateTime::new(46149.0, calamine::ExcelDateTimeType::DateTime, false);
+        let cell = calamine::Data::DateTime(serial);
+        let expected = match &cell {
+            calamine::Data::DateTime(v) => format_excel_datetime(v),
+            _ => unreachable!(),
+        };
+        assert_eq!(cell_value(&cell), Value::Text(expected.clone()));
+        assert!(expected.contains('/'), "expected a date like Y/M/D, got {expected}");
+        assert!(!expected.contains("46149"), "serial leaked into output: {expected}");
     }
 
     #[test]
