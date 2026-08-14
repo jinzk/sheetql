@@ -229,6 +229,48 @@ pub fn eval_function(
                 .unwrap_or(0);
             Ok(Value::Int(position))
         }
+        "startswith" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 2)?;
+            if values.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
+            let text = values[0].to_display_string();
+            let prefix = values[1].to_display_string();
+            Ok(Value::Bool(text.starts_with(&prefix)))
+        }
+        "endswith" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 2)?;
+            if values.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
+            let text = values[0].to_display_string();
+            let suffix = values[1].to_display_string();
+            Ok(Value::Bool(text.ends_with(&suffix)))
+        }
+        "split" => {
+            let values = eval_scalar_args(ctx, &args, current)?;
+            require_arity(&name, &values, 3)?;
+            if values.iter().any(Value::is_null) {
+                return Ok(Value::Null);
+            }
+            let text = values[0].to_display_string();
+            let sep = values[1].to_display_string();
+            let index = values[2].as_i64().ok_or("SPLIT index must be a number")?;
+            if index < 1 {
+                return Ok(Value::Null);
+            }
+            let parts: Vec<&str> = if sep.is_empty() {
+                vec![text.as_str()]
+            } else {
+                text.split(&sep).collect()
+            };
+            match parts.get((index - 1) as usize) {
+                Some(part) => Ok(Value::Text(part.to_string())),
+                None => Ok(Value::Null),
+            }
+        }
         "now" | "current_timestamp" => {
             let values = eval_scalar_args(ctx, &args, current)?;
             require_arity(&name, &values, 0)?;
@@ -599,6 +641,18 @@ mod tests {
         assert_eq!(scalar("IFNULL(NULL, 'fallback')"), Value::Text("fallback".to_string()));
         assert_eq!(scalar("IFNULL(5, 'fallback')"), Value::Int(5));
         assert_eq!(scalar("COALESCE(NULL, NULL, 7)"), Value::Int(7));
+    }
+
+    #[test]
+    fn startswith_endswith_split_functions() {
+        assert_eq!(scalar("STARTSWITH('SheetQL', 'Sheet')"), Value::Bool(true));
+        assert_eq!(scalar("STARTSWITH('SheetQL', 'sql')"), Value::Bool(false));
+        assert_eq!(scalar("ENDSWITH('SheetQL', 'QL')"), Value::Bool(true));
+        assert_eq!(scalar("ENDSWITH('SheetQL', 'She')"), Value::Bool(false));
+        assert_eq!(scalar("SPLIT('a,b,c', ',', 2)"), Value::Text("b".to_string()));
+        assert_eq!(scalar("SPLIT('a,b,c', ',', 1)"), Value::Text("a".to_string()));
+        assert_eq!(scalar("SPLIT('a,b,c', ',', 9)"), Value::Null);
+        assert_eq!(scalar("STARTSWITH(NULL, 'x')"), Value::Null);
     }
 
     #[test]

@@ -192,6 +192,8 @@ Not yet supported: subqueries, `UNION` / set operations, window functions, `INSE
 | `LEFT` | 2 | First `n` characters of a text value |
 | `RIGHT` | 2 | Last `n` characters of a text value |
 | `INSTR` | 2 | 1-based position of a substring (0 if not found) |
+| `STARTSWITH` / `ENDSWITH` | 2 | Whether text starts/ends with the given prefix/suffix (returns boolean) |
+| `SPLIT` | 3 | Split text by a separator and return the n-th part (1-based; `NULL` if out of range) |
 | `ABS` | 1 | Absolute value |
 | `ROUND` | 1 or 2 | Round a number, optionally to `n` decimal places |
 | `FLOOR` | 1 | Round down |
