@@ -7,6 +7,7 @@ pub struct Arguments {
     pub pagination: bool,
     pub page_size: usize,
     pub output_format: OutputFormat,
+    pub output_file: Option<String>,
 }
 
 impl Arguments {
@@ -17,6 +18,7 @@ impl Arguments {
             pagination: false,
             page_size: 10,
             output_format: OutputFormat::Table,
+            output_file: None,
         }
     }
 }
@@ -134,6 +136,16 @@ pub fn parse_arguments(args: &[String]) -> Command {
                 };
                 arg_index += 1;
             }
+            "--save" | "-s" => {
+                arg_index += 1;
+                if arg_index >= args.len() {
+                    return Command::Error(format!(
+                        "Argument {arg} must be followed by an output file path"
+                    ));
+                }
+                arguments.output_file = Some(args[arg_index].to_string());
+                arg_index += 1;
+            }
             _ => return Command::Error(format!("Unknown argument {arg}")),
         }
     }
@@ -142,6 +154,10 @@ pub fn parse_arguments(args: &[String]) -> Command {
         return Command::Error(
             "Missing file paths, use `-f` to pass one or more xls/xlsx/csv files".to_string(),
         );
+    }
+
+    if arguments.output_file.is_some() && optional_query.is_none() {
+        return Command::Error("--save requires --query".to_string());
     }
 
     match optional_query {
@@ -161,7 +177,91 @@ pub fn print_help_list() {
     println!("-p,  --pagination            Enable print result with pagination");
     println!("-ps, --pagesize              Set pagination page size [default: 10]");
     println!("-o,  --output                Set output format [render, json, csv, yaml]");
+    println!("-s,  --save <path>           Save --query result as a CSV file");
     println!("-a,  --analysis              Print Query analysis");
     println!("-h,  --help                  Print Sheetql help");
     println!("-v,  --version               Print Sheetql Current Version");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        let mut full: Vec<String> = vec!["sheetql".to_string()];
+        full.extend(parts.iter().map(|part| part.to_string()));
+        full
+    }
+
+    #[test]
+    fn query_mode_without_save() {
+        match parse_arguments(&args(&["-f", "data.csv", "-q", "SELECT 1"])) {
+            Command::QueryMode(query, arguments) => {
+                assert_eq!(query, "SELECT 1");
+                assert!(arguments.output_file.is_none());
+            }
+            other => panic!("expected QueryMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_mode_with_save_sets_output_file() {
+        match parse_arguments(&args(&["-f", "data.csv", "-q", "SELECT 1", "-s", "out.csv"])) {
+            Command::QueryMode(query, arguments) => {
+                assert_eq!(query, "SELECT 1");
+                assert_eq!(arguments.output_file.as_deref(), Some("out.csv"));
+            }
+            other => panic!("expected QueryMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_without_query_is_rejected() {
+        match parse_arguments(&args(&["-f", "data.csv", "-s", "out.csv"])) {
+            Command::Error(message) => {
+                assert!(message.contains("--save requires --query"), "got: {message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repl_mode_without_query() {
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv"])),
+            Command::ReplMode(_)
+        ));
+    }
+
+    #[test]
+    fn output_format_is_parsed() {
+        match parse_arguments(&args(&["-f", "data.csv", "-q", "SELECT 1", "-o", "json"])) {
+            Command::QueryMode(_, arguments) => {
+                assert_eq!(arguments.output_format, OutputFormat::Json)
+            }
+            other => panic!("expected QueryMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_files_is_rejected() {
+        assert!(matches!(
+            parse_arguments(&args(&["-q", "SELECT 1"])),
+            Command::Error(_)
+        ));
+    }
+
+    #[test]
+    fn help_is_recognized() {
+        assert!(matches!(parse_arguments(&args(&["--help"])), Command::Help));
+        assert!(matches!(parse_arguments(&args(&["-h"])), Command::Help));
+    }
+
+    #[test]
+    fn version_is_recognized() {
+        assert!(matches!(
+            parse_arguments(&args(&["--version"])),
+            Command::Version
+        ));
+    }
 }

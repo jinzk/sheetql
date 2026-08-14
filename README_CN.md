@@ -31,6 +31,7 @@ Sheetql 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
   -p,  --pagination           启用分页打印结果
   -ps, --pagesize             设置分页大小 [默认: 10]
   -o,  --output               设置输出格式 [render, json, csv, yaml]
+  -s,  --save <path>          将 --query 结果保存为 CSV 文件
   -a,  --analysis             打印查询分析信息
   -h,  --help                 打印 Sheetql 帮助
   -v,  --version              打印 Sheetql 当前版本
@@ -45,6 +46,7 @@ Sheetql 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
 | `-p, --pagination` | 大结果集分页打印（仅表格格式）。 |
 | `-ps, --pagesize` | 启用 `-p` 时每页显示的行数，默认 `10`。 |
 | `-o, --output` | 输出格式：`render`（默认）、`json`、`csv`、`yaml`。 |
+| `-s, --save` | 将 `--query` 的结果以 CSV 写入 `<path>`。仅能与 `--query` 配合使用（REPL 下会报错）。 |
 | `-a, --analysis` | 在结果后打印行数与执行耗时。 |
 | `-h, --help` | 打印帮助。 |
 | `-v, --version` | 打印当前版本。 |
@@ -257,6 +259,38 @@ YAML（`-o yaml`）:
 - age: 40
   name: Dan
 ```
+
+---
+
+### 将查询结果保存到文件
+
+有两种方式可将结果集以 CSV 写入磁盘。
+
+**1. `--save` / `-s`（命令行参数）**
+
+`-s <path>` 将 `--query` 的结果以 CSV（含表头）写入 `<path>`。它只能与 `--query` 配合使用；在 REPL 模式下使用会报错（`--save requires --query`）。终端仍会照常打印结果。
+
+```sh
+sheetql -f data/sales.csv -q "SELECT name, city FROM sales" -s result.csv
+```
+
+`result.csv` 内容：
+
+```
+name,city
+Alice,NY
+Bob,LA
+```
+
+**2. `INTO OUTFILE`（SQL 子句）**
+
+在 `SELECT` 语句后追加 `INTO OUTFILE 'path'` 即可将结果写成 CSV。由于 sqlparser 不解析 MySQL 风格的 `INTO OUTFILE`，Sheetql 会在解析前将其剥离，再写出文件。若文件已存在，查询会失败并返回 `Output file 'path' already exists`（绝不覆盖）。查询本身会返回一行 `Status` 以确认写入。
+
+```sql
+SELECT name, city FROM sales ORDER BY name INTO OUTFILE 'result.csv'
+```
+
+两种方式均始终输出 CSV（表头 + 逗号分隔的行），与 `-o` 无关。
 
 ---
 

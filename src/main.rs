@@ -70,6 +70,8 @@ fn execute_query(
             let duration = start.elapsed();
             print_result(arguments, &result.columns, &result.rows);
 
+            save_result(arguments, &result.columns, &result.rows)?;
+
             if arguments.analysis {
                 let plural = if result.rows.len() == 1 { "" } else { "s" };
                 println!(
@@ -84,8 +86,7 @@ fn execute_query(
     }
 }
 
-fn print_result(arguments: &arguments::Arguments, columns: &[String], rows: &[Vec<value::Value>]) {
-    if arguments.output_format == OutputFormat::Table
+fn print_result(arguments: &arguments::Arguments, columns: &[String], rows: &[Vec<value::Value>]) {    if arguments.output_format == OutputFormat::Table
         && arguments.pagination
         && rows.len() > arguments.page_size
     {
@@ -113,6 +114,22 @@ fn print_result(arguments: &arguments::Arguments, columns: &[String], rows: &[Ve
     }
 
     print!("{}", render(arguments.output_format, columns, rows));
+}
+
+fn save_result(
+    arguments: &arguments::Arguments,
+    columns: &[String],
+    rows: &[Vec<value::Value>],
+) -> Result<(), String> {
+    if let Some(path) = &arguments.output_file {
+        let content = render(OutputFormat::Csv, columns, rows);
+        std::fs::write(path, content)
+            .map_err(|error| format!("Cannot write result to `{path}`: {error}"))?;
+        if arguments.analysis {
+            eprintln!("Result saved to `{path}`");
+        }
+    }
+    Ok(())
 }
 
 fn launch_repl(arguments: arguments::Arguments) {

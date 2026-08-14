@@ -31,6 +31,7 @@ Options:
   -p,  --pagination           Enable print result with pagination
   -ps, --pagesize             Set pagination page size [default: 10]
   -o,  --output               Set output format [render, json, csv, yaml]
+  -s,  --save <path>          Save --query result as a CSV file
   -a,  --analysis             Print Query analysis
   -h,  --help                 Print Sheetql help
   -v,  --version              Print Sheetql Current Version
@@ -45,6 +46,7 @@ Option details:
 | `-p, --pagination` | Print large results page by page (table format only). |
 | `-ps, --pagesize` | Number of rows per page when `-p` is enabled. Defaults to `10`. |
 | `-o, --output` | Output format: `render` (default), `json`, `csv`, `yaml`. |
+| `-s, --save` | Write the `--query` result to `<path>` as CSV. Only valid with `--query` (REPL prints an error). |
 | `-a, --analysis` | Print the row count and execution time after the result. |
 | `-h, --help` | Print help. |
 | `-v, --version` | Print the current version. |
@@ -257,6 +259,38 @@ YAML (`-o yaml`):
 - age: 40
   name: Dan
 ```
+
+---
+
+### Saving query results to a file
+
+There are two ways to write a result set to disk as CSV.
+
+**1. `--save` / `-s` (command-line flag)**
+
+`-s <path>` writes the result of a `--query` to `<path>` as CSV (with a header row). It only works together with `--query`; using it in REPL mode prints an error (`--save requires --query`). The terminal still prints the result as usual.
+
+```sh
+sheetql -f data/sales.csv -q "SELECT name, city FROM sales" -s result.csv
+```
+
+`result.csv` will contain:
+
+```
+name,city
+Alice,NY
+Bob,LA
+```
+
+**2. `INTO OUTFILE` (SQL clause)**
+
+Append `INTO OUTFILE 'path'` to a `SELECT` statement to write the result as CSV. MySQL-style `INTO OUTFILE` is not understood by sqlparser, so Sheetql strips it before parsing and then writes the file. If the file already exists the query fails with `Output file 'path' already exists` (it never overwrites). The query itself returns a single `Status` row confirming the write.
+
+```sql
+SELECT name, city FROM sales ORDER BY name INTO OUTFILE 'result.csv'
+```
+
+Both options always produce CSV (header + comma-separated rows), regardless of `-o`.
 
 ---
 
