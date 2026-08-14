@@ -12,7 +12,7 @@ It parses queries with <a href="https://github.com/apache/datafusion-sqlparser-r
 - Build from source code
 
 ```
-git clone https://github.com/AmrDeveloper/sheetql.git
+git clone https://github.com/jinzk/sheetql.git
 cd sheetql
 cargo build
 ```

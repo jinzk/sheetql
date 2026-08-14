@@ -12,7 +12,7 @@ Sheetql 是一个让你可以在 <code>xls</code>、<code>xlsx</code> 和 <code>
 从源码构建
 
 ```
-git clone https://github.com/AmrDeveloper/sheetql.git
+git clone https://github.com/jinzk/sheetql.git
 cd sheetql
 cargo build
 ```
