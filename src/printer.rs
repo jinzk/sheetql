@@ -1,4 +1,5 @@
 use serde_json::json;
+use unicode_width::UnicodeWidthStr;
 
 use crate::value::Value;
 
@@ -89,11 +90,12 @@ fn render_table(columns: &[String], rows: &[Vec<Value>]) -> String {
         })
         .collect();
 
-    let mut widths: Vec<usize> = columns.iter().map(|column| column.len()).collect();
+    let mut widths: Vec<usize> = columns.iter().map(|column| column.width()).collect();
     for row in &cell_texts {
         for (index, text) in row.iter().enumerate() {
-            if text.len() > widths[index] {
-                widths[index] = text.len();
+            let width = text.width();
+            if width > widths[index] {
+                widths[index] = width;
             }
         }
     }
@@ -102,7 +104,7 @@ fn render_table(columns: &[String], rows: &[Vec<Value>]) -> String {
     let header = columns
         .iter()
         .enumerate()
-        .map(|(index, column)| pad(column, widths[index]))
+        .map(|(index, column)| pad(column, widths[index] + 2))
         .collect::<Vec<_>>()
         .join("│");
 
@@ -114,7 +116,7 @@ fn render_table(columns: &[String], rows: &[Vec<Value>]) -> String {
         let line = row
             .iter()
             .enumerate()
-            .map(|(column_index, text)| pad(text, widths[column_index]))
+            .map(|(column_index, text)| pad(text, widths[column_index] + 2))
             .collect::<Vec<_>>()
             .join("│");
         output.push_str(&format!("│{}│\n", line));
@@ -128,7 +130,7 @@ fn render_table(columns: &[String], rows: &[Vec<Value>]) -> String {
 }
 
 fn pad(text: &str, width: usize) -> String {
-    let padding = width.saturating_sub(text.len());
+    let padding = width.saturating_sub(text.width());
     let left = padding / 2;
     let right = padding - left;
     format!(
@@ -169,4 +171,44 @@ fn bottom_border(widths: &[usize]) -> String {
         .map(|width| "─".repeat(width + 2))
         .collect::<Vec<_>>()
         .join("┴")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every rendered line of a table must share the same terminal display
+    /// width so the box-drawing borders line up, even with CJK (wide) characters.
+    fn line_widths(table: &str) -> Vec<usize> {
+        table.lines().map(|line| line.width()).collect()
+    }
+
+    #[test]
+    fn table_rows_align_with_cjk() {
+        let columns = vec!["Tables".to_string(), "列".to_string()];
+        let rows = vec![vec![
+            Value::Text("商品销售明细".to_string()),
+            Value::Text("值".to_string()),
+        ]];
+        let widths = line_widths(&render_table(&columns, &rows));
+        assert!(!widths.is_empty());
+        let expected = widths[0];
+        for (index, width) in widths.iter().enumerate() {
+            assert_eq!(*width, expected, "line {index} has mismatched width");
+        }
+    }
+
+    #[test]
+    fn table_rows_align_with_ascii() {
+        let columns = vec!["id".to_string(), "name".to_string()];
+        let rows = vec![
+            vec![Value::Int(1), Value::Text("Alice".to_string())],
+            vec![Value::Int(2), Value::Text("Bob".to_string())],
+        ];
+        let widths = line_widths(&render_table(&columns, &rows));
+        let expected = widths[0];
+        for width in widths {
+            assert_eq!(width, expected);
+        }
+    }
 }
