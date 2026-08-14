@@ -1,7 +1,7 @@
 <h1 align="center">SheetQL - Spreadsheet Query Language</h1></br>
 
 <p align="center">
-Sheetql is a tool that allows you to run SQL-like queries on <code>xls</code>, <code>xlsx</code> and <code>csv</code> files.
+SheetQL is a tool that allows you to run SQL-like queries on <code>xls</code>, <code>xlsx</code> and <code>csv</code> files.
 It parses queries with <a href="https://github.com/apache/datafusion-sqlparser-rs">sqlparser-rs</a> (MySQL dialect) and executes them on in-memory tables with a custom engine, so you can query spreadsheets without a database.
 </p>
 
@@ -228,11 +228,11 @@ Table (default, `render`):
 
 ```
 ╭───────┬─────╮
-│name │age│
+│ name  │ age │
 ╞═══════╪═════╡
-│Alice│30 │
+│ Alice │ 30  │
 ├───────┼─────┤
-│ Dan │40 │
+│  Dan  │ 40  │
 ╰───────┴─────╯
 ```
 
