@@ -104,11 +104,9 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, String> 
 /// detect and remove it before handing the rest to the parser, and surface the
 /// path so the caller can write the result set to that file.
 fn strip_into_outfile(sql: &str) -> (String, Option<String>) {
-    let upper = sql.to_ascii_uppercase();
     let marker = "INTO OUTFILE";
-    let pos = match upper.find(marker) {
-        Some(pos) => pos,
-        None => return (sql.to_string(), None),
+    let Some(pos) = find_outfile_pos(sql, marker) else {
+        return (sql.to_string(), None);
     };
 
     let tail = &sql[pos + marker.len()..];
@@ -131,14 +129,20 @@ fn strip_into_outfile(sql: &str) -> (String, Option<String>) {
     let mut path = String::new();
     let mut end_byte = 0;
     let mut closed = false;
-    for (byte, c) in iter {
+    while let Some((byte, c)) = iter.next() {
         if c == quote {
+            if let Some(&(_, next)) = iter.peek()
+                && next == quote
+            {
+                path.push(quote);
+                iter.next();
+                continue;
+            }
             end_byte = byte + c.len_utf8();
             closed = true;
             break;
         }
         path.push(c);
-        end_byte = byte + c.len_utf8();
     }
     if !closed {
         return (sql.to_string(), None);
@@ -148,6 +152,47 @@ fn strip_into_outfile(sql: &str) -> (String, Option<String>) {
     rest.push_str(sql[..pos].trim_end());
     rest.push_str(tail[end_byte..].trim_start());
     (rest.trim().to_string(), Some(path))
+}
+
+/// Find the byte position of `marker` outside string literals and line
+/// comments, so a stray `INTO OUTFILE` inside a quoted string is ignored.
+fn find_outfile_pos(sql: &str, marker: &str) -> Option<usize> {
+    let upper = sql.to_ascii_uppercase();
+    let mut iter = sql.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        match c {
+            '\'' | '"' | '`' => {
+                let quote = c;
+                while let Some((_, next)) = iter.next() {
+                    if next == quote {
+                        if let Some(&(_, peeked)) = iter.peek()
+                            && peeked == quote
+                        {
+                            iter.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '-' if iter.peek().is_some_and(|&(_, next)| next == '-') => {
+                for (_, ch) in iter.by_ref() {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                if upper[i..].starts_with(marker) {
+                    let prev = sql[..i].chars().next_back();
+                    if !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Write a query result to a file as CSV (with header). Refuses to overwrite an
@@ -548,6 +593,33 @@ mod tests {
     }
 
     #[test]
+    fn sum_avg_distinct_ignore_duplicates() {
+        let mut database = Database::named("test");
+        database.add_table(Table {
+            name: "nums".to_string(),
+            columns: vec!["n".to_string()],
+            rows: vec![
+                vec![Value::Int(10)],
+                vec![Value::Int(10)],
+                vec![Value::Int(20)],
+                vec![Value::Int(20)],
+                vec![Value::Int(30)],
+            ],
+        });
+        let mut schema = Schema::new();
+        schema.add_database(database);
+        schema.set_current_database("test").unwrap();
+
+        let result = run(
+            &mut schema,
+            "SELECT SUM(n) AS s, SUM(DISTINCT n) AS d, AVG(DISTINCT n) AS a FROM nums",
+        );
+        assert_eq!(result.rows[0][0], Value::Int(90));
+        assert_eq!(result.rows[0][1], Value::Int(60));
+        assert_eq!(result.rows[0][2], Value::Float(20.0));
+    }
+
+    #[test]
     fn distinct_limit_offset() {
         let mut schema = make_schema();
         let result = run(&mut schema, "SELECT DISTINCT city FROM people LIMIT 2");
@@ -649,6 +721,20 @@ mod tests {
     fn strip_into_outfile_is_none_when_absent() {
         let (rest, path) = strip_into_outfile("SELECT * FROM people");
         assert_eq!(rest, "SELECT * FROM people");
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn strip_into_outfile_ignores_string_literals() {
+        let (rest, path) = strip_into_outfile("SELECT 'INTO OUTFILE' AS x");
+        assert_eq!(rest, "SELECT 'INTO OUTFILE' AS x");
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn strip_into_outfile_ignores_comment_text() {
+        let (rest, path) = strip_into_outfile("SELECT 1 -- INTO OUTFILE 'nope.csv'\nFROM people");
+        assert_eq!(rest, "SELECT 1 -- INTO OUTFILE 'nope.csv'\nFROM people");
         assert!(path.is_none());
     }
 

@@ -23,7 +23,13 @@ pub fn render(format: OutputFormat, columns: &[String], rows: &[Vec<Value>]) -> 
 fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::Int(number) => json!(number),
-        Value::Float(number) => json!(number),
+        Value::Float(number) => {
+            if number.is_finite() {
+                json!(number)
+            } else {
+                serde_json::Value::Null
+            }
+        }
         Value::Bool(boolean) => json!(boolean),
         Value::Text(text) => json!(text),
         Value::Null => serde_json::Value::Null,
@@ -53,27 +59,20 @@ fn render_yaml(columns: &[String], rows: &[Vec<Value>]) -> String {
 }
 
 fn render_csv(columns: &[String], rows: &[Vec<Value>]) -> String {
-    let mut output = String::new();
-    output.push_str(&columns.iter().map(|column| csv_escape(column)).collect::<Vec<_>>().join(","));
-    output.push('\n');
+    let mut writer = csv::Writer::from_writer(vec![]);
+    if writer.write_record(columns).is_err() {
+        return String::new();
+    }
     for row in rows {
         let fields: Vec<String> = (0..columns.len())
-            .map(|index| {
-                csv_escape(&row.get(index).unwrap_or(&Value::Null).to_display_string())
-            })
+            .map(|index| row.get(index).unwrap_or(&Value::Null).to_display_string())
             .collect();
-        output.push_str(&fields.join(","));
-        output.push('\n');
+        if writer.write_record(&fields).is_err() {
+            return String::new();
+        }
     }
-    output
-}
-
-fn csv_escape(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
-    }
+    let bytes = writer.into_inner().unwrap_or_default();
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 fn render_table(columns: &[String], rows: &[Vec<Value>]) -> String {

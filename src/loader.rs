@@ -176,6 +176,10 @@ fn parse_cell(cell: &str) -> Value {
         return Value::Null;
     }
 
+    if has_leading_zero(cell) {
+        return Value::Text(cell.to_string());
+    }
+
     if let Ok(value) = cell.parse::<i64>() {
         return Value::Int(value);
     }
@@ -193,6 +197,13 @@ fn parse_cell(cell: &str) -> Value {
     }
 
     Value::Text(cell.to_string())
+}
+
+fn has_leading_zero(cell: &str) -> bool {
+    let digits = cell.strip_prefix('-').unwrap_or(cell);
+    digits.len() > 1
+        && digits.starts_with('0')
+        && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 fn build_columns(headers: Vec<String>) -> Vec<String> {
@@ -253,7 +264,10 @@ mod tests {
         assert_eq!(parse_cell("FALSE"), Value::Bool(false));
         assert_eq!(parse_cell(""), Value::Null);
         assert_eq!(parse_cell("Alice"), Value::Text("Alice".to_string()));
-        assert_eq!(parse_cell("0012"), Value::Int(12));
+        assert_eq!(parse_cell("0012"), Value::Text("0012".to_string()));
+        assert_eq!(parse_cell("007"), Value::Text("007".to_string()));
+        assert_eq!(parse_cell("0"), Value::Int(0));
+        assert_eq!(parse_cell("-007"), Value::Text("-007".to_string()));
         assert_eq!(parse_cell("a1b2"), Value::Text("a1b2".to_string()));
     }
 

@@ -344,28 +344,33 @@ fn today_string(now: &DateTime<Local>) -> String {
 
 fn extract_date(input: &str) -> String {
     let trimmed = input.trim();
-    let bytes = trimmed.as_bytes();
-    let is_digit = |byte: u8| byte.is_ascii_digit();
-    let valid = bytes.len() >= 10
-        && is_digit(bytes[0])
-        && is_digit(bytes[1])
-        && is_digit(bytes[2])
-        && is_digit(bytes[3])
-        && matches!(bytes[4], b'-' | b'/' | b'.')
-        && is_digit(bytes[5])
-        && is_digit(bytes[6])
-        && matches!(bytes[7], b'-' | b'/' | b'.')
-        && is_digit(bytes[8])
-        && is_digit(bytes[9]);
-    if !valid {
+    let date_part = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    let has_separator = date_part.chars().any(|c| matches!(c, '-' | '/' | '.'));
+    if !has_separator {
         return trimmed.to_string();
     }
-    let month = trimmed[5..7].parse::<u32>().unwrap_or(0);
-    let day = trimmed[8..10].parse::<u32>().unwrap_or(0);
+    let parts: Vec<&str> = date_part.split(['-', '/', '.']).collect();
+    if parts.len() != 3 {
+        return trimmed.to_string();
+    }
+    let (year, month, day) = (parts[0], parts[1], parts[2]);
+    if year.len() != 4
+        || month.is_empty()
+        || month.len() > 2
+        || day.is_empty()
+        || day.len() > 2
+        || !year.chars().all(|c| c.is_ascii_digit())
+        || !month.chars().all(|c| c.is_ascii_digit())
+        || !day.chars().all(|c| c.is_ascii_digit())
+    {
+        return trimmed.to_string();
+    }
+    let month = month.parse::<u32>().unwrap_or(0);
+    let day = day.parse::<u32>().unwrap_or(0);
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return trimmed.to_string();
     }
-    format!("{}-{}-{}", &trimmed[0..4], &trimmed[5..7], &trimmed[8..10])
+    format!("{}-{:02}-{:02}", year, month, day)
 }
 
 fn eval_scalar_args(ctx: &EvalContext, args: &FnArgs, current: &[Value]) -> Result<Vec<Value>, String> {
@@ -410,13 +415,18 @@ fn collect_numeric(
     ctx: &EvalContext,
     args: &FnArgs,
 ) -> Result<(Vec<Value>, bool), String> {
+    let distinct = matches!(args, FnArgs::Distinct(_));
     let mut values = vec![];
+    let mut seen: HashSet<Value> = HashSet::new();
     let mut is_float = false;
     for &row_index in ctx.group_rows {
         let row = ctx.all_rows.get(row_index);
         if let (Some(expr), Some(row)) = (args.first_expr(), row) {
             let value = eval_expr(ctx, expr, row)?;
             if value.is_null() {
+                continue;
+            }
+            if distinct && !seen.insert(value.clone()) {
                 continue;
             }
             if let Value::Float(number) = value
@@ -515,8 +525,8 @@ fn eval_min_max(ctx: &EvalContext, args: &FnArgs, is_max: bool) -> Result<Value,
 pub fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(func) => {
-    let mut name = func.name.to_string();
-    name.make_ascii_lowercase();
+            let mut name = func.name.to_string();
+            name.make_ascii_lowercase();
             if AGGREGATE_FUNCTIONS.contains(&name.as_str()) {
                 return true;
             }
@@ -653,6 +663,14 @@ mod tests {
         assert_eq!(scalar("SPLIT('a,b,c', ',', 1)"), Value::Text("a".to_string()));
         assert_eq!(scalar("SPLIT('a,b,c', ',', 9)"), Value::Null);
         assert_eq!(scalar("STARTSWITH(NULL, 'x')"), Value::Null);
+    }
+
+    #[test]
+    fn date_parses_padded_and_unpadded() {
+        assert_eq!(scalar("DATE('2026/5/7')"), Value::Text("2026-05-07".to_string()));
+        assert_eq!(scalar("DATE('2026-05-07')"), Value::Text("2026-05-07".to_string()));
+        assert_eq!(scalar("DATE('2026/08/14 10:30:00')"), Value::Text("2026-08-14".to_string()));
+        assert_eq!(scalar("DATE('nope')"), Value::Text("nope".to_string()));
     }
 
     #[test]

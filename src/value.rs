@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::fmt;
 use std::hash::Hash;
 
@@ -135,8 +136,8 @@ pub fn values_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
-        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
-        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)),
+        (Value::Int(x), Value::Float(y)) => cmp_int_float(*x, *y),
+        (Value::Float(x), Value::Int(y)) => cmp_int_float(*y, *x).map(Ordering::reverse),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
         _ => Some(a.type_rank().cmp(&b.type_rank())),
@@ -147,13 +148,41 @@ pub fn values_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Float(x), Value::Float(y)) => x == y,
-        (Value::Int(x), Value::Float(y)) => (*x as f64) == *y,
-        (Value::Float(x), Value::Int(y)) => *x == (*y as f64),
+        (Value::Int(x), Value::Float(y)) => eq_int_float(*x, *y),
+        (Value::Float(x), Value::Int(y)) => eq_int_float(*y, *x),
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Null, Value::Null) => true,
         _ => false,
     }
+}
+
+fn cmp_int_float(int: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    if float.fract() != 0.0 {
+        return (int as f64).partial_cmp(&float);
+    }
+    let limit = 2f64.powi(63);
+    if float >= limit {
+        return Some(Ordering::Less);
+    }
+    if float <= -limit {
+        return Some(Ordering::Greater);
+    }
+    Some(int.cmp(&(float as i64)))
+}
+
+fn eq_int_float(int: i64, float: f64) -> bool {
+    if float.fract() != 0.0 {
+        return false;
+    }
+    let limit = 2f64.powi(63);
+    if float >= limit || float <= -limit {
+        return false;
+    }
+    int == float as i64
 }
 
 #[cfg(test)]
@@ -203,6 +232,18 @@ mod tests {
         );
         assert!(values_eq(&Value::Int(3), &Value::Float(3.0)));
         assert!(!values_eq(&Value::Int(3), &Value::Float(3.1)));
+    }
+
+    #[test]
+    fn large_int_float_comparison_is_exact() {
+        let big = 9_007_199_254_740_993i64; // 2^53 + 1, not representable as f64
+        let two_pow_53 = 9_007_199_254_740_992.0;
+        assert_eq!(
+            values_partial_cmp(&Value::Int(big), &Value::Float(two_pow_53)),
+            Some(Ordering::Greater)
+        );
+        assert!(!values_eq(&Value::Int(big), &Value::Float(two_pow_53)));
+        assert!(values_eq(&Value::Int(3), &Value::Float(3.0)));
     }
 
     #[test]

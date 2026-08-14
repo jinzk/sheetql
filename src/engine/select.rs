@@ -77,6 +77,14 @@ pub(crate) fn execute_query(
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = vec![];
     let output_titles = titles(&plan);
 
+    let mut order_columns: HashMap<String, usize> = HashMap::new();
+    for (name, index) in &lookup {
+        order_columns.insert(name.clone(), output_titles.len() + index);
+    }
+    for (index, title) in output_titles.iter().enumerate() {
+        order_columns.insert(title.clone(), index);
+    }
+
     if is_aggregate {
         let groups = build_groups(&lookup, &rows, &group_exprs)?;
 
@@ -96,13 +104,6 @@ pub(crate) fn execute_query(
             let mut combined = out;
             combined.extend_from_slice(representative);
 
-            let mut order_columns: HashMap<String, usize> = HashMap::new();
-            for (name, index) in &lookup {
-                order_columns.insert(name.clone(), output_titles.len() + index);
-            }
-            for (index, title) in output_titles.iter().enumerate() {
-                order_columns.insert(title.clone(), index);
-            }
             let order_ctx = EvalContext::new(&order_columns, &rows, group, now);
             let keys = compute_order_keys(query, &order_ctx, &combined)?;
             let _original = combined.split_off(output_titles.len());
@@ -115,13 +116,6 @@ pub(crate) fn execute_query(
             let mut combined = out;
             combined.extend_from_slice(row);
 
-            let mut order_columns: HashMap<String, usize> = HashMap::new();
-            for (name, index) in &lookup {
-                order_columns.insert(name.clone(), output_titles.len() + index);
-            }
-            for (index, title) in output_titles.iter().enumerate() {
-                order_columns.insert(title.clone(), index);
-            }
             let order_ctx = EvalContext::new(&order_columns, &rows, &[], now);
             let keys = compute_order_keys(query, &order_ctx, &combined)?;
             let _original = combined.split_off(output_titles.len());
@@ -130,8 +124,8 @@ pub(crate) fn execute_query(
     }
 
     if is_distinct(select)? {
-        let mut seen: HashSet<String> = HashSet::new();
-        keyed.retain(|(_, out)| seen.insert(format!("{:?}", out)));
+        let mut seen: HashSet<Vec<Value>> = HashSet::new();
+        keyed.retain(|(_, out)| seen.insert(out.clone()));
     }
 
     if let Some(order) = &query.order_by {
@@ -273,15 +267,14 @@ fn build_groups(
 
     let ctx = EvalContext::new(lookup, rows, &[], Local::now());
     let mut groups: Vec<Vec<usize>> = vec![];
-    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
 
     for (row_index, row) in rows.iter().enumerate() {
-        let mut key: Vec<String> = vec![];
+        let mut key: Vec<Value> = vec![];
         for expr in group_exprs {
             let value = eval_expr(&ctx, expr, row)?;
-            key.push(format!("{:?}", value));
+            key.push(value);
         }
-        let key = key.join("|");
         let group_index = match index.get(&key) {
             Some(existing) => *existing,
             None => {
@@ -478,13 +471,23 @@ fn apply_join(
     let mut matched_left = vec![false; left_rows.len()];
     let mut matched_right = vec![false; right.rows.len()];
 
+    let using_pairs = using_column_pairs(operator, left_schema, &right.schema)?;
+
     for (left_index, left_row) in left_rows.iter().enumerate() {
         for (right_index, right_row) in right.rows.iter().enumerate() {
-            let mut combined = left_row.clone();
-            combined.extend_from_slice(right_row);
-
-            let keep = join_keep(operator, left_schema, &right.schema, &combined)?;
+            let keep = match &using_pairs {
+                Some(pairs) => pairs
+                    .iter()
+                    .all(|&(left_col, right_col)| values_eq(&left_row[left_col], &right_row[right_col])),
+                None => {
+                    let mut combined = left_row.clone();
+                    combined.extend_from_slice(right_row);
+                    join_keep(operator, left_schema, &right.schema, &combined)?
+                }
+            };
             if keep {
+                let mut combined = left_row.clone();
+                combined.extend_from_slice(right_row);
                 matched_left[left_index] = true;
                 matched_right[right_index] = true;
                 output.push(combined);
@@ -520,6 +523,43 @@ fn apply_join(
     }
 
     Ok((schema, output))
+}
+
+fn using_column_pairs(
+    operator: &JoinOperator,
+    left_schema: &[ColumnRef],
+    right_schema: &[ColumnRef],
+) -> Result<Option<Vec<(usize, usize)>>, String> {
+    let columns = match operator {
+        JoinOperator::Join(JoinConstraint::Using(cols))
+        | JoinOperator::Inner(JoinConstraint::Using(cols))
+        | JoinOperator::Left(JoinConstraint::Using(cols))
+        | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
+        | JoinOperator::Right(JoinConstraint::Using(cols))
+        | JoinOperator::RightOuter(JoinConstraint::Using(cols))
+        | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => cols,
+        _ => return Ok(None),
+    };
+
+    let mut pairs = vec![];
+    for column in columns {
+        let name = column
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.value.to_lowercase())
+            .unwrap_or_default();
+        let left_index = left_schema
+            .iter()
+            .position(|column_ref| column_ref.column == name)
+            .ok_or_else(|| format!("USING column `{name}` not found in left table"))?;
+        let right_index = right_schema
+            .iter()
+            .position(|column_ref| column_ref.column == name)
+            .ok_or_else(|| format!("USING column `{name}` not found in right table"))?;
+        pairs.push((left_index, right_index));
+    }
+    Ok(Some(pairs))
 }
 
 fn join_keep(
