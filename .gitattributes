@@ -1,0 +1,3 @@
+# Normalize all text files to LF on checkout and commit so line-ending
+# conversions no longer produce "LF will be replaced by CRLF" warnings.
+* text=auto eol=lf
