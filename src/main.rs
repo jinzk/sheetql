@@ -6,6 +6,7 @@ mod arguments;
 mod database;
 mod engine;
 mod evaluator;
+mod functions;
 mod loader;
 mod naming;
 mod printer;

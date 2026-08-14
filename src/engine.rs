@@ -11,9 +11,9 @@ use sqlparser::parser::Parser;
 
 use crate::database::Schema;
 use crate::database::Table;
-use crate::evaluator::contains_aggregate;
 use crate::evaluator::eval_expr;
 use crate::evaluator::EvalContext;
+use crate::functions::contains_aggregate;
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
 use crate::value::Value;
