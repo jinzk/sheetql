@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use chrono::{DateTime, Local};
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments};
 
 use crate::evaluator::eval_expr;
@@ -231,12 +232,12 @@ pub fn eval_function(
         "now" | "current_timestamp" => {
             let values = eval_scalar_args(ctx, &args, current)?;
             require_arity(&name, &values, 0)?;
-            Ok(Value::Text(now_string()))
+            Ok(Value::Text(now_string(&ctx.now)))
         }
         "date" => {
             let values = eval_scalar_args(ctx, &args, current)?;
             if values.is_empty() {
-                return Ok(Value::Text(today_string()));
+                return Ok(Value::Text(today_string(&ctx.now)));
             }
             require_arity(&name, &values, 1)?;
             Ok(Value::Text(extract_date(&values[0].to_display_string())))
@@ -291,12 +292,12 @@ fn require_arity(name: &str, values: &[Value], expected: usize) -> Result<(), St
     Ok(())
 }
 
-fn now_string() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+fn now_string(now: &DateTime<Local>) -> String {
+    now.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn today_string() -> String {
-    chrono::Local::now().format("%Y-%m-%d").to_string()
+fn today_string(now: &DateTime<Local>) -> String {
+    now.format("%Y-%m-%d").to_string()
 }
 
 fn extract_date(input: &str) -> String {
@@ -374,6 +375,11 @@ fn collect_numeric(
         if let (Some(expr), Some(row)) = (args.first_expr(), row) {
             let value = eval_expr(ctx, expr, row)?;
             if value.is_null() {
+                continue;
+            }
+            if let Value::Float(number) = value
+                && number.is_nan()
+            {
                 continue;
             }
             if matches!(value, Value::Float(_)) {
@@ -467,7 +473,8 @@ fn eval_min_max(ctx: &EvalContext, args: &FnArgs, is_max: bool) -> Result<Value,
 pub fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Function(func) => {
-            let name = func.name.to_string().to_lowercase();
+    let mut name = func.name.to_string();
+    name.make_ascii_lowercase();
             if AGGREGATE_FUNCTIONS.contains(&name.as_str()) {
                 return true;
             }

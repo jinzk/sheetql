@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use chrono::Local;
 use sqlparser::ast::{
     Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Offset, OrderByKind,
     Select, SelectItem, SetExpr, Statement, TableFactor,
@@ -13,6 +14,7 @@ use crate::database::Schema;
 use crate::database::Table;
 use crate::evaluator::eval_expr;
 use crate::evaluator::EvalContext;
+use crate::evaluator::like_match;
 use crate::functions::contains_aggregate;
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
@@ -91,7 +93,7 @@ fn run_show_databases(schema: &Schema, like: Option<&str>) -> Result<QueryResult
     let rows = schema
         .database_names()
         .into_iter()
-        .filter(|name| like.is_none_or(|pattern| like_match(pattern, name)))
+        .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false)))
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
     Ok(QueryResult { columns, rows })
@@ -124,7 +126,7 @@ fn run_show_tables(
     let rows = database
         .table_names()
         .into_iter()
-        .filter(|name| like.is_none_or(|pattern| like_match(pattern, name)))
+        .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false)))
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
     Ok(QueryResult { columns, rows })
@@ -188,6 +190,7 @@ fn infer_column_type(table: &Table, column: &str) -> &'static str {
 }
 
 fn execute_query(schema: &Schema, query: &sqlparser::ast::Query) -> Result<QueryResult, String> {
+    let now = Local::now();
     let select: &Select = match &*query.body {
         SetExpr::Select(select) => select,
         _ => return Err("Only plain SELECT queries are supported".to_string()),
@@ -223,7 +226,7 @@ fn execute_query(schema: &Schema, query: &sqlparser::ast::Query) -> Result<Query
     let lookup = build_lookup(&schema_refs)?;
 
     if let Some(selection) = &select.selection {
-        let ctx = EvalContext::new(&lookup, &rows, &[]);
+        let ctx = EvalContext::new(&lookup, &rows, &[], now);
         let mut filtered: Vec<Vec<Value>> = vec![];
         for row in &rows {
             let value = eval_expr(&ctx, selection, row)?;
@@ -248,7 +251,7 @@ fn execute_query(schema: &Schema, query: &sqlparser::ast::Query) -> Result<Query
         let groups = build_groups(&lookup, &rows, &group_exprs)?;
 
         for group in &groups {
-            let ctx = EvalContext::new(&lookup, &rows, group);
+            let ctx = EvalContext::new(&lookup, &rows, group, now);
             let representative = representative_row(&rows, group);
 
             if let Some(having) = &select.having {
@@ -258,21 +261,28 @@ fn execute_query(schema: &Schema, query: &sqlparser::ast::Query) -> Result<Query
                 }
             }
 
-            let out = project_group(&ctx, &plan, representative)?;
+            let out = project(&ctx, &plan, representative)?;
+
+            let mut combined = out;
+            combined.extend_from_slice(representative);
 
             let mut order_columns: HashMap<String, usize> = HashMap::new();
+            for (name, index) in &lookup {
+                order_columns.insert(name.clone(), output_titles.len() + index);
+            }
             for (index, title) in output_titles.iter().enumerate() {
                 order_columns.insert(title.clone(), index);
             }
-            let order_ctx = EvalContext::new(&order_columns, &rows, group);
-            let keys = compute_order_keys(query, &order_ctx, &out)?;
-            keyed.push((keys, out));
+            let order_ctx = EvalContext::new(&order_columns, &rows, group, now);
+            let keys = compute_order_keys(query, &order_ctx, &combined)?;
+            let _original = combined.split_off(output_titles.len());
+            keyed.push((keys, combined));
         }
     } else {
-        let ctx = EvalContext::new(&lookup, &rows, &[]);
+        let ctx = EvalContext::new(&lookup, &rows, &[], now);
         for row in &rows {
-            let out = project_row(&ctx, &plan, row)?;
-            let mut combined = out.clone();
+            let out = project(&ctx, &plan, row)?;
+            let mut combined = out;
             combined.extend_from_slice(row);
 
             let mut order_columns: HashMap<String, usize> = HashMap::new();
@@ -282,9 +292,10 @@ fn execute_query(schema: &Schema, query: &sqlparser::ast::Query) -> Result<Query
             for (index, title) in output_titles.iter().enumerate() {
                 order_columns.insert(title.clone(), index);
             }
-            let order_ctx = EvalContext::new(&order_columns, &rows, &[]);
+            let order_ctx = EvalContext::new(&order_columns, &rows, &[], now);
             let keys = compute_order_keys(query, &order_ctx, &combined)?;
-            keyed.push((keys, out));
+            let _original = combined.split_off(output_titles.len());
+            keyed.push((keys, combined));
         }
     }
 
@@ -432,7 +443,7 @@ fn build_groups(
         return Ok(vec![all]);
     }
 
-    let ctx = EvalContext::new(lookup, rows, &[]);
+    let ctx = EvalContext::new(lookup, rows, &[], Local::now());
     let mut groups: Vec<Vec<usize>> = vec![];
     let mut index: HashMap<String, usize> = HashMap::new();
 
@@ -521,7 +532,11 @@ fn build_projection_plan(
     Ok(plan)
 }
 
-fn project_row(ctx: &EvalContext, plan: &[ProjectionItem], row: &[Value]) -> Result<Vec<Value>, String> {
+fn project(
+    ctx: &EvalContext,
+    plan: &[ProjectionItem],
+    row: &[Value],
+) -> Result<Vec<Value>, String> {
     let mut out: Vec<Value> = Vec::with_capacity(plan.len());
     for item in plan {
         match item {
@@ -530,25 +545,6 @@ fn project_row(ctx: &EvalContext, plan: &[ProjectionItem], row: &[Value]) -> Res
             }
             ProjectionItem::Expression { expr, .. } => {
                 out.push(eval_expr(ctx, expr, row)?);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn project_group(
-    ctx: &EvalContext,
-    plan: &[ProjectionItem],
-    representative: &[Value],
-) -> Result<Vec<Value>, String> {
-    let mut out: Vec<Value> = Vec::with_capacity(plan.len());
-    for item in plan {
-        match item {
-            ProjectionItem::Column { index, .. } => {
-                out.push(representative.get(*index).cloned().unwrap_or(Value::Null));
-            }
-            ProjectionItem::Expression { expr, .. } => {
-                out.push(eval_expr(ctx, expr, representative)?);
             }
         }
     }
@@ -622,26 +618,6 @@ fn unquote_pattern(token: &str) -> String {
         }
     }
     token.to_string()
-}
-
-/// Match a value against a `LIKE` pattern supporting `%` (any sequence) and
-/// `_` (single character).
-fn like_match(pattern: &str, value: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let v: Vec<char> = value.chars().collect();
-
-    fn helper(p: &[char], v: &[char]) -> bool {
-        if p.is_empty() {
-            return v.is_empty();
-        }
-        match p[0] {
-            '%' => helper(&p[1..], v) || (!v.is_empty() && helper(p, &v[1..])),
-            '_' => !v.is_empty() && helper(&p[1..], &v[1..]),
-            c => !v.is_empty() && v[0] == c && helper(&p[1..], &v[1..]),
-        }
-    }
-
-    helper(&p, &v)
 }
 
 fn expr_title(expr: &Expr) -> String {
@@ -789,7 +765,7 @@ fn join_keep(
     match constraint {
         JoinConstraint::On(expr) => {
             let lookup = build_lookup_on_fly(left_schema, right_schema)?;
-            let ctx = EvalContext::new(&lookup, &[], &[]);
+            let ctx = EvalContext::new(&lookup, &[], &[], Local::now());
             let value = eval_expr(&ctx, expr, combined)?;
             Ok(value.truthy())
         }
@@ -1023,13 +999,13 @@ mod tests {
 
     #[test]
     fn like_match_supports_wildcards() {
-        assert!(like_match("a%", "abc"));
-        assert!(like_match("%c", "abc"));
-        assert!(like_match("a_c", "abc"));
-        assert!(!like_match("a_c", "ab"));
-        assert!(!like_match("a%", "xyz"));
-        assert!(like_match("%", "anything"));
-        assert!(like_match("", ""));
+        assert!(like_match("abc", "a%", false));
+        assert!(like_match("abc", "%c", false));
+        assert!(like_match("abc", "a_c", false));
+        assert!(!like_match("ab", "a_c", false));
+        assert!(!like_match("xyz", "a%", false));
+        assert!(like_match("anything", "%", false));
+        assert!(like_match("", "", false));
     }
 
     #[test]

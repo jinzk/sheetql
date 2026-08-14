@@ -127,25 +127,29 @@ fn load_csv(database: &mut Database, path: &str) -> Result<(), String> {
         .from_path(path)
         .map_err(|error| format!("Cannot open file `{path}`: {error}"))?;
 
-    let mut records: Vec<csv::StringRecord> = vec![];
+    let mut header: Option<csv::StringRecord> = None;
+    let mut columns: Vec<String> = vec![];
+    let mut rows: Vec<Vec<Value>> = vec![];
+
     for record in reader.records() {
         let record = record.map_err(|error| format!("Cannot parse CSV file `{path}`: {error}"))?;
-        records.push(record);
-    }
-
-    if records.is_empty() {
-        return Ok(());
-    }
-
-    let header_record = &records[0];
-    let columns = build_columns(header_record.iter().map(|value| value.to_string()).collect());
-    let mut rows: Vec<Vec<Value>> = vec![];
-    for record in records.iter().skip(1) {
-        let values = build_row_values(record.iter().collect(), columns.len());
-        if values.iter().all(Value::is_null) {
-            continue;
+        match &header {
+            None => {
+                columns = build_columns(record.iter().map(|value| value.to_string()).collect());
+                header = Some(record);
+            }
+            Some(_) => {
+                let values = build_row_values(record.iter().collect(), columns.len());
+                if values.iter().all(Value::is_null) {
+                    continue;
+                }
+                rows.push(values);
+            }
         }
-        rows.push(values);
+    }
+
+    if header.is_none() {
+        return Ok(());
     }
 
     let name = csv_table_name(path);

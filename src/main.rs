@@ -33,7 +33,10 @@ fn main() {
                     return;
                 }
             };
-            execute_query(&query, &arguments, &mut schema);
+            if let Err(error) = execute_query(&query, &arguments, &mut schema) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
         }
         Command::Help => arguments::print_help_list(),
         Command::Version => println!("Sheetql version {}", env!("CARGO_PKG_VERSION")),
@@ -56,7 +59,11 @@ fn validate_files(files: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn execute_query(query: &str, arguments: &arguments::Arguments, schema: &mut Schema) {
+fn execute_query(
+    query: &str,
+    arguments: &arguments::Arguments,
+    schema: &mut Schema,
+) -> Result<(), String> {
     let start = Instant::now();
     match engine::run_query(schema, query) {
         Ok(result) => {
@@ -71,8 +78,9 @@ fn execute_query(query: &str, arguments: &arguments::Arguments, schema: &mut Sch
                     duration
                 );
             }
+            Ok(())
         }
-        Err(error) => eprintln!("{error}"),
+        Err(error) => Err(error),
     }
 }
 
@@ -153,6 +161,8 @@ fn launch_repl(arguments: arguments::Arguments) {
             break;
         }
 
-        execute_query(&trimmed, &arguments, &mut schema);
+        if let Err(error) = execute_query(&trimmed, &arguments, &mut schema) {
+            eprintln!("{error}");
+        }
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use chrono::{DateTime, Local};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, DataType as SqlDataType, Expr, TrimWhereField, UnaryOperator,
     Value as SqlValue, ValueWithSpan,
@@ -14,6 +15,7 @@ pub struct EvalContext<'a> {
     pub columns: &'a HashMap<String, usize>,
     pub all_rows: &'a [Vec<Value>],
     pub group_rows: &'a [usize],
+    pub now: DateTime<Local>,
 }
 
 static EMPTY_COLUMNS: std::sync::OnceLock<HashMap<String, usize>> = std::sync::OnceLock::new();
@@ -25,11 +27,13 @@ impl<'a> EvalContext<'a> {
         columns: &'a HashMap<String, usize>,
         all_rows: &'a [Vec<Value>],
         group_rows: &'a [usize],
+        now: DateTime<Local>,
     ) -> Self {
         Self {
             columns,
             all_rows,
             group_rows,
+            now,
         }
     }
 
@@ -38,6 +42,7 @@ impl<'a> EvalContext<'a> {
             columns: EMPTY_COLUMNS.get_or_init(HashMap::new),
             all_rows: &EMPTY_ROWS,
             group_rows: &EMPTY_GROUP,
+            now: Local::now(),
         }
     }
 }
@@ -49,10 +54,7 @@ pub fn eval_expr(
 ) -> Result<Value, String> {
     match expr {
         Expr::Value(ValueWithSpan { value, .. }) => eval_sql_value(value),
-        Expr::Identifier(ident) => {
-            let name = ident.value.to_lowercase();
-            resolve_column(ctx, &name, current)
-        }
+        Expr::Identifier(ident) => resolve_column(ctx, &ident.value, current),
         Expr::CompoundIdentifier(parts) => {
             let mut name_parts: Vec<String> =
                 parts.iter().map(|p| p.value.to_lowercase()).collect();
@@ -210,12 +212,13 @@ fn resolve_column(
     name: &str,
     current: &[Value],
 ) -> Result<Value, String> {
-    match ctx.columns.get(name) {
-        Some(index) => Ok(current
-            .get(*index)
-            .cloned()
-            .unwrap_or(Value::Null)),
-        None => Err(format!("Column `{name}` not found")),
+    if let Some(index) = ctx.columns.get(name) {
+        return Ok(current.get(*index).cloned().unwrap_or(Value::Null));
+    }
+    let lowered = name.to_lowercase();
+    match ctx.columns.get(&lowered) {
+        Some(index) => Ok(current.get(*index).cloned().unwrap_or(Value::Null)),
+        None => Err(format!("Column `{lowered}` not found")),
     }
 }
 
@@ -276,11 +279,12 @@ fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value,
                 let a = lhs.as_i64().expect("int value");
                 let b = rhs.as_i64().expect("int value");
                 let value = match op {
-                    BinaryOperator::Plus => a.wrapping_add(b),
-                    BinaryOperator::Minus => a.wrapping_sub(b),
-                    BinaryOperator::Multiply => a.wrapping_mul(b),
+                    BinaryOperator::Plus => a.checked_add(b),
+                    BinaryOperator::Minus => a.checked_sub(b),
+                    BinaryOperator::Multiply => a.checked_mul(b),
                     _ => unreachable!(),
-                };
+                }
+                .ok_or_else(|| format!("Integer overflow in `{op}` for `{a}` and `{b}`"))?;
                 Ok(Value::Int(value))
             } else {
                 let a = lhs
