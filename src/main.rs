@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 
 mod arguments;
+mod completion;
 mod database;
 mod engine;
 mod evaluator;

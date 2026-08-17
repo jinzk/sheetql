@@ -2,7 +2,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 /// SQL keywords highlighted in the interactive input and history cells.
-const KEYWORDS: &[&str] = &[
+pub const KEYWORDS: &[&str] = &[
     "add", "all", "alter", "and", "as", "asc", "avg", "between", "by", "case",
     "cast", "column", "count", "create", "delete", "desc", "describe", "distinct",
     "drop", "else", "end", "from", "full", "group", "having", "in", "index",
