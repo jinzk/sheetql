@@ -44,7 +44,7 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
 | `-f, --files`      | 一个或多个`xls` / `xlsx` / `xlsm` / `csv` 文件路径，多个文件用空格分隔。           |
 | `-q, --query`      | 运行单条查询后退出。不使用该选项时，Sheetql 启动交互式 REPL。                              |
 | `-p, --pagination` | 大结果集分页打印（仅表格格式）。                                                           |
-| `-ps, --pagesize`  | 启用`-p` 时每页显示的行数，默认 `10`。                                                 |
+| `-ps, --pagesize`  | 启用`-p` 时每页显示的行数，默认 `10`。必须大于零。                               |
 | `-o, --output`     | 输出格式：`render`（默认）、`json`、`csv`、`yaml`。                                |
 | `-s, --save`       | 将`--query` 的结果以 CSV 写入 `<path>`。仅能与 `--query` 配合使用（REPL 下会报错）。 |
 | `-a, --analysis`   | 在结果后打印行数与执行耗时。                                                               |
@@ -148,7 +148,7 @@ DESCRIBE sales
 
 - 表头使用与表名相同的规则净化。
 - 空表头按位置命名为 `col1`、`col2`、…。
-- 重复表头追加数字后缀（`name`、`name_1`、`name_2`、…）。
+- 重复表头追加数字后缀（`name`、`name_2`、`name_3`、…）。
 
 ### 数据类型
 
@@ -162,6 +162,13 @@ DESCRIBE sales
 | Text    | `Alice`, `NY`   |
 | NULL    | 空单元格            |
 
+边界情况:
+
+- 超出 `i64` 范围的纯整数（如 `12345678901234567890`）存储为 `Text`，避免精度静默丢失。
+- 非有限浮点数（`NaN`、`inf`、`-inf`）存储为 `Text`。
+- CSV 行的字段数多于表头时拒绝并报错（包含行号）。
+- CSV 行的字段数少于表头时用 `NULL` 填充。
+
 `DESCRIBE <table>` 显示每列及其推断类型。
 
 ---
@@ -170,13 +177,24 @@ DESCRIBE sales
 
 - `SELECT` 投影、`*`、`table.*` 与列别名（`AS`）
 - `FROM` 支持多表与 `JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN`，含逗号分隔的表，以及 `ON` 与 `USING`
-- `WHERE` 支持比较、`AND` / `OR` / `NOT`、`LIKE` / `ILIKE`、`IN`、`BETWEEN`、`IS NULL`、`IS TRUE` / `IS FALSE`、`CASE`、`CAST`。`LIKE` / `ILIKE` 支持 `%`（任意字符序列）与 `_`（单个字符）通配符，并可选用 `ESCAPE '<char>'` 子句转义；当任一操作数为 `NULL` 时结果为 `NULL`（而非 `false`）。
+- `WHERE` 支持比较、`AND` / `OR` / `NOT`、`LIKE` / `ILIKE`、`IN`、`BETWEEN`、`IS NULL`、`IS TRUE` / `IS FALSE`、`CASE`、`CAST`。`LIKE` / `ILIKE` 支持 `%`（任意字符序列）与 `_`（单个字符）通配符，并可选用 `ESCAPE '<char>'` 子句转义；当任一操作数为 `NULL` 时结果为 `NULL`（而非 `false`）。`AND` / `OR` 短路求值：左侧已确定结果时不计算右侧。`IN` / `NOT IN` 列表中含 `NULL` 且值不匹配时返回 `NULL`（而非 `false`）。
 - `GROUP BY` 配合聚合函数，以及 `HAVING`
 - `ORDER BY` 支持 `ASC` / `DESC`
 - `LIMIT` / `OFFSET` 与 `SELECT DISTINCT`
 - 元数据命令：`SHOW DATABASES`（别名 `SHOW SCHEMAS`）、`SHOW TABLES [FROM <database>]`、`SHOW COLUMNS FROM <table>`、`DESCRIBE <table>`、`USE <database>`；`SHOW DATABASES` / `SHOW TABLES` 支持 `LIKE '<pattern>'`，通配符为 `%` / `_`
 
 暂不支持：子查询、`UNION` / 集合运算、窗口函数、`INSERT` / `UPDATE` / `DELETE`（Sheetql 为只读工具）。
+
+### 交互式 REPL
+
+不带 `-q` 运行 `sheetql -f <files>` 会启动交互式 TUI，提供:
+
+- **SQL 语法高亮** — 关键字、字符串、数字和注释以不同颜色显示。
+- **自动补全** — 输入部分单词后弹出候选列表，匹配关键字、函数、表名和列名。按 `Tab` 或 `Enter` 接受，`Up`/`Down` 导航，`Esc` 关闭。关键字始终以大写插入。
+- **历史记录** — `Up`/`Down` 箭头在历史查询中切换（弹窗未打开时）。
+- **管道输入** — 可通过 stdin 管道传入查询；stdin 非终端时隐藏提示符。
+
+输入 `exit` 或 `quit`（不区分大小写）退出 REPL。
 
 ### 标量函数
 
@@ -210,13 +228,14 @@ DESCRIBE sales
 
 ### 聚合函数
 
-| 函数                           | 说明                     |
-| ------------------------------ | ------------------------ |
-| `COUNT(*)` / `COUNT(expr)` | 行数 / 非`NULL` 值个数 |
-| `SUM(expr)`                  | 数值之和                 |
-| `AVG(expr)`                  | 数值平均值               |
-| `MIN(expr)`                  | 最小值                   |
-| `MAX(expr)`                  | 最大值                   |
+| 函数                              | 说明                                                 |
+| --------------------------------- | ---------------------------------------------------- |
+| `COUNT(*)` / `COUNT(expr)`    | 行数 / 非`NULL` 值个数                            |
+| `COUNT(DISTINCT expr)`         | 去重后非`NULL` 值个数（数值类型自动统一 Int/Float） |
+| `SUM(expr)`                     | 数值之和（溢出时报错）                               |
+| `AVG(expr)`                     | 数值平均值                                           |
+| `MIN(expr)`                     | 最小值                                               |
+| `MAX(expr)`                     | 最大值                                               |
 
 ---
 
