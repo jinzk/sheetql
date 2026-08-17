@@ -6,7 +6,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -19,7 +19,7 @@ use crate::completion;
 use crate::database::Schema;
 use crate::engine;
 use crate::highlight::highlight;
-use crate::printer::{render, OutputFormat};
+use crate::printer::{OutputFormat, render};
 
 type Backend = CrosstermBackend<Stdout>;
 
@@ -38,11 +38,14 @@ struct App<'a> {
     viewport_top: Option<usize>,
     last_top: usize,
     candidates: Vec<completion::Completion>,
+    candidate_cache: completion::CandidateCache,
     selected: usize,
     show_popup: bool,
     history: Vec<String>,
     history_index: Option<usize>,
     draft: String,
+    rendered_lines: Vec<Line<'static>>,
+    rendered_cells: usize,
     schema: &'a mut Schema,
 }
 
@@ -72,11 +75,14 @@ fn run_app(terminal: &mut Terminal<Backend>, schema: &mut Schema) -> io::Result<
         viewport_top: None,
         last_top: 0,
         candidates: Vec::new(),
+        candidate_cache: completion::CandidateCache::new(),
         selected: 0,
         show_popup: false,
         history: Vec::new(),
         history_index: None,
         draft: String::new(),
+        rendered_lines: Vec::new(),
+        rendered_cells: 0,
         schema,
     };
     loop {
@@ -109,7 +115,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let input_area = Rect::new(area.x, area.y + history_height, area.width, 1);
     let bar_area = Rect::new(area.x, area.y + history_height + 1, area.width, 1);
 
-    let lines = app.history_lines();
+    // Rebuild the highlighted history lines only when a new cell arrives;
+    // keystrokes just clone the cached lines.
+    if app.rendered_cells != app.cells.len() {
+        app.rendered_lines = app.history_lines();
+        app.rendered_cells = app.cells.len();
+    }
+    let lines = app.rendered_lines.clone();
     let total = lines.len();
     let viewport = history_height as usize;
     let bottom = total.saturating_sub(viewport);
@@ -134,7 +146,11 @@ fn draw(frame: &mut Frame, app: &mut App) {
         prompt.to_string(),
         Style::default().add_modifier(Modifier::BOLD),
     )];
-    spans.extend(highlight(&app.input).into_iter().flat_map(|line| line.spans));
+    spans.extend(
+        highlight(&app.input)
+            .into_iter()
+            .flat_map(|line| line.spans),
+    );
     frame.render_widget(
         Paragraph::new(Line::from(spans)).scroll((0, app.input_scroll)),
         input_area,
@@ -142,9 +158,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let prompt_width = unicode_width::UnicodeWidthStr::width(prompt) as u16;
     let before = &app.input[..app.cursor];
-    let cursor_x = prompt_width
-        + unicode_width::UnicodeWidthStr::width(before) as u16
-        - app.input_scroll;
+    let cursor_x =
+        prompt_width + unicode_width::UnicodeWidthStr::width(before) as u16 - app.input_scroll;
     let cursor_x = cursor_x.min(area.width.saturating_sub(1));
     let cursor_y = input_area.y;
     frame.set_cursor_position((input_area.x + cursor_x, cursor_y));
@@ -185,7 +200,11 @@ fn style_for(kind: completion::Kind) -> Style {
 /// when there is no room above).
 fn popup_rect(area: Rect, candidate_count: usize, cursor_x: u16, cursor_y: u16) -> Rect {
     let height = (candidate_count as u16).min(8) + 2;
-    let width = if area.width >= 24 { area.width.min(50) } else { area.width };
+    let width = if area.width >= 24 {
+        area.width.min(50)
+    } else {
+        area.width
+    };
     let x = cursor_x
         .saturating_sub(width / 2)
         .min(area.x + area.width.saturating_sub(width));
@@ -216,11 +235,7 @@ impl App<'_> {
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 {
-                    let len = self.input[..self.cursor]
-                        .chars()
-                        .last()
-                        .unwrap()
-                        .len_utf8();
+                    let len = self.input[..self.cursor].chars().last().unwrap().len_utf8();
                     self.input.remove(self.cursor - len);
                     self.cursor -= len;
                     self.refresh_candidates();
@@ -234,18 +249,13 @@ impl App<'_> {
             }
             KeyCode::Left => {
                 if self.cursor > 0 {
-                    self.cursor -= self.input[..self.cursor]
-                        .chars()
-                        .last()
-                        .unwrap()
-                        .len_utf8();
+                    self.cursor -= self.input[..self.cursor].chars().last().unwrap().len_utf8();
                     self.refresh_candidates();
                 }
             }
             KeyCode::Right => {
                 if self.cursor < self.input.len() {
-                    self.cursor +=
-                        self.input[self.cursor..].chars().next().unwrap().len_utf8();
+                    self.cursor += self.input[self.cursor..].chars().next().unwrap().len_utf8();
                     self.refresh_candidates();
                 }
             }
@@ -260,11 +270,12 @@ impl App<'_> {
             KeyCode::Enter => {
                 if self.show_popup {
                     self.apply_completion();
-                } else {
-                    let query = self.input.trim();
-                    if matches!(query, "exit" | "quit") {
-                        return true;
-                    }
+                }
+                let query = self.input.trim().to_lowercase();
+                if matches!(query.as_str(), "exit" | "quit") {
+                    return true;
+                }
+                if !self.show_popup && !self.input.trim().is_empty() {
                     self.execute();
                 }
             }
@@ -291,7 +302,8 @@ impl App<'_> {
             }
             KeyCode::Down => {
                 if self.show_popup {
-                    self.selected = (self.selected + 1).min(self.candidates.len().saturating_sub(1));
+                    self.selected =
+                        (self.selected + 1).min(self.candidates.len().saturating_sub(1));
                 } else {
                     self.history_next();
                 }
@@ -307,7 +319,10 @@ impl App<'_> {
             self.close_popup();
             return;
         }
-        let candidates = completion::candidates(self.schema, before);
+        let candidates = self
+            .candidate_cache
+            .candidates(self.schema, before)
+            .to_vec();
         self.selected = self.selected.min(candidates.len().saturating_sub(1));
         self.candidates = candidates;
         self.show_popup = !self.candidates.is_empty();
@@ -318,7 +333,8 @@ impl App<'_> {
             return;
         };
         let start = self.cursor - completion::trailing_token_len(&self.input[..self.cursor]);
-        self.input.replace_range(start..self.cursor, &candidate.value);
+        self.input
+            .replace_range(start..self.cursor, &candidate.value);
         self.cursor = start + candidate.value.len();
         self.close_popup();
     }
@@ -338,7 +354,10 @@ impl App<'_> {
             Ok(result) => Ok(render(OutputFormat::Table, &result.columns, &result.rows)),
             Err(error) => Err(error),
         };
-        self.cells.push(Cell { query: query.clone(), result });
+        self.cells.push(Cell {
+            query: query.clone(),
+            result,
+        });
         if self.history.last().is_none_or(|last| last != &query) {
             self.history.push(query);
         }
@@ -407,8 +426,7 @@ impl App<'_> {
     /// Keep the visible slice of the input line around the cursor.
     fn adjust_input_scroll(&mut self, prompt: &str, area_width: u16) {
         let prompt_width = unicode_width::UnicodeWidthStr::width(prompt) as u16;
-        let before_width = unicode_width::UnicodeWidthStr::width(&self.input[..self.cursor])
-            as u16;
+        let before_width = unicode_width::UnicodeWidthStr::width(&self.input[..self.cursor]) as u16;
         let cursor_x = prompt_width + before_width;
         if cursor_x < self.input_scroll {
             self.input_scroll = cursor_x;

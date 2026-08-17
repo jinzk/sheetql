@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -9,15 +10,17 @@ use sqlparser::ast::{
 };
 
 use crate::database::Schema;
-use crate::evaluator::eval_expr;
 use crate::evaluator::EvalContext;
+use crate::evaluator::eval_expr;
 use crate::functions::contains_aggregate;
+use crate::value::GroupKey;
+use crate::value::Value;
+use crate::value::group_key;
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
-use crate::value::Value;
 
-pub(crate) fn execute_query(
-    schema: &Schema,
+pub(crate) fn execute_query<'a>(
+    schema: &'a Schema,
     query: &Query,
 ) -> Result<crate::engine::QueryResult, String> {
     let now = Local::now();
@@ -29,50 +32,69 @@ pub(crate) fn execute_query(
     let has_from = !select.from.is_empty();
 
     let mut schema_refs: Vec<ColumnRef> = vec![];
-    let mut rows: Vec<Vec<Value>> = vec![];
+    // A single table without joins is borrowed straight from the schema; any
+    // join or multi-table FROM materializes a combined owned copy.
+    let mut rows: Cow<'a, [Vec<Value>]> = Cow::Owned(vec![]);
 
     for (index, table_with_joins) in select.from.iter().enumerate() {
         let base = load_relation(schema, &table_with_joins.relation)?;
+        if index == 0 && table_with_joins.joins.is_empty() {
+            schema_refs = base.schema;
+            rows = Cow::Borrowed(base.rows);
+            continue;
+        }
+
+        let mut current: Vec<Vec<Value>> = match rows {
+            Cow::Borrowed(borrowed) => borrowed.to_vec(),
+            Cow::Owned(owned) => owned,
+        };
         if index == 0 {
             schema_refs = base.schema;
-            rows = base.rows;
+            current = base.rows.to_vec();
         } else {
             schema_refs.extend(base.schema.clone());
-            rows = cross_combine(rows, base.rows);
+            current = cross_combine(&current, base.rows);
         }
 
         for join in &table_with_joins.joins {
             let right = load_relation(schema, &join.relation)?;
-            let merged = apply_join(&schema_refs, &rows, &right, &join.join_operator)?;
+            let merged = apply_join(&schema_refs, &current, &right, &join.join_operator, now)?;
             schema_refs = merged.0;
-            rows = merged.1;
+            current = merged.1;
         }
+        rows = Cow::Owned(current);
     }
 
     if !has_from {
-        rows = vec![vec![]];
+        rows = Cow::Owned(vec![vec![]]);
     }
+
+    let rows_view: &[Vec<Value>] = &rows;
 
     let lookup = build_lookup(&schema_refs)?;
 
-    if let Some(selection) = &select.selection {
-        let ctx = EvalContext::new(&lookup, &rows, &[], now);
-        let mut filtered: Vec<Vec<Value>> = vec![];
-        for row in &rows {
+    // WHERE keeps a set of row indices instead of copying the rows themselves.
+    let active: Vec<usize> = if let Some(selection) = &select.selection {
+        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
+        let mut filtered: Vec<usize> = vec![];
+        for (index, row) in rows_view.iter().enumerate() {
             let value = eval_expr(&ctx, selection, row)?;
             if value.truthy() {
-                filtered.push(row.clone());
+                filtered.push(index);
             }
         }
-        rows = filtered;
-    }
+        filtered
+    } else {
+        (0..rows_view.len()).collect()
+    };
 
     let plan = build_projection_plan(&schema_refs, &select.projection)?;
 
     let group_exprs = group_by_expressions(&select.group_by)?;
     let is_aggregate = !group_exprs.is_empty()
         || select.projection.iter().any(projection_has_aggregate)
-        || select.having.is_some();
+        || select.having.is_some()
+        || order_by_has_aggregate(query);
 
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = vec![];
     let output_titles = titles(&plan);
@@ -86,11 +108,11 @@ pub(crate) fn execute_query(
     }
 
     if is_aggregate {
-        let groups = build_groups(&lookup, &rows, &group_exprs)?;
+        let groups = build_groups(&lookup, rows_view, &group_exprs, &active, now)?;
 
         for group in &groups {
-            let ctx = EvalContext::new(&lookup, &rows, group, now);
-            let representative = representative_row(&rows, group);
+            let ctx = EvalContext::new(&lookup, rows_view, group, now);
+            let representative = representative_row(rows_view, group);
 
             if let Some(having) = &select.having {
                 let value = eval_expr(&ctx, having, representative)?;
@@ -104,28 +126,35 @@ pub(crate) fn execute_query(
             let mut combined = out;
             combined.extend_from_slice(representative);
 
-            let order_ctx = EvalContext::new(&order_columns, &rows, group, now);
+            let order_ctx = EvalContext::new(&order_columns, rows_view, group, now);
             let keys = compute_order_keys(query, &order_ctx, &combined)?;
             let _original = combined.split_off(output_titles.len());
             keyed.push((keys, combined));
         }
     } else {
-        let ctx = EvalContext::new(&lookup, &rows, &[], now);
-        for row in &rows {
+        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
+        let order_ctx = EvalContext::new(&order_columns, rows_view, &[], now);
+        // Only assemble the combined row when an ORDER BY expression actually
+        // references a projection title; otherwise evaluate directly on the
+        // row using the original (unshifted) column lookup.
+        let needs_projection = order_by_references_titles(query, &output_titles);
+        for &row_index in &active {
+            let row = &rows_view[row_index];
             let out = project(&ctx, &plan, row)?;
-            let mut combined = out;
-            combined.extend_from_slice(row);
-
-            let order_ctx = EvalContext::new(&order_columns, &rows, &[], now);
-            let keys = compute_order_keys(query, &order_ctx, &combined)?;
-            let _original = combined.split_off(output_titles.len());
-            keyed.push((keys, combined));
+            let keys = if needs_projection {
+                let mut combined = out.clone();
+                combined.extend_from_slice(row);
+                compute_order_keys(query, &order_ctx, &combined)?
+            } else {
+                compute_order_keys(query, &ctx, row)?
+            };
+            keyed.push((keys, out));
         }
     }
 
     if is_distinct(select)? {
-        let mut seen: HashSet<Vec<Value>> = HashSet::new();
-        keyed.retain(|(_, out)| seen.insert(out.clone()));
+        let mut seen: HashSet<Vec<GroupKey>> = HashSet::new();
+        keyed.retain(|(_, out)| seen.insert(out.iter().map(group_key).collect()));
     }
 
     if let Some(order) = &query.order_by {
@@ -170,6 +199,18 @@ fn projection_has_aggregate(item: &SelectItem) -> bool {
     }
 }
 
+fn order_by_has_aggregate(query: &Query) -> bool {
+    query.order_by.as_ref().is_some_and(|order| {
+        if let OrderByKind::Expressions(exprs) = &order.kind {
+            exprs
+                .iter()
+                .any(|order_expr| contains_aggregate(&order_expr.expr))
+        } else {
+            false
+        }
+    })
+}
+
 fn group_by_expressions(group_by: &GroupByExpr) -> Result<Vec<&Expr>, String> {
     match group_by {
         GroupByExpr::Expressions(exprs, _) => Ok(exprs.iter().collect()),
@@ -190,9 +231,7 @@ fn parse_limit(
 ) -> Result<(Option<usize>, Option<usize>), String> {
     match limit_clause {
         None => Ok((None, None)),
-        Some(LimitClause::LimitOffset {
-            limit, offset, ..
-        }) => {
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => {
             let limit_value = match limit {
                 Some(expr) => eval_const_int(expr)?,
                 None => None,
@@ -217,6 +256,29 @@ fn eval_const_int(expr: &Expr) -> Result<Option<usize>, String> {
         Value::Int(number) => Ok(Some(number.max(0) as usize)),
         _ => Ok(None),
     }
+}
+
+fn order_by_references_titles(query: &Query, titles: &[String]) -> bool {
+    let Some(order) = &query.order_by else {
+        return false;
+    };
+    let OrderByKind::Expressions(exprs) = &order.kind else {
+        return false;
+    };
+    exprs.iter().any(|order_expr| match &order_expr.expr {
+        Expr::Identifier(ident) => titles
+            .iter()
+            .any(|title| title.eq_ignore_ascii_case(&ident.value)),
+        Expr::CompoundIdentifier(parts) => {
+            let name = parts
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<_>>()
+                .join(".");
+            titles.iter().any(|title| title.eq_ignore_ascii_case(&name))
+        }
+        _ => false,
+    })
 }
 
 fn compute_order_keys(
@@ -259,21 +321,23 @@ fn build_groups(
     lookup: &HashMap<String, usize>,
     rows: &[Vec<Value>],
     group_exprs: &[&Expr],
+    active: &[usize],
+    now: chrono::DateTime<Local>,
 ) -> Result<Vec<Vec<usize>>, String> {
     if group_exprs.is_empty() {
-        let all: Vec<usize> = (0..rows.len()).collect();
-        return Ok(vec![all]);
+        return Ok(vec![active.to_vec()]);
     }
 
-    let ctx = EvalContext::new(lookup, rows, &[], Local::now());
+    let ctx = EvalContext::new(lookup, rows, &[], now);
     let mut groups: Vec<Vec<usize>> = vec![];
-    let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
+    let mut index: HashMap<Vec<GroupKey>, usize> = HashMap::new();
 
-    for (row_index, row) in rows.iter().enumerate() {
-        let mut key: Vec<Value> = vec![];
+    for &row_index in active {
+        let row = &rows[row_index];
+        let mut key: Vec<GroupKey> = vec![];
         for expr in group_exprs {
             let value = eval_expr(&ctx, expr, row)?;
-            key.push(value);
+            key.push(group_key(&value));
         }
         let group_index = match index.get(&key) {
             Some(existing) => *existing,
@@ -291,14 +355,8 @@ fn build_groups(
 }
 
 enum ProjectionItem {
-    Column {
-        index: usize,
-        title: String,
-    },
-    Expression {
-        expr: Box<Expr>,
-        title: String,
-    },
+    Column { index: usize, title: String },
+    Expression { expr: Box<Expr>, title: String },
 }
 
 fn build_projection_plan(
@@ -346,7 +404,7 @@ fn build_projection_plan(
                 title: alias.to_string(),
             }),
             SelectItem::ExprWithAliases { .. } => {
-                return Err("Multiple aliases are not supported".to_string())
+                return Err("Multiple aliases are not supported".to_string());
             }
         }
     }
@@ -379,9 +437,9 @@ struct ColumnRef {
     column: String,
 }
 
-struct Relation {
+struct Relation<'a> {
     schema: Vec<ColumnRef>,
-    rows: Vec<Vec<Value>>,
+    rows: &'a [Vec<Value>],
 }
 
 pub(crate) fn object_name_to_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
@@ -404,18 +462,14 @@ fn expr_title(expr: &Expr) -> String {
     }
 }
 
-fn load_relation(schema: &Schema, factor: &TableFactor) -> Result<Relation, String> {
+fn load_relation<'a>(schema: &'a Schema, factor: &TableFactor) -> Result<Relation<'a>, String> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
             let parts = object_name_to_parts(name);
             let (database, table_name) = match parts.as_slice() {
                 [table_name] => (None, table_name.as_str()),
                 [database, table_name] => (Some(database.as_str()), table_name.as_str()),
-                _ => {
-                    return Err(
-                        "Table reference must be `table` or `database.table`".to_string()
-                    )
-                }
+                _ => return Err("Table reference must be `table` or `database.table`".to_string()),
             };
             let (_, table) = schema.resolve_table(database, table_name)?;
             let table_name = table.name.clone();
@@ -434,20 +488,17 @@ fn load_relation(schema: &Schema, factor: &TableFactor) -> Result<Relation, Stri
                 .collect();
             Ok(Relation {
                 schema: schema_refs,
-                rows: table.rows.clone(),
+                rows: &table.rows,
             })
         }
         _ => Err("Only plain table references are supported in FROM".to_string()),
     }
 }
 
-fn cross_combine(
-    left_rows: Vec<Vec<Value>>,
-    right_rows: Vec<Vec<Value>>,
-) -> Vec<Vec<Value>> {
+fn cross_combine(left_rows: &[Vec<Value>], right_rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
     let mut output = vec![];
-    for left in &left_rows {
-        for right in &right_rows {
+    for left in left_rows {
+        for right in right_rows {
             let mut combined = left.clone();
             combined.extend_from_slice(right);
             output.push(combined);
@@ -459,13 +510,17 @@ fn cross_combine(
 fn apply_join(
     left_schema: &[ColumnRef],
     left_rows: &[Vec<Value>],
-    right: &Relation,
+    right: &Relation<'_>,
     operator: &JoinOperator,
+    now: chrono::DateTime<Local>,
 ) -> Result<(Vec<ColumnRef>, Vec<Vec<Value>>), String> {
     let mut schema = left_schema.to_vec();
     schema.extend(right.schema.clone());
     let left_len = left_schema.len();
     let right_len = right.schema.len();
+
+    // Build the column lookup once for the whole join instead of per row pair.
+    let lookup = build_lookup(&schema)?;
 
     let mut output: Vec<Vec<Value>> = vec![];
     let mut matched_left = vec![false; left_rows.len()];
@@ -475,22 +530,31 @@ fn apply_join(
 
     for (left_index, left_row) in left_rows.iter().enumerate() {
         for (right_index, right_row) in right.rows.iter().enumerate() {
+            let mut combined: Option<Vec<Value>> = None;
             let keep = match &using_pairs {
-                Some(pairs) => pairs
-                    .iter()
-                    .all(|&(left_col, right_col)| values_eq(&left_row[left_col], &right_row[right_col])),
+                Some(pairs) => pairs.iter().all(|&(left_col, right_col)| {
+                    values_eq(&left_row[left_col], &right_row[right_col])
+                }),
                 None => {
-                    let mut combined = left_row.clone();
-                    combined.extend_from_slice(right_row);
-                    join_keep(operator, left_schema, &right.schema, &combined)?
+                    let mut row = left_row.clone();
+                    row.extend_from_slice(right_row);
+                    let keep = join_keep(operator, &lookup, now, &row)?;
+                    combined = Some(row);
+                    keep
                 }
             };
             if keep {
-                let mut combined = left_row.clone();
-                combined.extend_from_slice(right_row);
                 matched_left[left_index] = true;
                 matched_right[right_index] = true;
-                output.push(combined);
+                let row = match combined {
+                    Some(row) => row,
+                    None => {
+                        let mut row = left_row.clone();
+                        row.extend_from_slice(right_row);
+                        row
+                    }
+                };
+                output.push(row);
             }
         }
     }
@@ -564,8 +628,8 @@ fn using_column_pairs(
 
 fn join_keep(
     operator: &JoinOperator,
-    left_schema: &[ColumnRef],
-    right_schema: &[ColumnRef],
+    lookup: &HashMap<String, usize>,
+    now: chrono::DateTime<Local>,
     combined: &[Value],
 ) -> Result<bool, String> {
     let constraint = match operator {
@@ -582,45 +646,16 @@ fn join_keep(
 
     match constraint {
         JoinConstraint::On(expr) => {
-            let lookup = build_lookup_on_fly(left_schema, right_schema)?;
-            let ctx = EvalContext::new(&lookup, &[], &[], Local::now());
+            let ctx = EvalContext::new(lookup, &[], &[], now);
             let value = eval_expr(&ctx, expr, combined)?;
             Ok(value.truthy())
         }
-        JoinConstraint::Using(columns) => {
-            for column in columns {
-                let name = column
-                    .0
-                    .last()
-                    .and_then(|part| part.as_ident())
-                    .map(|ident| ident.value.to_lowercase())
-                    .unwrap_or_default();
-                let left_index = left_schema
-                    .iter()
-                    .position(|column_ref| column_ref.column == name)
-                    .ok_or_else(|| format!("USING column `{name}` not found in left table"))?;
-                let right_index = right_schema
-                    .iter()
-                    .position(|column_ref| column_ref.column == name)
-                    .ok_or_else(|| format!("USING column `{name}` not found in right table"))?;
-                if !values_eq(&combined[left_index], &combined[left_schema.len() + right_index]) {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+        JoinConstraint::Using(_) => {
+            unreachable!("USING joins are handled by column pairs")
         }
         JoinConstraint::None => Ok(true),
         JoinConstraint::Natural => Err("NATURAL JOIN is not supported".to_string()),
     }
-}
-
-fn build_lookup_on_fly(
-    left_schema: &[ColumnRef],
-    right_schema: &[ColumnRef],
-) -> Result<HashMap<String, usize>, String> {
-    let mut schema = left_schema.to_vec();
-    schema.extend(right_schema.iter().cloned());
-    build_lookup(&schema)
 }
 
 fn build_lookup(schema: &[ColumnRef]) -> Result<HashMap<String, usize>, String> {

@@ -9,12 +9,6 @@ pub struct Table {
     pub rows: Vec<Vec<Value>>,
 }
 
-impl Table {
-    pub fn column_index(&self, column: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c == column)
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct Database {
     pub name: String,
@@ -196,8 +190,7 @@ mod tests {
             rows: vec![],
         });
         let table = database.get_table("people").expect("table exists");
-        assert_eq!(table.column_index("name"), Some(1));
-        assert_eq!(table.column_index("missing"), None);
+        assert_eq!(table.columns.get(1), Some(&"name".to_string()));
         assert!(database.get_table("nope").is_none());
     }
 
@@ -236,10 +229,16 @@ mod tests {
     #[test]
     fn schema_resolve_qualified_table() {
         let schema = make_schema();
-        let (db, table) = schema.resolve_table(Some("backup_sales_csv"), "sales").unwrap();
+        let (db, table) = schema
+            .resolve_table(Some("backup_sales_csv"), "sales")
+            .unwrap();
         assert_eq!(db.name, "backup_sales_csv");
         assert_eq!(table.name, "sales");
-        assert!(schema.resolve_table(Some("data_sales_csv"), "missing").is_err());
+        assert!(
+            schema
+                .resolve_table(Some("data_sales_csv"), "missing")
+                .is_err()
+        );
         assert!(schema.resolve_table(Some("nope"), "sales").is_err());
     }
 

@@ -10,7 +10,13 @@ pub fn sanitize(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
         if c == '_' || c.is_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
+            // Unicode-aware lowercasing (a multi-char mapping can drop to a
+            // non-alphanumeric combining mark, which we discard).
+            for lower in c.to_lowercase() {
+                if lower == '_' || lower.is_alphanumeric() {
+                    out.push(lower);
+                }
+            }
         } else {
             out.push('_');
         }
@@ -71,6 +77,12 @@ mod tests {
     fn sanitize_keeps_unicode_alphanumerics() {
         assert_eq!(sanitize("café"), "café");
         assert_eq!(sanitize("日本語"), "日本語");
+    }
+
+    #[test]
+    fn sanitize_lowercases_unicode_letters() {
+        assert_eq!(sanitize("ÜBER"), "über");
+        assert_eq!(sanitize("ÄRMEL"), "ärmel");
     }
 
     #[test]

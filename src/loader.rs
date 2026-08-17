@@ -61,10 +61,12 @@ fn load_spreadsheet(database: &mut Database, path: &str, extension: &str) -> Res
     let reader = BufReader::new(file);
 
     if extension == "xls" {
-        let mut workbook = Xls::new(reader).map_err(|error| format!("Cannot read file `{path}`: {error}"))?;
+        let mut workbook =
+            Xls::new(reader).map_err(|error| format!("Cannot read file `{path}`: {error}"))?;
         load_workbook(database, path, &mut workbook)
     } else {
-        let mut workbook = Xlsx::new(reader).map_err(|error| format!("Cannot read file `{path}`: {error}"))?;
+        let mut workbook =
+            Xlsx::new(reader).map_err(|error| format!("Cannot read file `{path}`: {error}"))?;
         load_workbook(database, path, &mut workbook)
     }
 }
@@ -139,6 +141,17 @@ fn load_csv(database: &mut Database, path: &str) -> Result<(), String> {
                 header = Some(record);
             }
             Some(_) => {
+                if record.len() > columns.len() {
+                    let line = record
+                        .position()
+                        .map(|position| position.line())
+                        .unwrap_or(0);
+                    return Err(format!(
+                        "CSV row {line} has {} fields but the header has {} columns",
+                        record.len(),
+                        columns.len()
+                    ));
+                }
                 let values = build_row_values(record.iter().collect(), columns.len());
                 if values.iter().all(Value::is_null) {
                     continue;
@@ -184,8 +197,17 @@ fn parse_cell(cell: &str) -> Value {
         return Value::Int(value);
     }
 
+    // Keep whole numbers that don't fit in i64 as text instead of silently
+    // losing precision when parsed as f64.
+    if is_whole_number(cell) {
+        return Value::Text(cell.to_string());
+    }
+
     if let Ok(value) = cell.parse::<f64>() {
-        return Value::Float(value);
+        if value.is_finite() {
+            return Value::Float(value);
+        }
+        return Value::Text(cell.to_string());
     }
 
     let lower = cell.to_lowercase();
@@ -199,11 +221,14 @@ fn parse_cell(cell: &str) -> Value {
     Value::Text(cell.to_string())
 }
 
+fn is_whole_number(cell: &str) -> bool {
+    let digits = cell.strip_prefix('-').unwrap_or(cell);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 fn has_leading_zero(cell: &str) -> bool {
     let digits = cell.strip_prefix('-').unwrap_or(cell);
-    digits.len() > 1
-        && digits.starts_with('0')
-        && digits.chars().all(|c| c.is_ascii_digit())
+    digits.len() > 1 && digits.starts_with('0') && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 fn build_columns(headers: Vec<String>) -> Vec<String> {
@@ -272,16 +297,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_cell_keeps_overflowing_whole_numbers_as_text() {
+        // Larger than i64::MAX: must not silently lose precision as f64.
+        assert_eq!(
+            parse_cell("123456789012345678901234567890"),
+            Value::Text("123456789012345678901234567890".to_string())
+        );
+        assert_eq!(
+            parse_cell("-123456789012345678901234567890"),
+            Value::Text("-123456789012345678901234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_cell_rejects_non_finite_floats() {
+        assert_eq!(parse_cell("NaN"), Value::Text("NaN".to_string()));
+        assert_eq!(parse_cell("inf"), Value::Text("inf".to_string()));
+        assert_eq!(parse_cell("-inf"), Value::Text("-inf".to_string()));
+    }
+
+    #[test]
+    fn load_csv_rejects_rows_with_more_fields_than_headers() {
+        let path = std::env::temp_dir().join(format!("sheetql_bad_row_{}.csv", std::process::id()));
+        std::fs::write(&path, "a,b\n1,2,3\n").unwrap();
+        let mut database = crate::database::Database::new();
+        let result = load_csv(&mut database, &path.to_string_lossy());
+        let error = result.expect_err("extra fields should be rejected");
+        assert!(error.contains("3 fields"), "got: {error}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_csv_pads_short_rows_with_null() {
+        let path =
+            std::env::temp_dir().join(format!("sheetql_short_row_{}.csv", std::process::id()));
+        std::fs::write(&path, "a,b\n1\n").unwrap();
+        let mut database = crate::database::Database::new();
+        load_csv(&mut database, &path.to_string_lossy()).unwrap();
+        let table = database.tables.first().unwrap();
+        assert_eq!(table.rows[0], vec![Value::Int(1), Value::Null]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn datetime_cell_becomes_readable_date_not_serial() {
-        let serial = calamine::ExcelDateTime::new(46149.0, calamine::ExcelDateTimeType::DateTime, false);
+        let serial =
+            calamine::ExcelDateTime::new(46149.0, calamine::ExcelDateTimeType::DateTime, false);
         let cell = calamine::Data::DateTime(serial);
         let expected = match &cell {
             calamine::Data::DateTime(v) => format_excel_datetime(v),
             _ => unreachable!(),
         };
         assert_eq!(cell_value(&cell), Value::Text(expected.clone()));
-        assert!(expected.contains('/'), "expected a date like Y/M/D, got {expected}");
-        assert!(!expected.contains("46149"), "serial leaked into output: {expected}");
+        assert!(
+            expected.contains('/'),
+            "expected a date like Y/M/D, got {expected}"
+        );
+        assert!(
+            !expected.contains("46149"),
+            "serial leaked into output: {expected}"
+        );
     }
 
     #[test]
@@ -298,7 +373,10 @@ mod tests {
     #[test]
     fn build_row_values_pads_to_column_count() {
         let values = build_row_values(vec!["1", "Alice"], 3);
-        assert_eq!(values, vec![Value::Int(1), Value::Text("Alice".to_string()), Value::Null]);
+        assert_eq!(
+            values,
+            vec![Value::Int(1), Value::Text("Alice".to_string()), Value::Null]
+        );
     }
 
     #[test]

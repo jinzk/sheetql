@@ -66,36 +66,22 @@ pub fn parse_arguments(args: &[String]) -> Command {
         match arg.as_str() {
             "--files" | "-f" => {
                 arg_index += 1;
-                if arg_index >= args.len() {
+                let mut found = false;
+                while arg_index < args.len() && !args[arg_index].starts_with('-') {
+                    arguments.files.push(args[arg_index].clone());
+                    arg_index += 1;
+                    found = true;
+                }
+                if !found {
                     return Command::Error(format!(
                         "Argument {arg} must be followed by one or more file paths"
                     ));
                 }
-
-                loop {
-                    if arg_index >= args.len() {
-                        break;
-                    }
-
-                    let file = &args[arg_index];
-                    if !file.starts_with('-') {
-                        arguments.files.push(file.to_string());
-                        arg_index += 1;
-                        continue;
-                    }
-
-                    break;
-                }
             }
-            "--query" | "-q" => {
-                arg_index += 1;
-                if arg_index >= args.len() {
-                    return Command::Error(format!("Argument {arg} must be followed by the query"));
-                }
-
-                optional_query = Some(args[arg_index].to_string());
-                arg_index += 1;
-            }
+            "--query" | "-q" => match take_value(args, &mut arg_index, arg, "the query") {
+                Ok(value) => optional_query = Some(value.to_string()),
+                Err(message) => return Command::Error(message),
+            },
             "--analysis" | "-a" => {
                 arguments.analysis = true;
                 arg_index += 1;
@@ -104,54 +90,39 @@ pub fn parse_arguments(args: &[String]) -> Command {
                 arguments.pagination = true;
                 arg_index += 1;
             }
-            "--pagesize" | "-ps" => {
-                arg_index += 1;
-                if arg_index >= args.len() {
-                    return Command::Error(format!(
-                        "Argument {arg} must be followed by the page size"
-                    ));
-                }
-
-                match args[arg_index].parse::<usize>() {
-                    Ok(page_size) => {
+            "--pagesize" | "-ps" => match take_value(args, &mut arg_index, arg, "the page size") {
+                Ok(page_size) => match page_size.parse::<usize>() {
+                    Ok(page_size) if page_size > 0 => {
                         arguments.page_size = page_size;
-                        arg_index += 1;
+                    }
+                    Ok(_) => {
+                        return Command::Error("Page size must be greater than zero".to_string());
                     }
                     Err(_) => return Command::Error("Invalid page size".to_string()),
+                },
+                Err(message) => return Command::Error(message),
+            },
+            "--output" | "-o" => match take_value(args, &mut arg_index, arg, "the output format") {
+                Ok(output) => {
+                    arguments.output_format = match output.to_lowercase().as_str() {
+                        "csv" => OutputFormat::Csv,
+                        "json" => OutputFormat::Json,
+                        "yaml" => OutputFormat::Yaml,
+                        "render" | "table" => OutputFormat::Table,
+                        _ => {
+                            return Command::Error(
+                                "Invalid output format, expected one of: render, json, csv, yaml"
+                                    .to_string(),
+                            );
+                        }
+                    };
                 }
-            }
-            "--output" | "-o" => {
-                arg_index += 1;
-                if arg_index >= args.len() {
-                    return Command::Error(format!(
-                        "Argument {arg} must be followed by output format"
-                    ));
-                }
-
-                arguments.output_format = match args[arg_index].to_lowercase().as_str() {
-                    "csv" => OutputFormat::Csv,
-                    "json" => OutputFormat::Json,
-                    "yaml" => OutputFormat::Yaml,
-                    "render" | "table" => OutputFormat::Table,
-                    _ => {
-                        return Command::Error(
-                            "Invalid output format, expected one of: render, json, csv, yaml"
-                                .to_string(),
-                        );
-                    }
-                };
-                arg_index += 1;
-            }
-            "--save" | "-s" => {
-                arg_index += 1;
-                if arg_index >= args.len() {
-                    return Command::Error(format!(
-                        "Argument {arg} must be followed by an output file path"
-                    ));
-                }
-                arguments.output_file = Some(args[arg_index].to_string());
-                arg_index += 1;
-            }
+                Err(message) => return Command::Error(message),
+            },
+            "--save" | "-s" => match take_value(args, &mut arg_index, arg, "an output file path") {
+                Ok(path) => arguments.output_file = Some(path.to_string()),
+                Err(message) => return Command::Error(message),
+            },
             _ => return Command::Error(format!("Unknown argument {arg}")),
         }
     }
@@ -175,6 +146,22 @@ pub fn parse_arguments(args: &[String]) -> Command {
         Some(query) => Command::QueryMode(query, arguments),
         None => Command::ReplMode(arguments),
     }
+}
+
+/// Consume the value following a flag argument, advancing `arg_index` past it.
+fn take_value<'a>(
+    args: &'a [String],
+    arg_index: &mut usize,
+    arg: &str,
+    what: &str,
+) -> Result<&'a str, String> {
+    *arg_index += 1;
+    if *arg_index >= args.len() {
+        return Err(format!("Argument {arg} must be followed by {what}"));
+    }
+    let value = args[*arg_index].as_str();
+    *arg_index += 1;
+    Ok(value)
 }
 
 fn expand_file_patterns(files: &[String]) -> Result<Vec<String>, String> {
@@ -334,6 +321,14 @@ mod tests {
             parse_arguments(&args(&["-q", "SELECT 1"])),
             Command::Error(_)
         ));
+    }
+
+    #[test]
+    fn page_size_must_be_positive() {
+        match parse_arguments(&args(&["-f", "data.csv", "-p", "-ps", "0"])) {
+            Command::Error(message) => assert!(message.contains("greater than zero")),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]

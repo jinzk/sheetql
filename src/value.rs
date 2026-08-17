@@ -162,7 +162,21 @@ fn cmp_int_float(int: i64, float: f64) -> Option<Ordering> {
         return None;
     }
     if float.fract() != 0.0 {
-        return (int as f64).partial_cmp(&float);
+        // Exact comparison without widening to f64 (which loses precision for
+        // ints near 2^53): clamp by magnitude first, then compare against the
+        // integral part and break the tie on the fractional part.
+        let limit = 2f64.powi(63);
+        if float >= limit {
+            return Some(Ordering::Less);
+        }
+        if float < -limit {
+            return Some(Ordering::Greater);
+        }
+        let cmp_floor = int.cmp(&(float.floor() as i64));
+        if cmp_floor != Ordering::Equal {
+            return Some(cmp_floor);
+        }
+        return Some(Ordering::Less);
     }
     let limit = 2f64.powi(63);
     if float >= limit {
@@ -183,6 +197,38 @@ fn eq_int_float(int: i64, float: f64) -> bool {
         return false;
     }
     int == float as i64
+}
+
+/// A hashable/equatable key for grouping and deduplication that treats
+/// numerically equal values the same regardless of their `Value` variant and
+/// normalizes NaN so identical NaNs form a single group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GroupKey {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(u64),
+    Text(String),
+}
+
+/// Build the normalized group key for `value`. `Int` and integral `Float`
+/// values share the same key so mixed-type columns aggregate consistently.
+pub fn group_key(value: &Value) -> GroupKey {
+    match value {
+        Value::Null => GroupKey::Null,
+        Value::Bool(value) => GroupKey::Bool(*value),
+        Value::Int(value) => GroupKey::Int(*value),
+        Value::Float(value) => {
+            if value.is_nan() {
+                GroupKey::Float(f64::NAN.to_bits())
+            } else if value.fract() == 0.0 && *value >= -(2f64.powi(63)) && *value < 2f64.powi(63) {
+                GroupKey::Int(*value as i64)
+            } else {
+                GroupKey::Float(value.to_bits())
+            }
+        }
+        Value::Text(value) => GroupKey::Text(value.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -244,6 +290,48 @@ mod tests {
         );
         assert!(!values_eq(&Value::Int(big), &Value::Float(two_pow_53)));
         assert!(values_eq(&Value::Int(3), &Value::Float(3.0)));
+    }
+
+    #[test]
+    fn large_int_vs_fractional_float_is_exact() {
+        let big = 9_007_199_254_740_993i64;
+        assert_eq!(
+            values_partial_cmp(&Value::Int(big), &Value::Float(9_007_199_254_740_992.5)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            values_partial_cmp(&Value::Int(big), &Value::Float(9_007_199_254_740_993.5)),
+            Some(Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn group_keys_normalize_numeric_variants() {
+        assert_eq!(group_key(&Value::Int(1)), group_key(&Value::Float(1.0)));
+        assert_ne!(group_key(&Value::Int(1)), group_key(&Value::Float(1.5)));
+        assert_eq!(group_key(&Value::Null), group_key(&Value::Null));
+        assert_ne!(group_key(&Value::Null), group_key(&Value::Int(0)));
+        assert_eq!(
+            group_key(&Value::Float(f64::NAN)),
+            group_key(&Value::Float(f64::NAN))
+        );
+        assert_eq!(
+            group_key(&Value::Float(-0.0)),
+            group_key(&Value::Float(0.0))
+        );
+    }
+
+    #[test]
+    fn group_key_keeps_out_of_range_floats_as_float() {
+        let huge = 1e20;
+        assert_ne!(
+            group_key(&Value::Float(huge)),
+            group_key(&Value::Int(i64::MAX))
+        );
+        assert_eq!(
+            group_key(&Value::Float(huge)),
+            group_key(&Value::Float(huge))
+        );
     }
 
     #[test]

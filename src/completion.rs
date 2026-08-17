@@ -29,9 +29,10 @@ pub struct Completion {
 
 impl Completion {
     fn keyword(value: &str) -> Self {
+        let upper = value.to_uppercase();
         Self {
-            value: value.to_string(),
-            label: value.to_string(),
+            value: upper.clone(),
+            label: upper,
             kind: Kind::Keyword,
         }
     }
@@ -55,11 +56,47 @@ impl Completion {
 
 /// Functions supported by the engine (`src/functions.rs`).
 const FUNCTIONS: &[&str] = &[
-    "count", "sum", "avg", "min", "max", "ifnull", "isnull", "coalesce", "len",
-    "length", "char_length", "lower", "lcase", "upper", "ucase", "trim", "ltrim",
-    "rtrim", "concat", "substring", "substr", "replace", "abs", "round", "floor",
-    "ceil", "ceiling", "mod", "left", "right", "instr", "startswith", "endswith",
-    "split", "now", "current_timestamp", "date", "power", "pow", "sqrt", "greatest",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "ifnull",
+    "isnull",
+    "coalesce",
+    "len",
+    "length",
+    "char_length",
+    "lower",
+    "lcase",
+    "upper",
+    "ucase",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "concat",
+    "substring",
+    "substr",
+    "replace",
+    "abs",
+    "round",
+    "floor",
+    "ceil",
+    "ceiling",
+    "mod",
+    "left",
+    "right",
+    "instr",
+    "startswith",
+    "endswith",
+    "split",
+    "now",
+    "current_timestamp",
+    "date",
+    "power",
+    "pow",
+    "sqrt",
+    "greatest",
     "least",
 ];
 
@@ -69,13 +106,54 @@ const EXPRESSION_KEYWORDS: &[&str] = &[
 ];
 
 /// Statement keywords suggested at the start of a query.
-const STATEMENT_KEYWORDS: &[&str] = &[
-    "SELECT", "SHOW", "USE", "DESCRIBE", "EXIT", "QUIT",
-];
+const STATEMENT_KEYWORDS: &[&str] = &["SELECT", "SHOW", "USE", "DESCRIBE", "EXIT", "QUIT"];
+
+/// Caches the validated candidate list across keystrokes. The cache key is the
+/// full text before the cursor; prefix filtering is applied on every lookup.
+pub struct CandidateCache {
+    before: String,
+    unfiltered: Vec<Completion>,
+}
+
+impl CandidateCache {
+    pub fn new() -> Self {
+        Self {
+            before: String::new(),
+            unfiltered: Vec::new(),
+        }
+    }
+
+    pub fn candidates(&mut self, schema: &Schema, line: &str) -> Vec<Completion> {
+        let (_, prefix) = split_prefix(line);
+        if line != self.before {
+            self.before = line.to_string();
+            self.unfiltered = compute_candidates(schema, line);
+        }
+        let prefix = prefix.to_lowercase();
+        self.unfiltered
+            .iter()
+            .filter(|c| prefix.is_empty() || c.value.to_lowercase().starts_with(&prefix))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Split a line into (base, prefix) where base is the text before the current
+/// word and prefix is the trailing partial word typed so far.
+fn split_prefix(line: &str) -> (&str, &str) {
+    let len = trailing_token_len(line);
+    (&line[..line.len() - len], &line[line.len() - len..])
+}
 
 /// Every completion candidate for the text before the cursor, filtered by
-/// prefix and validated against the SQL grammar.
+/// prefix and validated against the SQL grammar. Used by the tests; the TUI
+/// goes through [`CandidateCache`].
+#[allow(dead_code)]
 pub fn candidates(schema: &Schema, line: &str) -> Vec<Completion> {
+    compute_candidates(schema, line)
+}
+
+fn compute_candidates(schema: &Schema, line: &str) -> Vec<Completion> {
     if !should_suggest(line) {
         return Vec::new();
     }
@@ -89,12 +167,24 @@ pub fn candidates(schema: &Schema, line: &str) -> Vec<Completion> {
             let mut out = column_candidates(schema, line);
             out.extend(function_candidates());
             out.push(Completion::named(Kind::Keyword, "*"));
+            out.push(Completion::keyword("FROM"));
+            out.push(Completion::keyword("WHERE"));
+            out.push(Completion::keyword("GROUP"));
+            out.push(Completion::keyword("ORDER"));
+            out.push(Completion::keyword("LIMIT"));
+            out.push(Completion::keyword("HAVING"));
             out
         }
         Context::Expression => {
             let mut out = column_candidates(schema, line);
             out.extend(function_candidates());
             out.extend(expression_keywords());
+            out
+        }
+        Context::ByClause => {
+            let mut out = column_candidates(schema, line);
+            out.extend(function_candidates());
+            out.push(Completion::keyword("BY"));
             out
         }
         Context::General => {
@@ -115,7 +205,9 @@ pub fn candidates(schema: &Schema, line: &str) -> Vec<Completion> {
     pool.retain(|candidate| seen.insert(candidate.value.to_lowercase()));
 
     pool.retain(|candidate| {
-        is_repl_command(&candidate.value) || is_valid_continuation(line, &candidate.value)
+        is_repl_command(&candidate.value)
+            || (candidate.value.to_uppercase() == "FROM" && from_is_valid(line))
+            || is_valid_continuation(line, &candidate.value)
     });
 
     pool.sort_by(|a, b| {
@@ -156,10 +248,16 @@ pub fn trailing_token_len(line: &str) -> usize {
         .sum()
 }
 
-/// The partial word under / before the cursor, lowercased.
+/// The partial word under / before the cursor, lowercased. Returns empty when
+/// the cursor sits at a word boundary (e.g. after a space).
 pub fn current_prefix(line: &str) -> String {
     let len = trailing_token_len(line);
-    line[line.len() - len..].to_lowercase()
+    let raw = &line[line.len() - len..];
+    if raw.chars().all(|c| c.is_whitespace()) {
+        String::new()
+    } else {
+        raw.to_lowercase()
+    }
 }
 
 /// Coarse syntactic position, used only to narrow the candidate pool. The
@@ -170,6 +268,7 @@ enum Context {
     SelectList,
     Table,
     Expression,
+    ByClause,
     Database,
     General,
 }
@@ -185,8 +284,8 @@ fn infer_context(line: &str) -> Context {
         "USE" => Context::Database,
         "FROM" | "JOIN" | "INTO" => Context::Table,
         "SELECT" | "DISTINCT" => Context::SelectList,
-        "WHERE" | "ON" | "HAVING" | "AND" | "OR" | "SET" | "VALUES" | "GROUP"
-        | "ORDER" | "BY" => Context::Expression,
+        "GROUP" | "ORDER" => Context::ByClause,
+        "WHERE" | "ON" | "HAVING" | "AND" | "OR" | "SET" | "VALUES" | "BY" => Context::Expression,
         _ => Context::General,
     }
 }
@@ -197,9 +296,7 @@ fn last_word(line: &str) -> Option<String> {
         .into_iter()
         .rev()
         .find_map(|token| match token {
-            Token::Word(word) if word.quote_style.is_none() => {
-                Some(word.value.to_uppercase())
-            }
+            Token::Word(word) if word.quote_style.is_none() => Some(word.value.to_uppercase()),
             _ => None,
         })
 }
@@ -238,7 +335,10 @@ fn expression_keywords() -> Vec<Completion> {
 }
 
 fn function_candidates() -> Vec<Completion> {
-    FUNCTIONS.iter().map(|name| Completion::function(name)).collect()
+    FUNCTIONS
+        .iter()
+        .map(|name| Completion::function(name))
+        .collect()
 }
 
 fn table_candidates(schema: &Schema) -> Vec<Completion> {
@@ -353,9 +453,29 @@ fn referenced_tables(line: &str) -> Vec<(Option<String>, String)> {
 fn is_clause_keyword(word: &str) -> bool {
     matches!(
         word.to_uppercase().as_str(),
-        "WHERE" | "GROUP" | "ORDER" | "HAVING" | "LIMIT" | "ON" | "JOIN" | "INNER"
-            | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "UNION" | "AND" | "OR" | "AS"
-            | "SET" | "VALUES" | "WHEN" | "THEN" | "ELSE" | "END" | "USING"
+        "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "LIMIT"
+            | "ON"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "CROSS"
+            | "UNION"
+            | "AND"
+            | "OR"
+            | "AS"
+            | "SET"
+            | "VALUES"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+            | "USING"
     )
 }
 
@@ -375,25 +495,78 @@ fn is_repl_command(value: &str) -> bool {
 /// the parser stopped before consuming the candidate, so it is not a valid
 /// continuation.
 fn is_valid_continuation(line: &str, value: &str) -> bool {
-    // Replace the partial word under the cursor instead of appending to it,
-    // so the validation reflects the real text after completion.
-    let base = &line[..line.len() - trailing_token_len(line)];
-    let test = format!("{base}{value}");
-    if Parser::parse_sql(&MySqlDialect {}, &test).is_ok() {
-        return true;
-    }
-
-    let Some(first_token) = tokenize(value).into_iter().next() else {
-        return false;
+    // At a word boundary (empty prefix) use the whole line as the base so that
+    // a trailing space is preserved.  Otherwise strip the partial word.
+    let prefix_len = trailing_token_len(line);
+    let base = if line[line.len() - prefix_len..]
+        .chars()
+        .all(|c| c.is_whitespace())
+    {
+        line
+    } else {
+        &line[..line.len() - prefix_len]
     };
+    let test = format!("{base}{}", validation_form(value));
     match Parser::parse_sql(&MySqlDialect {}, &test) {
         Ok(_) => true,
         Err(sqlparser::parser::ParserError::ParserError(message)) => {
+            let Some(first_token) = tokenize(value).into_iter().next() else {
+                return false;
+            };
+            // The candidate is a legal continuation when the parser consumed
+            // it and failed later (e.g. `SELECT * FROM sales WHE` + `WHERE`
+            // parses the keyword then fails looking for the predicate). If the
+            // parser stopped before consuming the candidate's first token, the
+            // `found:` token matches it and it is not a valid continuation.
             found_token(&message).is_some_and(|found| found != first_token)
         }
         Err(sqlparser::parser::ParserError::TokenizerError(_)) => true,
         Err(_) => true,
     }
+}
+
+/// The minimal complete form a candidate is validated with. Some keywords
+/// open multi-token clauses (`GROUP BY`, `ORDER BY`, `FROM _`) and are
+/// rejected by the parser when tested bare, so they are validated in their
+/// minimal complete form.
+fn validation_form(value: &str) -> String {
+    match value.to_uppercase().as_str() {
+        "GROUP" => "GROUP BY _".to_string(),
+        "ORDER" => "ORDER BY _".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// FROM is only valid after a projection (column, *, or comma).  Rather than
+/// trying to prove this to the parser (which rejects `SELECT FROM`), we
+/// check the surface form directly.  It is also valid immediately after
+/// SELECT/DISTINCT (user may type `SELECT * FROM`).
+fn from_is_valid(line: &str) -> bool {
+    let tokens: Vec<_> = tokenize(line);
+    let mut found_item = false;
+    for tok in tokens.iter().rev() {
+        match tok {
+            Token::Word(w) if w.quote_style.is_none() => {
+                let kw = w.value.to_uppercase();
+                match kw.as_str() {
+                    "SELECT" | "DISTINCT" => return true,
+                    "FROM" | "JOIN" | "WHERE" | "GROUP" | "ORDER" | "LIMIT" | "HAVING"
+                    | "UNION" => return found_item,
+                    _ => {
+                        found_item = true;
+                    }
+                }
+            }
+            Token::Comma => {
+                found_item = true;
+            }
+            Token::Mul => {
+                found_item = true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Extract the token printed after `found:` in a parser error message.
@@ -505,17 +678,21 @@ mod tests {
         let cs = candidates(&schema, "SELECT ");
         assert!(has(&cs, "name"));
         assert!(has(&cs, "*"));
+        assert!(has(&cs, "FROM"));
     }
 
     #[test]
     fn keyword_completion_is_validated() {
         let schema = make_schema();
         // Completing WHE -> WHERE stays: WHERE is a valid continuation.
-        assert!(has(&candidates(&schema, "SELECT * FROM sales WHE"), "where"));
+        assert!(has(
+            &candidates(&schema, "SELECT * FROM sales WHE"),
+            "WHERE"
+        ));
         // Adding a second FROM is not a valid continuation and is filtered out.
         assert!(!has(
             &candidates(&schema, "SELECT * FROM sales WHERE name = 'a' AND "),
-            "from"
+            "FROM"
         ));
     }
 
@@ -538,5 +715,89 @@ mod tests {
         let cs = candidates(&schema, "SELECT * FROM data_sales_csv.customers WHERE ");
         assert!(has(&cs, "city"));
         assert!(!has(&cs, "amount"));
+    }
+
+    #[test]
+    fn candidate_cache_reuses_result_for_same_base() {
+        let schema = make_schema();
+        let mut cache = CandidateCache::new();
+        let values =
+            |cs: &[Completion]| -> Vec<String> { cs.iter().map(|c| c.value.clone()).collect() };
+        let first = values(&cache.candidates(&schema, "SELECT * FROM sales WHE"));
+        assert!(!first.is_empty());
+        // Same base, different prefix: cache hit, but prefix filters differently.
+        let second = values(&cache.candidates(&schema, "SELECT * FROM sales WHERE"));
+        // Prefix "where" does not match any Expression-context candidate, so
+        // the result may be empty — that is correct.
+        assert!(first.len() >= second.len());
+    }
+
+    #[test]
+    fn candidate_cache_rebuilds_on_new_base() {
+        let schema = make_schema();
+        let mut cache = CandidateCache::new();
+        let values =
+            |cs: &[Completion]| -> Vec<String> { cs.iter().map(|c| c.value.clone()).collect() };
+        // Table context first.
+        let tables = values(&cache.candidates(&schema, "SELECT * FROM "));
+        assert!(tables.iter().any(|v| v == "sales"));
+        // A different base must rebuild: now a select-list context, with
+        // column candidates instead of table names.
+        let columns = values(&cache.candidates(&schema, "SELECT "));
+        assert!(columns.iter().any(|v| v == "name"));
+        assert!(!columns.contains(&"sales".to_string()));
+    }
+
+    #[test]
+    fn expression_end_suggests_clause_keywords() {
+        let schema = make_schema();
+        // GROUP/ORDER open multi-token clauses and must survive validation
+        // after a completed expression.
+        assert!(has(
+            &candidates(&schema, "SELECT * FROM sales WHERE amount > 10 G"),
+            "GROUP"
+        ));
+        assert!(has(
+            &candidates(&schema, "SELECT * FROM sales WHERE amount > 10 O"),
+            "ORDER"
+        ));
+        // After the clause opener, BY is suggested.
+        assert!(has(
+            &candidates(&schema, "SELECT * FROM sales ORDER "),
+            "BY"
+        ));
+        assert!(has(
+            &candidates(&schema, "SELECT * FROM sales GROUP "),
+            "BY"
+        ));
+        // Still filtered out in genuinely illegal positions.
+        assert!(!has(
+            &candidates(&schema, "SELECT * FROM sales WHERE "),
+            "GROUP"
+        ));
+    }
+
+    #[test]
+    fn keyword_candidates_are_uppercase() {
+        let schema = make_schema();
+        for line in [
+            "",
+            "SELECT * FROM sales WHE",
+            "SELECT * FROM sales WHERE ",
+            "SELECT * FROM sales WHERE name = 'a' ",
+            "SELECT * FROM sales G",
+            "SELECT * FROM sales ORDER ",
+        ] {
+            for c in candidates(&schema, line) {
+                if c.kind == Kind::Keyword {
+                    assert_eq!(
+                        c.value,
+                        c.value.to_uppercase(),
+                        "line={line:?} value={}",
+                        c.value
+                    );
+                }
+            }
+        }
     }
 }

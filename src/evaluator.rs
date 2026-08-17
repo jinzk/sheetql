@@ -7,9 +7,9 @@ use sqlparser::ast::{
 };
 
 use crate::functions::eval_function;
+use crate::value::Value;
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
-use crate::value::Value;
 
 pub struct EvalContext<'a> {
     pub columns: &'a HashMap<String, usize>,
@@ -47,11 +47,7 @@ impl<'a> EvalContext<'a> {
     }
 }
 
-pub fn eval_expr(
-    ctx: &EvalContext,
-    expr: &Expr,
-    current: &[Value],
-) -> Result<Value, String> {
+pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Value, String> {
     match expr {
         Expr::Value(ValueWithSpan { value, .. }) => eval_sql_value(value),
         Expr::Identifier(ident) => resolve_column(ctx, &ident.value, current),
@@ -67,6 +63,9 @@ pub fn eval_expr(
         }
         Expr::Nested(inner) => eval_expr(ctx, inner, current),
         Expr::BinaryOp { left, op, right } => {
+            if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+                return eval_logic(ctx, left, op, right, current);
+            }
             let lhs = eval_expr(ctx, left, current)?;
             let rhs = eval_expr(ctx, right, current)?;
             eval_binary(op, lhs, rhs)
@@ -142,7 +141,9 @@ pub fn eval_expr(
             else_result,
             ..
         } => eval_case(ctx, operand, conditions, else_result, current),
-        Expr::Cast { expr, data_type, .. } => {
+        Expr::Cast {
+            expr, data_type, ..
+        } => {
             let value = eval_expr(ctx, expr, current)?;
             cast_value(value, data_type)
         }
@@ -229,11 +230,7 @@ fn eval_sql_value(value: &SqlValue) -> Result<Value, String> {
     }
 }
 
-fn resolve_column(
-    ctx: &EvalContext,
-    name: &str,
-    current: &[Value],
-) -> Result<Value, String> {
+fn resolve_column(ctx: &EvalContext, name: &str, current: &[Value]) -> Result<Value, String> {
     if let Some(index) = ctx.columns.get(name) {
         return Ok(current.get(*index).cloned().unwrap_or(Value::Null));
     }
@@ -267,7 +264,6 @@ fn eval_binary(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Str
         | BinaryOperator::LtEq
         | BinaryOperator::Gt
         | BinaryOperator::GtEq => eval_compare(op, lhs, rhs),
-        BinaryOperator::And | BinaryOperator::Or => eval_logic(op, lhs, rhs),
         other => Err(format!("Unsupported operator: {other}")),
     }
 }
@@ -279,11 +275,15 @@ fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value,
 
     match op {
         BinaryOperator::Divide => {
-            let b = rhs.as_f64().ok_or_else(|| format!("Cannot divide by `{}`", rhs))?;
+            let b = rhs
+                .as_f64()
+                .ok_or_else(|| format!("Cannot divide by `{}`", rhs))?;
             if b == 0.0 {
                 return Err("Division by zero".to_string());
             }
-            let a = lhs.as_f64().ok_or_else(|| format!("Cannot divide `{}`", lhs))?;
+            let a = lhs
+                .as_f64()
+                .ok_or_else(|| format!("Cannot divide `{}`", lhs))?;
             Ok(Value::Float(a / b))
         }
         BinaryOperator::Modulo => {
@@ -293,7 +293,9 @@ fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value,
             if b == 0 {
                 return Err("Modulo by zero".to_string());
             }
-            let a = lhs.as_i64().ok_or_else(|| format!("Cannot modulo `{}`", lhs))?;
+            let a = lhs
+                .as_i64()
+                .ok_or_else(|| format!("Cannot modulo `{}`", lhs))?;
             Ok(Value::Int(a % b))
         }
         _ => {
@@ -352,9 +354,26 @@ fn eval_compare(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, St
     }
 }
 
-fn eval_logic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, String> {
-    let a = tri_bool(&lhs);
-    let b = tri_bool(&rhs);
+/// Evaluate `AND`/`OR` with short-circuit semantics: when the left operand
+/// already determines the result the right side is not evaluated, matching
+/// SQL behavior (e.g. `FALSE AND 1/0 = 1` is FALSE, not an error).
+fn eval_logic(
+    ctx: &EvalContext,
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    current: &[Value],
+) -> Result<Value, String> {
+    let a = tri_bool(&eval_expr(ctx, left, current)?);
+    let short_circuited = match op {
+        BinaryOperator::And => a == Some(false),
+        BinaryOperator::Or => a == Some(true),
+        _ => unreachable!(),
+    };
+    if short_circuited {
+        return Ok(Value::Bool(matches!(op, BinaryOperator::Or)));
+    }
+    let b = tri_bool(&eval_expr(ctx, right, current)?);
 
     match op {
         BinaryOperator::And => Ok(match (a, b) {
@@ -415,14 +434,23 @@ fn eval_in_list(
         return Ok(Value::Null);
     }
     let mut found = false;
+    let mut saw_null = false;
     for item in list {
         let item_value = eval_expr(ctx, item, current)?;
-        if values_eq(&value, &item_value) {
+        if item_value.is_null() {
+            saw_null = true;
+        } else if values_eq(&value, &item_value) {
             found = true;
             break;
         }
     }
-    Ok(Value::Bool(if negated { !found } else { found }))
+    if found {
+        Ok(Value::Bool(!negated))
+    } else if saw_null {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Bool(negated))
+    }
 }
 
 fn eval_between(
@@ -441,9 +469,7 @@ fn eval_between(
         values_partial_cmp(&value, &low),
         values_partial_cmp(&value, &high),
     ) {
-        (Some(a), Some(b)) => {
-            a != std::cmp::Ordering::Less && b != std::cmp::Ordering::Greater
-        }
+        (Some(a), Some(b)) => a != std::cmp::Ordering::Less && b != std::cmp::Ordering::Greater,
         _ => false,
     };
 
@@ -504,7 +530,12 @@ fn trim_string(value: &str, side: TrimWhereField, what: Option<&str>) -> String 
     }
 }
 
-fn like_values(value: &Value, pattern: &Value, case_insensitive: bool, escape: Option<char>) -> Result<bool, String> {
+fn like_values(
+    value: &Value,
+    pattern: &Value,
+    case_insensitive: bool,
+    escape: Option<char>,
+) -> Result<bool, String> {
     if value.is_null() || pattern.is_null() {
         return Ok(false);
     }
@@ -549,36 +580,70 @@ pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Opt
     }
 
     let n = tokens.len();
-    let mut dp = vec![vec![false; n + 1]; text.len() + 1];
-    dp[0][0] = true;
+
+    // Fast path: a pattern of only literals is a plain substring search.
+    if n > 0
+        && tokens
+            .iter()
+            .all(|token| matches!(token, Token::Literal(_)))
+    {
+        let literal: Vec<char> = tokens
+            .iter()
+            .map(|token| match token {
+                Token::Literal(c) => *c,
+                _ => unreachable!(),
+            })
+            .collect();
+        return text
+            .windows(literal.len())
+            .any(|window| window == literal.as_slice());
+    }
+
+    // Rolling two-row DP: O(n) memory instead of O(text_len * n).
+    let mut prev = vec![false; n + 1];
+    let mut curr = vec![false; n + 1];
+    prev[0] = true;
     for j in 0..n {
         if matches!(tokens[j], Token::Percent) {
-            dp[0][j + 1] = dp[0][j];
+            prev[j + 1] = prev[j];
         }
     }
 
-    for i in 0..text.len() {
+    for &text_char in &text {
+        curr[0] = false;
         for j in 0..n {
             match tokens[j] {
-                Token::Percent => dp[i + 1][j + 1] = dp[i + 1][j] || dp[i][j + 1],
-                Token::Underscore => dp[i + 1][j + 1] = dp[i][j],
-                Token::Literal(ch) => dp[i + 1][j + 1] = dp[i][j] && text[i] == ch,
+                Token::Percent => curr[j + 1] = curr[j] || prev[j + 1],
+                Token::Underscore => curr[j + 1] = prev[j],
+                Token::Literal(ch) => curr[j + 1] = prev[j] && text_char == ch,
             }
         }
+        std::mem::swap(&mut prev, &mut curr);
     }
 
-    dp[text.len()][n]
+    prev[n]
 }
 
 fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
     match data_type {
-        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::SmallInt(_)
-        | SqlDataType::SmallIntUnsigned(_) | SqlDataType::Int2Unsigned(_)
-        | SqlDataType::TinyInt(_) | SqlDataType::TinyIntUnsigned(_) | SqlDataType::UTinyInt
-        | SqlDataType::USmallInt | SqlDataType::BigInt(_) | SqlDataType::BigIntUnsigned(_)
-        | SqlDataType::Int8Unsigned(_) | SqlDataType::Int4Unsigned(_)
-        | SqlDataType::IntegerUnsigned(_) | SqlDataType::IntUnsigned(_)
-        | SqlDataType::MediumIntUnsigned(_) | SqlDataType::Unsigned | SqlDataType::UnsignedInteger => {
+        SqlDataType::Int(_)
+        | SqlDataType::Integer(_)
+        | SqlDataType::SmallInt(_)
+        | SqlDataType::SmallIntUnsigned(_)
+        | SqlDataType::Int2Unsigned(_)
+        | SqlDataType::TinyInt(_)
+        | SqlDataType::TinyIntUnsigned(_)
+        | SqlDataType::UTinyInt
+        | SqlDataType::USmallInt
+        | SqlDataType::BigInt(_)
+        | SqlDataType::BigIntUnsigned(_)
+        | SqlDataType::Int8Unsigned(_)
+        | SqlDataType::Int4Unsigned(_)
+        | SqlDataType::IntegerUnsigned(_)
+        | SqlDataType::IntUnsigned(_)
+        | SqlDataType::MediumIntUnsigned(_)
+        | SqlDataType::Unsigned
+        | SqlDataType::UnsignedInteger => {
             if let Some(parsed) = value.as_i64() {
                 return Ok(Value::Int(parsed));
             }
@@ -589,9 +654,14 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
             }
             Err(format!("Cannot cast `{}` to integer", value))
         }
-        SqlDataType::Float(_) | SqlDataType::Real | SqlDataType::Double(_)
-        | SqlDataType::DoublePrecision | SqlDataType::FloatUnsigned(_) | SqlDataType::RealUnsigned
-        | SqlDataType::DoubleUnsigned(_) | SqlDataType::DoublePrecisionUnsigned => {
+        SqlDataType::Float(_)
+        | SqlDataType::Real
+        | SqlDataType::Double(_)
+        | SqlDataType::DoublePrecision
+        | SqlDataType::FloatUnsigned(_)
+        | SqlDataType::RealUnsigned
+        | SqlDataType::DoubleUnsigned(_)
+        | SqlDataType::DoublePrecisionUnsigned => {
             if let Some(parsed) = value.as_f64() {
                 return Ok(Value::Float(parsed));
             }
@@ -617,11 +687,15 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
             }
             Err(format!("Cannot cast `{}` to boolean", value))
         }
-        SqlDataType::Text | SqlDataType::String(_) | SqlDataType::Char(_)
-        | SqlDataType::Varchar(_) | SqlDataType::Character(_) | SqlDataType::CharacterVarying(_)
-        | SqlDataType::TinyText | SqlDataType::MediumText | SqlDataType::LongText => {
-            Ok(Value::Text(value.to_display_string()))
-        }
+        SqlDataType::Text
+        | SqlDataType::String(_)
+        | SqlDataType::Char(_)
+        | SqlDataType::Varchar(_)
+        | SqlDataType::Character(_)
+        | SqlDataType::CharacterVarying(_)
+        | SqlDataType::TinyText
+        | SqlDataType::MediumText
+        | SqlDataType::LongText => Ok(Value::Text(value.to_display_string())),
         _ => Err(format!("Unsupported cast target type `{}`", data_type)),
     }
 }
@@ -641,8 +715,7 @@ mod tests {
     }
 
     fn scalar(expr: &str) -> Value {
-        eval_expr(&EvalContext::scalar(), &parse_expr(expr), &[])
-            .expect("eval scalar")
+        eval_expr(&EvalContext::scalar(), &parse_expr(expr), &[]).expect("eval scalar")
     }
 
     fn scalar_result(expr: &str) -> Result<Value, String> {
@@ -688,6 +761,26 @@ mod tests {
         assert_eq!(scalar("'c' IN ('a', 'b')"), Value::Bool(false));
         assert_eq!(scalar("5 BETWEEN 1 AND 10"), Value::Bool(true));
         assert_eq!(scalar("15 BETWEEN 1 AND 10"), Value::Bool(false));
+    }
+
+    #[test]
+    fn in_list_null_semantics() {
+        // Matching value wins even when NULL is in the list.
+        assert_eq!(scalar("1 IN (1, NULL)"), Value::Bool(true));
+        // Unmatched with NULL in the list is NULL, not FALSE.
+        assert_eq!(scalar("3 IN (1, NULL)"), Value::Null);
+        // NOT IN with NULL in the list is NULL when unmatched.
+        assert_eq!(scalar("3 NOT IN (1, NULL)"), Value::Null);
+        // NOT IN still returns FALSE for a matching value.
+        assert_eq!(scalar("1 NOT IN (1, NULL)"), Value::Bool(false));
+    }
+
+    #[test]
+    fn between_null_semantics() {
+        // BETWEEN does not propagate NULL: a NULL bound compares via the
+        // sentinel ordering (NULL sorts first), yielding FALSE.
+        assert_eq!(scalar("5 BETWEEN 1 AND NULL"), Value::Bool(false));
+        assert_eq!(scalar("NULL BETWEEN 1 AND 5"), Value::Bool(false));
     }
 
     #[test]

@@ -37,11 +37,32 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 }
 
 fn rows_to_objects(columns: &[String], rows: &[Vec<Value>]) -> Vec<serde_json::Value> {
+    // Disambiguate duplicate column names instead of silently overwriting
+    // earlier values when building JSON/YAML objects.
+    let keys: Vec<String> = {
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        columns
+            .iter()
+            .map(|column| {
+                let count = seen.entry(column.as_str()).or_insert(0);
+                *count += 1;
+                if *count == 1 {
+                    column.clone()
+                } else {
+                    format!("{column}_{count}")
+                }
+            })
+            .collect()
+    };
+
     let mut objects = vec![];
     for row in rows {
         let mut object = serde_json::Map::new();
-        for (index, column) in columns.iter().enumerate() {
-            object.insert(column.clone(), value_to_json(row.get(index).unwrap_or(&Value::Null)));
+        for (index, key) in keys.iter().enumerate() {
+            object.insert(
+                key.clone(),
+                value_to_json(row.get(index).unwrap_or(&Value::Null)),
+            );
         }
         objects.push(serde_json::Value::Object(object));
     }
@@ -64,10 +85,9 @@ fn render_csv(columns: &[String], rows: &[Vec<Value>]) -> String {
         return String::new();
     }
     for row in rows {
-        let fields: Vec<String> = (0..columns.len())
-            .map(|index| row.get(index).unwrap_or(&Value::Null).to_display_string())
-            .collect();
-        if writer.write_record(&fields).is_err() {
+        let fields = (0..columns.len())
+            .map(|index| row.get(index).unwrap_or(&Value::Null).to_display_string());
+        if writer.write_record(fields).is_err() {
             return String::new();
         }
     }
@@ -132,44 +152,31 @@ fn pad(text: &str, width: usize) -> String {
     let padding = width.saturating_sub(text.width());
     let left = padding / 2;
     let right = padding - left;
-    format!(
-        "{}{}{}",
-        " ".repeat(left),
-        text,
-        " ".repeat(right)
-    )
+    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+}
+
+fn border(widths: &[usize], fill: char, join: char) -> String {
+    widths
+        .iter()
+        .map(|width| fill.to_string().repeat(width + 2))
+        .collect::<Vec<_>>()
+        .join(&join.to_string())
 }
 
 fn top_border(widths: &[usize]) -> String {
-    widths
-        .iter()
-        .map(|width| "─".repeat(width + 2))
-        .collect::<Vec<_>>()
-        .join("┬")
+    border(widths, '─', '┬')
 }
 
 fn header_border(widths: &[usize]) -> String {
-    widths
-        .iter()
-        .map(|width| "═".repeat(width + 2))
-        .collect::<Vec<_>>()
-        .join("╪")
+    border(widths, '═', '╪')
 }
 
 fn middle_border(widths: &[usize]) -> String {
-    widths
-        .iter()
-        .map(|width| "─".repeat(width + 2))
-        .collect::<Vec<_>>()
-        .join("┼")
+    border(widths, '─', '┼')
 }
 
 fn bottom_border(widths: &[usize]) -> String {
-    widths
-        .iter()
-        .map(|width| "─".repeat(width + 2))
-        .collect::<Vec<_>>()
-        .join("┴")
+    border(widths, '─', '┴')
 }
 
 #[cfg(test)]
@@ -209,5 +216,64 @@ mod tests {
         for width in widths {
             assert_eq!(width, expected);
         }
+    }
+
+    #[test]
+    fn json_renders_typed_values_and_types_as_null() {
+        let columns = vec!["n".to_string(), "b".to_string(), "t".to_string()];
+        let rows = vec![vec![
+            Value::Int(1),
+            Value::Bool(true),
+            Value::Text("x".to_string()),
+        ]];
+        let out = render(OutputFormat::Json, &columns, &rows);
+        assert!(out.contains("\"n\": 1"), "got: {out}");
+        assert!(out.contains("\"b\": true"), "got: {out}");
+        assert!(out.contains("\"t\": \"x\""), "got: {out}");
+    }
+
+    #[test]
+    fn json_maps_non_finite_floats_to_null() {
+        let columns = vec!["n".to_string()];
+        let rows = vec![vec![Value::Float(f64::NAN)]];
+        let out = render(OutputFormat::Json, &columns, &rows);
+        assert!(out.contains("\"n\": null"), "got: {out}");
+    }
+
+    #[test]
+    fn json_and_yaml_disambiguate_duplicate_column_names() {
+        let columns = vec!["a".to_string(), "a".to_string()];
+        let rows = vec![vec![Value::Int(1), Value::Int(2)]];
+        let json = render(OutputFormat::Json, &columns, &rows);
+        assert!(
+            json.contains("\"a\": 1") && json.contains("\"a_2\": 2"),
+            "got: {json}"
+        );
+        let yaml = render(OutputFormat::Yaml, &columns, &rows);
+        assert!(
+            yaml.contains("a: 1") && yaml.contains("a_2: 2"),
+            "got: {yaml}"
+        );
+    }
+
+    #[test]
+    fn csv_renders_header_and_quoted_fields() {
+        let columns = vec!["name".to_string(), "note".to_string()];
+        let rows = vec![vec![
+            Value::Text("Alice, B.".to_string()),
+            Value::Text("say \"hi\"".to_string()),
+        ]];
+        let out = render(OutputFormat::Csv, &columns, &rows);
+        assert!(out.starts_with("name,note\n"), "got: {out}");
+        assert!(out.contains("\"Alice, B.\""), "got: {out}");
+        assert!(out.contains("\"say \"\"hi\"\"\""), "got: {out}");
+    }
+
+    #[test]
+    fn yaml_renders_rows() {
+        let columns = vec!["k".to_string()];
+        let rows = vec![vec![Value::Text("v".to_string())]];
+        let out = render(OutputFormat::Yaml, &columns, &rows);
+        assert!(out.contains("k: v"), "got: {out}");
     }
 }

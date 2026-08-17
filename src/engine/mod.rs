@@ -6,8 +6,8 @@ use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
 use crate::database::Schema;
-use crate::printer::render;
 use crate::printer::OutputFormat;
+use crate::printer::render;
 use crate::value::Value;
 
 use crate::engine::metadata::{
@@ -24,7 +24,11 @@ pub struct QueryResult {
 pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, String> {
     let (query_sql, outfile) = strip_into_outfile(sql);
     let trimmed = query_sql.trim();
-    let lower = trimmed.to_lowercase().trim_end_matches(';').trim().to_string();
+    let lower = trimmed
+        .to_lowercase()
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
 
     if lower.starts_with("show databases") {
         let rest = lower.strip_prefix("show databases").unwrap().trim();
@@ -224,11 +228,36 @@ mod tests {
                 "city".to_string(),
             ],
             rows: vec![
-                vec![Value::Int(1), Value::Text("Alice".into()), Value::Int(30), Value::Text("NY".into())],
-                vec![Value::Int(2), Value::Text("Bob".into()), Value::Int(25), Value::Text("LA".into())],
-                vec![Value::Int(3), Value::Text("Carol".into()), Value::Int(35), Value::Text("SF".into())],
-                vec![Value::Int(4), Value::Text("Dan".into()), Value::Int(40), Value::Text("NY".into())],
-                vec![Value::Int(5), Value::Text("Eve".into()), Value::Int(28), Value::Text("LA".into())],
+                vec![
+                    Value::Int(1),
+                    Value::Text("Alice".into()),
+                    Value::Int(30),
+                    Value::Text("NY".into()),
+                ],
+                vec![
+                    Value::Int(2),
+                    Value::Text("Bob".into()),
+                    Value::Int(25),
+                    Value::Text("LA".into()),
+                ],
+                vec![
+                    Value::Int(3),
+                    Value::Text("Carol".into()),
+                    Value::Int(35),
+                    Value::Text("SF".into()),
+                ],
+                vec![
+                    Value::Int(4),
+                    Value::Text("Dan".into()),
+                    Value::Int(40),
+                    Value::Text("NY".into()),
+                ],
+                vec![
+                    Value::Int(5),
+                    Value::Text("Eve".into()),
+                    Value::Int(28),
+                    Value::Text("LA".into()),
+                ],
             ],
         });
         database.add_table(Table {
@@ -420,7 +449,10 @@ mod tests {
     fn describe_reports_columns_and_types() {
         let mut schema = make_schema();
         let result = run(&mut schema, "DESCRIBE people");
-        assert_eq!(result.columns, vec!["Column".to_string(), "Type".to_string()]);
+        assert_eq!(
+            result.columns,
+            vec!["Column".to_string(), "Type".to_string()]
+        );
         assert_eq!(
             result.rows[0],
             vec![Value::Text("id".into()), Value::Text("Integer".into())]
@@ -435,7 +467,10 @@ mod tests {
     fn show_columns_lists_columns() {
         let mut schema = make_schema();
         let result = run(&mut schema, "SHOW COLUMNS FROM people");
-        assert_eq!(result.columns, vec!["Column".to_string(), "Type".to_string()]);
+        assert_eq!(
+            result.columns,
+            vec!["Column".to_string(), "Type".to_string()]
+        );
         assert_eq!(result.rows.len(), 4);
         assert_eq!(result.rows[0][0], Value::Text("id".into()));
         assert_eq!(result.rows[0][1], Value::Text("Integer".into()));
@@ -624,7 +659,10 @@ mod tests {
         let mut schema = make_schema();
         let result = run(&mut schema, "SELECT DISTINCT city FROM people LIMIT 2");
         assert_eq!(result.rows.len(), 2);
-        let result = run(&mut schema, "SELECT name FROM people ORDER BY id LIMIT 2 OFFSET 2");
+        let result = run(
+            &mut schema,
+            "SELECT name FROM people ORDER BY id LIMIT 2 OFFSET 2",
+        );
         assert_eq!(result.rows.len(), 2);
     }
 
@@ -675,7 +713,10 @@ mod tests {
     #[test]
     fn greatest_least_functions() {
         let mut schema = make_schema();
-        let result = run(&mut schema, "SELECT GREATEST(3, 7, 5) AS g, LEAST(3, 7, 5) AS l");
+        let result = run(
+            &mut schema,
+            "SELECT GREATEST(3, 7, 5) AS g, LEAST(3, 7, 5) AS l",
+        );
         assert_eq!(result.rows[0][0], Value::Int(7));
         assert_eq!(result.rows[0][1], Value::Int(3));
     }
@@ -741,8 +782,7 @@ mod tests {
     #[test]
     fn into_outfile_writes_csv() {
         let mut schema = make_schema();
-        let path = std::env::temp_dir()
-            .join(format!("sheetql_outfile_{}.csv", std::process::id()));
+        let path = std::env::temp_dir().join(format!("sheetql_outfile_{}.csv", std::process::id()));
         let target = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let sql = format!(
@@ -761,8 +801,10 @@ mod tests {
     #[test]
     fn into_outfile_rejects_existing_file() {
         let mut schema = make_schema();
-        let path = std::env::temp_dir()
-            .join(format!("sheetql_outfile_existing_{}.csv", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "sheetql_outfile_existing_{}.csv",
+            std::process::id()
+        ));
         std::fs::write(&path, "stub").unwrap();
         let target = path.to_string_lossy().to_string();
         let sql = format!("SELECT name FROM people INTO OUTFILE '{}'", target);
@@ -774,8 +816,8 @@ mod tests {
     #[test]
     fn into_outfile_with_where_filters_rows() {
         let mut schema = make_schema();
-        let path = std::env::temp_dir()
-            .join(format!("sheetql_outfile_where_{}.csv", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("sheetql_outfile_where_{}.csv", std::process::id()));
         let target = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let sql = format!(
@@ -796,8 +838,8 @@ mod tests {
     #[test]
     fn into_outfile_with_aggregation() {
         let mut schema = make_schema();
-        let path = std::env::temp_dir()
-            .join(format!("sheetql_outfile_group_{}.csv", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("sheetql_outfile_group_{}.csv", std::process::id()));
         let target = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let sql = format!(
@@ -819,8 +861,8 @@ mod tests {
     #[test]
     fn into_outfile_double_quoted_path() {
         let mut schema = make_schema();
-        let path = std::env::temp_dir()
-            .join(format!("sheetql_outfile_dq_{}.csv", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("sheetql_outfile_dq_{}.csv", std::process::id()));
         let target = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let sql = format!(
@@ -830,5 +872,134 @@ mod tests {
         let _ = run_query(&mut schema, &sql).unwrap();
         assert!(path.exists(), "output file should be created");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn order_by_aggregate_without_projection_aggregate() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT city FROM people GROUP BY city ORDER BY COUNT(*) DESC",
+        );
+        let cities: Vec<String> = result
+            .rows
+            .iter()
+            .map(|row| row[0].to_display_string())
+            .collect();
+        assert_eq!(cities.len(), 3);
+        assert_eq!(cities[0], "NY"); // 2 rows, largest count first
+    }
+
+    #[test]
+    fn group_by_unifies_int_and_float() {
+        let mut schema = make_schema();
+        schema.add_database(crate::database::Database::named("mixed"));
+        schema.set_current_database("mixed").unwrap();
+        let database = schema
+            .databases
+            .iter_mut()
+            .find(|db| db.name == "mixed")
+            .unwrap();
+        database.add_table(Table {
+            name: "t".to_string(),
+            columns: vec!["k".to_string()],
+            rows: vec![
+                vec![Value::Int(1)],
+                vec![Value::Float(1.0)],
+                vec![Value::Float(2.5)],
+                vec![Value::Int(2)],
+            ],
+        });
+        let result = run(
+            &mut schema,
+            "SELECT k, COUNT(*) AS cnt FROM t GROUP BY k ORDER BY k",
+        );
+        assert_eq!(
+            result.rows.len(),
+            3,
+            "Int(1) and Float(1.0) share one group"
+        );
+        let total: i64 = result.rows.iter().map(|row| row[1].as_i64().unwrap()).sum();
+        assert_eq!(total, 4);
+        assert_eq!(result.rows[0][1].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn count_distinct_unifies_int_and_float() {
+        let mut schema = make_schema();
+        schema.add_database(crate::database::Database::named("mixed"));
+        schema.set_current_database("mixed").unwrap();
+        let database = schema
+            .databases
+            .iter_mut()
+            .find(|db| db.name == "mixed")
+            .unwrap();
+        database.add_table(Table {
+            name: "t".to_string(),
+            columns: vec!["v".to_string()],
+            rows: vec![
+                vec![Value::Int(1)],
+                vec![Value::Float(1.0)],
+                vec![Value::Float(2.0)],
+            ],
+        });
+        let result = run(&mut schema, "SELECT COUNT(DISTINCT v) AS n FROM t");
+        assert_eq!(result.rows, vec![vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn logical_and_short_circuits() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT 1 WHERE FALSE AND 1/0 = 1");
+        assert_eq!(result.rows, Vec::<Vec<Value>>::new());
+        let result = run(&mut schema, "SELECT 1 WHERE TRUE OR 1/0 = 1");
+        assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn in_list_with_null_is_null_when_unmatched() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT 3 IN (1, NULL) AS r");
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+        let result = run(&mut schema, "SELECT 1 IN (1, NULL) AS r");
+        assert_eq!(result.rows, vec![vec![Value::Bool(true)]]);
+    }
+
+    #[test]
+    fn abs_of_min_is_an_error_not_a_panic() {
+        let mut schema = make_schema();
+        schema.add_database(crate::database::Database::named("extreme"));
+        schema.set_current_database("extreme").unwrap();
+        let database = schema
+            .databases
+            .iter_mut()
+            .find(|db| db.name == "extreme")
+            .unwrap();
+        database.add_table(Table {
+            name: "t".to_string(),
+            columns: vec!["v".to_string()],
+            rows: vec![vec![Value::Int(i64::MIN)]],
+        });
+        let error = run_query(&mut schema, "SELECT ABS(v) FROM t").unwrap_err();
+        assert!(error.contains("overflow"), "got: {error}");
+    }
+
+    #[test]
+    fn sum_overflow_is_an_error_not_a_panic() {
+        let mut schema = make_schema();
+        schema.add_database(crate::database::Database::named("extreme"));
+        schema.set_current_database("extreme").unwrap();
+        let database = schema
+            .databases
+            .iter_mut()
+            .find(|db| db.name == "extreme")
+            .unwrap();
+        database.add_table(Table {
+            name: "t".to_string(),
+            columns: vec!["v".to_string()],
+            rows: vec![vec![Value::Int(i64::MAX)], vec![Value::Int(1)]],
+        });
+        let error = run_query(&mut schema, "SELECT SUM(v) FROM t").unwrap_err();
+        assert!(error.contains("overflow"), "got: {error}");
     }
 }

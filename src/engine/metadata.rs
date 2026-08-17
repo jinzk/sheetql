@@ -17,7 +17,10 @@ pub(crate) fn run_show_databases(
     Ok(crate::engine::QueryResult { columns, rows })
 }
 
-pub(crate) fn run_use(schema: &mut Schema, name: &str) -> Result<crate::engine::QueryResult, String> {
+pub(crate) fn run_use(
+    schema: &mut Schema,
+    name: &str,
+) -> Result<crate::engine::QueryResult, String> {
     schema.set_current_database(name)?;
     Ok(crate::engine::QueryResult {
         columns: vec!["Status".to_string()],
@@ -66,55 +69,49 @@ pub(crate) fn run_describe_table(
 
 fn describe_table(table: &Table) -> Result<crate::engine::QueryResult, String> {
     let columns = vec!["Column".to_string(), "Type".to_string()];
+
+    // Scan the rows once for all columns instead of once per column.
+    let mut has_int = vec![false; table.columns.len()];
+    let mut has_float = vec![false; table.columns.len()];
+    let mut has_bool = vec![false; table.columns.len()];
+    let mut has_text = vec![false; table.columns.len()];
+    for row in &table.rows {
+        for index in 0..table.columns.len() {
+            match row.get(index) {
+                Some(Value::Int(_)) => has_int[index] = true,
+                Some(Value::Float(_)) => has_float[index] = true,
+                Some(Value::Bool(_)) => has_bool[index] = true,
+                Some(Value::Text(_)) => has_text[index] = true,
+                _ => {}
+            }
+        }
+    }
+
     let rows: Vec<Vec<Value>> = table
         .columns
         .iter()
-        .map(|column| {
-            vec![
-                Value::Text(column.clone()),
-                Value::Text(infer_column_type(table, column).to_string()),
-            ]
+        .enumerate()
+        .map(|(index, column)| {
+            let kind = if has_text[index] {
+                "Text"
+            } else if has_bool[index] {
+                "Boolean"
+            } else if has_float[index] {
+                "Float"
+            } else if has_int[index] {
+                "Integer"
+            } else {
+                "Text"
+            };
+            vec![Value::Text(column.clone()), Value::Text(kind.to_string())]
         })
         .collect();
     Ok(crate::engine::QueryResult { columns, rows })
 }
 
-fn infer_column_type(table: &Table, column: &str) -> &'static str {
-    let index = match table.column_index(column) {
-        Some(index) => index,
-        None => return "Text",
-    };
-    let mut has_int = false;
-    let mut has_float = false;
-    let mut has_bool = false;
-    let mut has_text = false;
-    for row in &table.rows {
-        match row.get(index) {
-            Some(Value::Int(_)) => has_int = true,
-            Some(Value::Float(_)) => has_float = true,
-            Some(Value::Bool(_)) => has_bool = true,
-            Some(Value::Text(_)) => has_text = true,
-            _ => {}
-        }
-    }
-    if has_text {
-        "Text"
-    } else if has_bool {
-        "Boolean"
-    } else if has_float {
-        "Float"
-    } else if has_int {
-        "Integer"
-    } else {
-        "Text"
-    }
-}
-
 /// Split the tail of a `SHOW ... [FROM <database>] [LIKE 'pattern']` clause
 /// into an optional database name and an optional LIKE pattern.
-pub(crate) fn parse_show_clauses(
-    rest: &str,
-) -> Result<(Option<String>, Option<String>), String> {
+pub(crate) fn parse_show_clauses(rest: &str) -> Result<(Option<String>, Option<String>), String> {
     let mut database = None;
     let mut pattern = None;
     let mut expecting_name = false;
