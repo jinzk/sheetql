@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::printer::OutputFormat;
 
 #[derive(Debug, PartialEq)]
@@ -33,11 +35,17 @@ pub enum Command {
 }
 
 pub fn parse_arguments(args: &[String]) -> Command {
-    if args.iter().any(|argument| argument == "--help" || argument == "-h") {
+    if args
+        .iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
         return Command::Help;
     }
 
-    if args.iter().any(|argument| argument == "--version" || argument == "-v") {
+    if args
+        .iter()
+        .any(|argument| argument == "--version" || argument == "-v")
+    {
         return Command::Version;
     }
 
@@ -82,9 +90,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
             "--query" | "-q" => {
                 arg_index += 1;
                 if arg_index >= args.len() {
-                    return Command::Error(format!(
-                        "Argument {arg} must be followed by the query"
-                    ));
+                    return Command::Error(format!("Argument {arg} must be followed by the query"));
                 }
 
                 optional_query = Some(args[arg_index].to_string());
@@ -131,7 +137,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
                         return Command::Error(
                             "Invalid output format, expected one of: render, json, csv, yaml"
                                 .to_string(),
-                        )
+                        );
                     }
                 };
                 arg_index += 1;
@@ -150,6 +156,11 @@ pub fn parse_arguments(args: &[String]) -> Command {
         }
     }
 
+    match expand_file_patterns(&arguments.files) {
+        Ok(files) => arguments.files = files,
+        Err(error) => return Command::Error(error),
+    }
+
     if arguments.files.is_empty() {
         return Command::Error(
             "Missing file paths, use `-f` to pass one or more xls/xlsx/csv files".to_string(),
@@ -164,6 +175,48 @@ pub fn parse_arguments(args: &[String]) -> Command {
         Some(query) => Command::QueryMode(query, arguments),
         None => Command::ReplMode(arguments),
     }
+}
+
+fn expand_file_patterns(files: &[String]) -> Result<Vec<String>, String> {
+    let mut expanded = Vec::new();
+    let mut seen = HashSet::new();
+
+    for file in files {
+        if !contains_glob_magic(file) {
+            if seen.insert(path_key(file)) {
+                expanded.push(file.clone());
+            }
+            continue;
+        }
+
+        let matches =
+            glob::glob(file).map_err(|error| format!("Invalid file pattern `{file}`: {error}"))?;
+        let mut matched = false;
+        for path in matches {
+            let path =
+                path.map_err(|error| format!("Cannot expand file pattern `{file}`: {error}"))?;
+            let path = path.to_string_lossy().into_owned();
+            matched = true;
+            if seen.insert(path_key(&path)) {
+                expanded.push(path);
+            }
+        }
+
+        if !matched {
+            return Err(format!("File pattern `{file}` matched no files"));
+        }
+    }
+
+    Ok(expanded)
+}
+
+fn contains_glob_magic(path: &str) -> bool {
+    path.chars()
+        .any(|character| matches!(character, '*' | '?' | '['))
+}
+
+fn path_key(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 pub fn print_help_list() {
@@ -206,7 +259,9 @@ mod tests {
 
     #[test]
     fn query_mode_with_save_sets_output_file() {
-        match parse_arguments(&args(&["-f", "data.csv", "-q", "SELECT 1", "-s", "out.csv"])) {
+        match parse_arguments(&args(&[
+            "-f", "data.csv", "-q", "SELECT 1", "-s", "out.csv",
+        ])) {
             Command::QueryMode(query, arguments) => {
                 assert_eq!(query, "SELECT 1");
                 assert_eq!(arguments.output_file.as_deref(), Some("out.csv"));
@@ -219,7 +274,10 @@ mod tests {
     fn save_without_query_is_rejected() {
         match parse_arguments(&args(&["-f", "data.csv", "-s", "out.csv"])) {
             Command::Error(message) => {
-                assert!(message.contains("--save requires --query"), "got: {message}")
+                assert!(
+                    message.contains("--save requires --query"),
+                    "got: {message}"
+                )
             }
             other => panic!("expected Error, got {other:?}"),
         }
@@ -231,6 +289,33 @@ mod tests {
             parse_arguments(&args(&["-f", "data.csv"])),
             Command::ReplMode(_)
         ));
+    }
+
+    #[test]
+    fn file_patterns_are_expanded_and_deduplicated() {
+        match parse_arguments(&args(&["-f", "test_data/*.csv", "test_data/orders.csv"])) {
+            Command::ReplMode(arguments) => {
+                assert_eq!(arguments.files.len(), 3);
+                assert!(arguments.files.iter().all(|file| file.ends_with(".csv")));
+                assert_eq!(
+                    arguments
+                        .files
+                        .iter()
+                        .filter(|file| file.ends_with("orders.csv"))
+                        .count(),
+                    1
+                );
+            }
+            other => panic!("expected ReplMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmatched_file_pattern_is_rejected() {
+        match parse_arguments(&args(&["-f", "test_data/*.does-not-exist"])) {
+            Command::Error(message) => assert!(message.contains("matched no files")),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
