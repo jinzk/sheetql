@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Instant;
 
@@ -7,9 +6,11 @@ mod database;
 mod engine;
 mod evaluator;
 mod functions;
+mod highlight;
 mod loader;
 mod naming;
 mod printer;
+mod ui;
 mod value;
 
 use arguments::{parse_arguments, Command};
@@ -146,40 +147,7 @@ fn launch_repl(arguments: arguments::Arguments) {
         }
     };
 
-    println!(
-        "Sheetql version {}, type `exit` to quit",
-        env!("CARGO_PKG_VERSION")
-    );
-
-    let stdin = std::io::stdin();
-    loop {
-        if stdin.is_terminal() {
-            print!("sheetql > ");
-        }
-        std::io::Write::flush(&mut std::io::stdout()).expect("flush failed!");
-
-        let mut input = String::new();
-        match stdin.read_line(&mut input) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("{error}");
-                break;
-            }
-        }
-
-        let trimmed = input.trim().to_string();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed == "exit" {
-            println!("Goodbye!");
-            break;
-        }
-
-        if let Err(error) = execute_query(&trimmed, &arguments, &mut schema) {
-            eprintln!("{error}");
-        }
+    if let Err(error) = ui::run(&mut schema) {
+        eprintln!("{error}");
     }
 }
