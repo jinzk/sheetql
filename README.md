@@ -44,7 +44,7 @@ Option details:
 | `-f, --files`      | One or more paths to`xls` / `xlsx` / `xlsm` / `csv` files. Pass multiple files separated by spaces. |
 | `-q, --query`      | Run a single query and exit. Without it, Sheetql starts an interactive REPL.                                |
 | `-p, --pagination` | Print large results page by page (table format only).                                                       |
-| `-ps, --pagesize`  | Number of rows per page when`-p` is enabled. Defaults to `10`.                                          |
+| `-ps, --pagesize`  | Number of rows per page when`-p` is enabled. Defaults to `10`. Must be greater than zero. |
 | `-o, --output`     | Output format:`render` (default), `json`, `csv`, `yaml`.                                            |
 | `-s, --save`       | Write the`--query` result to `<path>` as CSV. Only valid with `--query` (REPL prints an error).       |
 | `-a, --analysis`   | Print the row count and execution time after the result.                                                    |
@@ -148,7 +148,7 @@ The first row of each sheet / CSV file is treated as the header.
 
 - Headers are sanitized with the same rules as table names.
 - Empty headers become `col1`, `col2`, ... based on position.
-- Duplicate headers get a numeric suffix (`name`, `name_1`, `name_2`, ...).
+- Duplicate headers get a numeric suffix (`name`, `name_2`, `name_3`, ...).
 
 ### Data types
 
@@ -162,6 +162,13 @@ Cell values are inferred automatically. CSV cells are parsed as `Integer`, `Floa
 | Text    | `Alice`, `NY`   |
 | NULL    | empty cells         |
 
+Edge cases:
+
+- Whole numbers beyond `i64` range (e.g. `12345678901234567890`) are stored as `Text` to avoid silent precision loss.
+- Non-finite floats (`NaN`, `inf`, `-inf`) are stored as `Text`.
+- CSV rows with more fields than the header are rejected with an error (including the line number).
+- CSV rows with fewer fields than the header are padded with `NULL`.
+
 `DESCRIBE <table>` shows each column with its inferred type.
 
 ---
@@ -170,13 +177,24 @@ Cell values are inferred automatically. CSV cells are parsed as `Integer`, `Floa
 
 - `SELECT` projections, `*`, `table.*` and column aliases (`AS`)
 - `FROM` with multiple tables and `JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN`, including comma-separated tables, with `ON` and `USING`
-- `WHERE` with comparisons, `AND` / `OR` / `NOT`, `LIKE` / `ILIKE`, `IN`, `BETWEEN`, `IS NULL`, `IS TRUE` / `IS FALSE`, `CASE`, `CAST`. `LIKE` / `ILIKE` support `%` (any sequence) and `_` (single char) wildcards plus an optional `ESCAPE '<char>'` clause; a `NULL` operand yields `NULL` (not `false`).
+- `WHERE` with comparisons, `AND` / `OR` / `NOT`, `LIKE` / `ILIKE`, `IN`, `BETWEEN`, `IS NULL`, `IS TRUE` / `IS FALSE`, `CASE`, `CAST`. `LIKE` / `ILIKE` support `%` (any sequence) and `_` (single char) wildcards plus an optional `ESCAPE '<char>'` clause; a `NULL` operand yields `NULL` (not `false`). `AND` / `OR` short-circuit: the right operand is not evaluated when the left determines the result. `IN` / `NOT IN` with a `NULL` in the list returns `NULL` (not `false`) when the value does not match.
 - `GROUP BY` with aggregate functions, and `HAVING`
 - `ORDER BY` with `ASC` / `DESC`
 - `LIMIT` / `OFFSET` and `SELECT DISTINCT`
 - Metadata commands: `SHOW DATABASES` (alias `SHOW SCHEMAS`), `SHOW TABLES [FROM <database>]`, `SHOW COLUMNS FROM <table>`, `DESCRIBE <table>`, `USE <database>`; `SHOW DATABASES` / `SHOW TABLES` support `LIKE '<pattern>'` with `%` / `_` wildcards
 
 Not yet supported: subqueries, `UNION` / set operations, window functions, `INSERT` / `UPDATE` / `DELETE` (Sheetql is read-only).
+
+### Interactive REPL
+
+Running `sheetql -f <files>` without `-q` starts an interactive TUI with:
+
+- **SQL syntax highlighting** — keywords, strings, numbers and comments are color-coded.
+- **Autocomplete** — type a partial word and a popup suggests matching keywords, functions, table names and column names. Press `Tab` or `Enter` to accept, `Up`/`Down` to navigate, `Esc` to dismiss. Keywords are always inserted in uppercase.
+- **History** — `Up`/`Down` arrows cycle through previous queries (when the popup is not open).
+- **Piped input** — queries can be piped via stdin; the prompt is hidden when stdin is not a terminal.
+
+Type `exit` or `quit` (case-insensitive) to leave the REPL.
 
 ### Scalar functions
 
@@ -210,13 +228,14 @@ Not yet supported: subqueries, `UNION` / set operations, window functions, `INSE
 
 ### Aggregate functions
 
-| Function                       | Description                          |
-| ------------------------------ | ------------------------------------ |
-| `COUNT(*)` / `COUNT(expr)` | Number of rows / non-`NULL` values |
-| `SUM(expr)`                  | Sum of numeric values                |
-| `AVG(expr)`                  | Average of numeric values            |
-| `MIN(expr)`                  | Minimum value                        |
-| `MAX(expr)`                  | Maximum value                        |
+| Function                            | Description                                      |
+| ----------------------------------- | ------------------------------------------------ |
+| `COUNT(*)` / `COUNT(expr)`      | Number of rows / non-`NULL` values             |
+| `COUNT(DISTINCT expr)`           | Number of distinct non-`NULL` values (numeric values unify `Int` and `Float`) |
+| `SUM(expr)`                       | Sum of numeric values (overflow → error)         |
+| `AVG(expr)`                       | Average of numeric values                        |
+| `MIN(expr)`                       | Minimum value                                    |
+| `MAX(expr)`                       | Maximum value                                    |
 
 ---
 
