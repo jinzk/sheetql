@@ -3,13 +3,12 @@ use ratatui::text::{Line, Span};
 
 /// SQL keywords highlighted in the interactive input and history cells.
 pub const KEYWORDS: &[&str] = &[
-    "add", "all", "alter", "and", "as", "asc", "avg", "between", "by", "case",
-    "cast", "column", "count", "create", "delete", "desc", "describe", "distinct",
-    "drop", "else", "end", "from", "full", "group", "having", "in", "index",
-    "inner", "insert", "into", "is", "join", "left", "like", "limit", "max",
-    "min", "not", "null", "on", "or", "order", "outer", "replace", "right",
-    "select", "set", "show", "sum", "table", "then", "true", "false", "union",
-    "unique", "update", "use", "using", "values", "view", "when", "where", "with",
+    "add", "all", "alter", "and", "as", "asc", "avg", "between", "by", "case", "cast", "column",
+    "count", "create", "delete", "desc", "describe", "distinct", "drop", "else", "end", "from",
+    "full", "group", "having", "in", "index", "inner", "insert", "into", "is", "join", "left",
+    "like", "limit", "max", "min", "not", "null", "on", "or", "order", "outer", "replace", "right",
+    "select", "set", "show", "sum", "table", "then", "true", "false", "union", "unique", "update",
+    "use", "using", "values", "view", "when", "where", "with",
 ];
 
 /// Split `sql` into styled spans, coloring keywords, string literals, numbers
@@ -29,10 +28,7 @@ fn highlight_line(line: &str) -> Line<'static> {
         // Line comment: everything until end of line.
         if c == '-' && chars.get(i + 1) == Some(&'-') {
             let rest: String = chars[i..].iter().collect();
-            spans.push(Span::styled(
-                rest,
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(rest, Style::default().fg(Color::DarkGray)));
             break;
         }
 
@@ -45,8 +41,7 @@ fn highlight_line(line: &str) -> Line<'static> {
         }
 
         // Number literal (integers, decimals, and leading-dot forms).
-        if c.is_ascii_digit()
-            || (c == '.' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()))
+        if c.is_ascii_digit() || (c == '.' && chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()))
         {
             let mut j = i;
             while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
@@ -84,7 +79,9 @@ fn highlight_line(line: &str) -> Line<'static> {
 
 /// Case-insensitive keyword check on a bare word.
 fn is_keyword(word: &str) -> bool {
-    KEYWORDS.iter().any(|keyword| keyword.eq_ignore_ascii_case(word))
+    KEYWORDS
+        .iter()
+        .any(|keyword| keyword.eq_ignore_ascii_case(word))
 }
 
 /// Scan a quoted literal starting at `start`. Handles doubled quotes as
