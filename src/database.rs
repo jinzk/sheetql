@@ -105,6 +105,10 @@ impl Schema {
         self.current.as_deref()
     }
 
+    pub fn clear_current_database(&mut self) {
+        self.current = None;
+    }
+
     /// Resolve a table reference. With a database name, looks only in that
     /// database. Without one, searches the current database first, then every
     /// other database, reporting ambiguity if the name matches in multiple.

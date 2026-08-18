@@ -10,6 +10,7 @@ pub struct Arguments {
     pub page_size: usize,
     pub output_format: OutputFormat,
     pub output_file: Option<String>,
+    pub server: bool,
 }
 
 impl Arguments {
@@ -21,6 +22,7 @@ impl Arguments {
             page_size: 10,
             output_format: OutputFormat::Table,
             output_file: None,
+            server: false,
         }
     }
 }
@@ -29,6 +31,7 @@ impl Arguments {
 pub enum Command {
     ReplMode(Arguments),
     QueryMode(String, Arguments),
+    ServerMode(Arguments),
     Help,
     Version,
     Error(String),
@@ -123,6 +126,10 @@ pub fn parse_arguments(args: &[String]) -> Command {
                 Ok(path) => arguments.output_file = Some(path.to_string()),
                 Err(message) => return Command::Error(message),
             },
+            "--server" | "-S" => {
+                arguments.server = true;
+                arg_index += 1;
+            }
             _ => return Command::Error(format!("Unknown argument {arg}")),
         }
     }
@@ -140,6 +147,10 @@ pub fn parse_arguments(args: &[String]) -> Command {
 
     if arguments.output_file.is_some() && optional_query.is_none() {
         return Command::Error("--save requires --query".to_string());
+    }
+
+    if arguments.server {
+        return Command::ServerMode(arguments);
     }
 
     match optional_query {
@@ -218,6 +229,7 @@ pub fn print_help_list() {
     println!("-ps, --pagesize              Set pagination page size [default: 10]");
     println!("-o,  --output                Set output format [render, json, csv, yaml]");
     println!("-s,  --save <path>           Save --query result as a CSV file");
+    println!("-S,  --server                Start a JSONL server on stdin/stdout");
     println!("-a,  --analysis              Print Query analysis");
     println!("-h,  --help                  Print Sheetql help");
     println!("-v,  --version               Print Sheetql Current Version");
@@ -275,6 +287,18 @@ mod tests {
         assert!(matches!(
             parse_arguments(&args(&["-f", "data.csv"])),
             Command::ReplMode(_)
+        ));
+    }
+
+    #[test]
+    fn server_mode_flag() {
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "-S"])),
+            Command::ServerMode(_)
+        ));
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "--server"])),
+            Command::ServerMode(_)
         ));
     }
 

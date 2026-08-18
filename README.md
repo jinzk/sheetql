@@ -32,6 +32,7 @@ Options:
   -ps, --pagesize             Set pagination page size [default: 10]
   -o,  --output               Set output format [render, json, csv, yaml]
   -s,  --save <path>          Save --query result as a CSV file
+  -S,  --server               Start a JSONL server on stdin/stdout
   -a,  --analysis             Print Query analysis
   -h,  --help                 Print Sheetql help
   -v,  --version              Print Sheetql Current Version
@@ -47,7 +48,8 @@ Option details:
 | `-ps, --pagesize`  | Number of rows per page when`-p` is enabled. Defaults to `10`. Must be greater than zero. |
 | `-o, --output`     | Output format:`render` (default), `json`, `csv`, `yaml`.                                            |
 | `-s, --save`       | Write the`--query` result to `<path>` as CSV. Only valid with `--query` (REPL prints an error).       |
-| `-a, --analysis`   | Print the row count and execution time after the result.                                                    |
+| `-S, --server`    | Start a JSONL server on stdin/stdout for programmatic access (see [Server mode](#server-mode)).             |
+| `-a, --analysis`  | Print the row count and execution time after the result.                                                    |
 | `-h, --help`       | Print help.                                                                                                 |
 | `-v, --version`    | Print the current version.                                                                                  |
 
@@ -312,6 +314,60 @@ SELECT name, city FROM sales ORDER BY name INTO OUTFILE 'result.csv'
 ```
 
 Both options always produce CSV (header + comma-separated rows), regardless of `-o`.
+
+---
+
+### Server mode
+
+`-S, --server` starts a persistent JSONL server over stdin/stdout. Each line of stdin is one JSON request; each response is one JSON object printed to stdout and flushed. The files are loaded once when the server starts, then kept in memory across requests.
+
+```sh
+sheetql -f data/sales.csv data/customers.csv --server
+```
+
+Requests and responses:
+
+| Request | Description |
+| --- | --- |
+| `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | Run a query. `db` optionally scopes the query to one database (the process-wide `USE` state is unchanged). `format` controls the `text` field: `json` (default), `csv`, `yaml`, `table`. |
+| `{ "op": "list" }` | List every database, its tables, and their columns. |
+| `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | Run a query and write the result as CSV. `overwrite` defaults to `true`; set to `false` to fail if the file already exists. |
+| `{ "op": "exit" }` | Acknowledge with `{ "ok": true }` and terminate. The server also exits cleanly on stdin EOF. |
+
+Successful query response:
+
+```json
+{ "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2 }
+```
+
+`rows` is an array of arrays. Non-finite floats are serialized as `null`. Errors (bad JSON, unknown op, query failure, export failure) return `{ "ok": false, "error": "…" }` and do **not** stop the server.
+
+Successful `list` response:
+
+```json
+{ "ok": true, "data": { "current": "data_sales_csv", "databases": [ { "name": "data_sales_csv", "tables": [ { "name": "sales", "columns": ["name","city"] } ] } ] } }
+```
+
+Successful export response:
+
+```json
+{ "ok": true, "path": "out.csv", "elapsed_ms": 3 }
+```
+
+Example session:
+
+```
+> {"op":"list"}
+< {"ok":true,"data":{"current":null,"databases":[{"name":"data_sales_csv","tables":[{"name":"sales","columns":["name","city"]}]}]}}
+> {"op":"query","sql":"SELECT name, city FROM sales ORDER BY name"}
+< {"ok":true,"columns":["name","city"],"rows":[["Alice","NY"],["Bob","LA"]],"text":"…","elapsed_ms":1}
+> {"op":"export","sql":"SELECT * FROM sales","path":"sales.csv"}
+< {"ok":true,"path":"sales.csv","elapsed_ms":1}
+> {"op":"exit"}
+< {"ok":true}
+```
+
+The server handles requests sequentially in a single process. It is intended for local use by a trusted caller; there is no authentication or encryption.
 
 ---
 

@@ -32,6 +32,7 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
   -ps, --pagesize             设置分页大小 [默认: 10]
   -o,  --output               设置输出格式 [render, json, csv, yaml]
   -s,  --save <path>          将 --query 结果保存为 CSV 文件
+  -S,  --server               在 stdin/stdout 上启动 JSONL 服务器
   -a,  --analysis             打印查询分析信息
   -h,  --help                 打印 Sheetql 帮助
   -v,  --version              打印 Sheetql 当前版本
@@ -47,6 +48,7 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
 | `-ps, --pagesize`  | 启用`-p` 时每页显示的行数，默认 `10`。必须大于零。                               |
 | `-o, --output`     | 输出格式：`render`（默认）、`json`、`csv`、`yaml`。                                |
 | `-s, --save`       | 将`--query` 的结果以 CSV 写入 `<path>`。仅能与 `--query` 配合使用（REPL 下会报错）。 |
+| `-S, --server`    | 在 stdin/stdout 上启动 JSONL 服务器，供程序化访问（见[服务器模式](#服务器模式)）。   |
 | `-a, --analysis`   | 在结果后打印行数与执行耗时。                                                               |
 | `-h, --help`       | 打印帮助。                                                                                 |
 | `-v, --version`    | 打印当前版本。                                                                             |
@@ -312,6 +314,60 @@ SELECT name, city FROM sales ORDER BY name INTO OUTFILE 'result.csv'
 ```
 
 两种方式均始终输出 CSV（表头 + 逗号分隔的行），与 `-o` 无关。
+
+---
+
+### 服务器模式
+
+`-S, --server` 在 stdin/stdout 上启动一个持久的 JSONL 服务器。stdin 的每一行是一条 JSON 请求；每条响应都是一个 JSON 对象，打印到 stdout 并逐条 flush。文件在服务器启动时加载一次，之后常驻内存供多次请求使用。
+
+```sh
+sheetql -f data/sales.csv data/customers.csv --server
+```
+
+请求与响应:
+
+| 请求 | 说明 |
+| --- | --- |
+| `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | 运行查询。`db` 可选，仅将本次查询限定在该数据库内（进程级 `USE` 状态不变）。`format` 控制 `text` 字段：`json`（默认）、`csv`、`yaml`、`table`。 |
+| `{ "op": "list" }` | 列出所有数据库、其中的表及各表列名。 |
+| `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | 运行查询并将结果写成 CSV。`overwrite` 默认 `true`；设为 `false` 时若文件已存在则报错。 |
+| `{ "op": "exit" }` | 先返回 `{ "ok": true }` 再退出。stdin 关闭（EOF）时服务器也会干净退出。 |
+
+查询成功响应:
+
+```json
+{ "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2 }
+```
+
+`rows` 是二维数组。非有限浮点数序列化为 `null`。错误（非法 JSON、未知 op、查询失败、导出失败）返回 `{ "ok": false, "error": "…" }`，并且**不会**终止服务器。
+
+`list` 成功响应:
+
+```json
+{ "ok": true, "data": { "current": "data_sales_csv", "databases": [ { "name": "data_sales_csv", "tables": [ { "name": "sales", "columns": ["name","city"] } ] } ] } }
+```
+
+导出成功响应:
+
+```json
+{ "ok": true, "path": "out.csv", "elapsed_ms": 3 }
+```
+
+会话示例:
+
+```
+> {"op":"list"}
+< {"ok":true,"data":{"current":null,"databases":[{"name":"data_sales_csv","tables":[{"name":"sales","columns":["name","city"]}]}]}}
+> {"op":"query","sql":"SELECT name, city FROM sales ORDER BY name"}
+< {"ok":true,"columns":["name","city"],"rows":[["Alice","NY"],["Bob","LA"]],"text":"…","elapsed_ms":1}
+> {"op":"export","sql":"SELECT * FROM sales","path":"sales.csv"}
+< {"ok":true,"path":"sales.csv","elapsed_ms":1}
+> {"op":"exit"}
+< {"ok":true}
+```
+
+服务器在单进程内顺序处理请求，面向本地可信调用方；不含鉴权或加密。
 
 ---
 

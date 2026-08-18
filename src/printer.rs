@@ -20,7 +20,7 @@ pub fn render(format: OutputFormat, columns: &[String], rows: &[Vec<Value>]) -> 
     }
 }
 
-fn value_to_json(value: &Value) -> serde_json::Value {
+pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::Int(number) => json!(number),
         Value::Float(number) => {

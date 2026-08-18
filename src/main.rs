@@ -11,12 +11,13 @@ mod highlight;
 mod loader;
 mod naming;
 mod printer;
+mod server;
 mod ui;
 mod value;
 
-use arguments::{parse_arguments, Command};
+use arguments::{Command, parse_arguments};
 use database::Schema;
-use printer::{render, OutputFormat};
+use printer::{OutputFormat, render};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -38,6 +39,23 @@ fn main() {
             if let Err(error) = execute_query(&query, &arguments, &mut schema) {
                 eprintln!("{error}");
                 std::process::exit(1);
+            }
+        }
+        Command::ServerMode(arguments) => {
+            if let Err(error) = validate_files(&arguments.files) {
+                eprintln!("{error}");
+                return;
+            }
+
+            let mut schema = match loader::load_schema(&arguments.files) {
+                Ok(schema) => schema,
+                Err(error) => {
+                    eprintln!("{error}");
+                    return;
+                }
+            };
+            if let Err(error) = server::run(&mut schema) {
+                eprintln!("{error}");
             }
         }
         Command::Help => arguments::print_help_list(),
@@ -76,11 +94,7 @@ fn execute_query(
 
             if arguments.analysis {
                 let plural = if result.rows.len() == 1 { "" } else { "s" };
-                println!(
-                    "{} row{plural} in set ({:?})",
-                    result.rows.len(),
-                    duration
-                );
+                println!("{} row{plural} in set ({:?})", result.rows.len(), duration);
             }
             Ok(())
         }
@@ -88,7 +102,8 @@ fn execute_query(
     }
 }
 
-fn print_result(arguments: &arguments::Arguments, columns: &[String], rows: &[Vec<value::Value>]) {    if arguments.output_format == OutputFormat::Table
+fn print_result(arguments: &arguments::Arguments, columns: &[String], rows: &[Vec<value::Value>]) {
+    if arguments.output_format == OutputFormat::Table
         && arguments.pagination
         && rows.len() > arguments.page_size
     {
