@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::{Value as JsonValue, json};
@@ -9,7 +10,7 @@ use crate::printer::{self, OutputFormat};
 
 /// Serve a JSONL protocol on stdin/stdout: one request per line, one response
 /// per line. Returns on stdin EOF or an `{"op":"exit"}` request.
-pub fn run(schema: &mut Schema) -> Result<(), String> {
+pub fn run(schema: &mut Schema, export_root: Option<&str>) -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = stdin.lock();
@@ -21,7 +22,7 @@ pub fn run(schema: &mut Schema) -> Result<(), String> {
         match input.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(_) => break,
+            Err(error) => return Err(format!("Cannot read request: {error}")),
         }
         if line.trim().is_empty() {
             continue;
@@ -32,20 +33,22 @@ pub fn run(schema: &mut Schema) -> Result<(), String> {
             Err(error) => {
                 write_response(
                     &mut output,
-                    &json!({ "ok": false, "error": format!("Invalid JSON: {error}") }),
+                    &error_response("invalid_json", format!("Invalid JSON: {error}")),
                 )?;
                 continue;
             }
         };
 
-        let response = match handle_request(schema, &request) {
+        let request_id = request.get("id").cloned();
+        let response = match handle_request(schema, &request, export_root) {
             Outcome::Respond(response) => response,
             Outcome::Exit => {
-                write_response(&mut output, &json!({ "ok": true }))?;
+                let response = add_id(json!({ "ok": true }), request_id.as_ref());
+                write_response(&mut output, &response)?;
                 return Ok(());
             }
         };
-        write_response(&mut output, &response)?;
+        write_response(&mut output, &add_id(response, request_id.as_ref()))?;
     }
     Ok(())
 }
@@ -56,23 +59,24 @@ enum Outcome {
 }
 
 /// Handle a single request.
-fn handle_request(schema: &mut Schema, request: &JsonValue) -> Outcome {
+fn handle_request(schema: &mut Schema, request: &JsonValue, export_root: Option<&str>) -> Outcome {
     let op = request.get("op").and_then(JsonValue::as_str).unwrap_or("");
     match op {
         "query" => Outcome::Respond(handle_query(schema, request)),
         "list" => Outcome::Respond(handle_list(schema)),
-        "export" => Outcome::Respond(handle_export(schema, request)),
+        "export" => Outcome::Respond(handle_export(schema, request, export_root)),
         "exit" => Outcome::Exit,
-        _ => Outcome::Respond(
-            json!({ "ok": false, "error": format!("Unknown op `{op}`, expected one of: query, list, export, exit") }),
-        ),
+        _ => Outcome::Respond(error_response(
+            "invalid_request",
+            format!("Unknown op `{op}`, expected one of: query, list, export, exit"),
+        )),
     }
 }
 
 fn handle_query(schema: &mut Schema, request: &JsonValue) -> JsonValue {
     let sql = request.get("sql").and_then(JsonValue::as_str).unwrap_or("");
     if sql.is_empty() {
-        return json!({ "ok": false, "error": "query requires a non-empty `sql`" });
+        return error_response("invalid_request", "query requires a non-empty `sql`");
     }
 
     let format = request
@@ -85,27 +89,35 @@ fn handle_query(schema: &mut Schema, request: &JsonValue) -> JsonValue {
         "yaml" => OutputFormat::Yaml,
         "render" | "table" => OutputFormat::Table,
         _ => {
-            return json!({ "ok": false, "error": format!("Unknown format `{format}`, expected one of: json, csv, yaml, table") });
+            return error_response(
+                "invalid_request",
+                format!("Unknown format `{format}`, expected one of: json, csv, yaml, table"),
+            );
         }
     };
 
     let db = request.get("db").and_then(JsonValue::as_str);
     let start = Instant::now();
     let result = run_query_with_db(schema, sql, db);
-    respond_with_result(result, start.elapsed().as_millis() as u64, |result| {
-        let rows: Vec<Vec<JsonValue>> = result
-            .rows
-            .iter()
-            .map(|row| row.iter().map(printer::value_to_json).collect())
-            .collect();
-        let text = printer::render(output_format, &result.columns, &result.rows);
-        json!({
-            "ok": true,
-            "columns": result.columns,
-            "rows": rows,
-            "text": text,
-        })
-    })
+    respond_with_result(
+        result,
+        "query_error",
+        start.elapsed().as_millis() as u64,
+        |result| {
+            let rows: Vec<Vec<JsonValue>> = result
+                .rows
+                .iter()
+                .map(|row| row.iter().map(printer::value_to_json).collect())
+                .collect();
+            let text = printer::render(output_format, &result.columns, &result.rows);
+            json!({
+                "ok": true,
+                "columns": result.columns,
+                "rows": rows,
+                "text": text,
+            })
+        },
+    )
 }
 
 fn handle_list(schema: &Schema) -> JsonValue {
@@ -130,33 +142,43 @@ fn handle_list(schema: &Schema) -> JsonValue {
     })
 }
 
-fn handle_export(schema: &mut Schema, request: &JsonValue) -> JsonValue {
+fn handle_export(schema: &mut Schema, request: &JsonValue, export_root: Option<&str>) -> JsonValue {
     let sql = request.get("sql").and_then(JsonValue::as_str).unwrap_or("");
     if sql.is_empty() {
-        return json!({ "ok": false, "error": "export requires a non-empty `sql`" });
+        return error_response("invalid_request", "export requires a non-empty `sql`");
     }
     let path = request
         .get("path")
         .and_then(JsonValue::as_str)
         .unwrap_or("");
     if path.is_empty() {
-        return json!({ "ok": false, "error": "export requires a `path`" });
+        return error_response("invalid_request", "export requires a `path`");
     }
     let overwrite = request
         .get("overwrite")
         .and_then(JsonValue::as_bool)
         .unwrap_or(true);
 
+    let export_path = match resolve_export_path(path, export_root) {
+        Ok(path) => path,
+        Err(error) => return error_response("invalid_request", error),
+    };
+
     let db = request.get("db").and_then(JsonValue::as_str);
     let start = Instant::now();
     let result = run_query_with_db(schema, sql, db);
-    respond_with_result(result, start.elapsed().as_millis() as u64, |result| {
-        let content = printer::render(OutputFormat::Csv, &result.columns, &result.rows);
-        match write_export(path, &content, overwrite) {
-            Ok(()) => json!({ "ok": true, "path": path }),
-            Err(error) => json!({ "ok": false, "error": error }),
-        }
-    })
+    respond_with_result(
+        result,
+        "export_error",
+        start.elapsed().as_millis() as u64,
+        |result| {
+            let content = printer::render(OutputFormat::Csv, &result.columns, &result.rows);
+            match write_export(&export_path, &content, overwrite) {
+                Ok(()) => json!({ "ok": true, "path": export_path.to_string_lossy() }),
+                Err(error) => error_response("export_error", error),
+            }
+        },
+    )
 }
 
 /// Run a query, optionally scoped to `db` for this request only. The process
@@ -182,6 +204,7 @@ fn run_query_with_db(
 
 fn respond_with_result(
     result: Result<QueryResult, String>,
+    error_code: &str,
     elapsed_ms: u64,
     ok: impl FnOnce(&QueryResult) -> JsonValue,
 ) -> JsonValue {
@@ -191,15 +214,35 @@ fn respond_with_result(
             response["elapsed_ms"] = json!(elapsed_ms);
             response
         }
-        Err(error) => json!({ "ok": false, "error": error, "elapsed_ms": elapsed_ms }),
+        Err(error) => {
+            let mut response = error_response(error_code, error);
+            response["elapsed_ms"] = json!(elapsed_ms);
+            response
+        }
     }
 }
 
-fn write_export(path: &str, content: &str, overwrite: bool) -> Result<(), String> {
-    if !overwrite && std::path::Path::new(path).exists() {
-        return Err(format!("Output file `{path}` already exists"));
+fn write_export(path: &Path, content: &str, overwrite: bool) -> Result<(), String> {
+    if !overwrite && path.exists() {
+        return Err(format!("Output file `{}` already exists", path.display()));
     }
-    std::fs::write(path, content).map_err(|error| format!("Cannot write file `{path}`: {error}"))
+    std::fs::write(path, content)
+        .map_err(|error| format!("Cannot write file `{}`: {error}", path.display()))
+}
+
+fn resolve_export_path(path: &str, export_root: Option<&str>) -> Result<PathBuf, String> {
+    let requested = Path::new(path);
+    let Some(root) = export_root else {
+        return Ok(requested.to_path_buf());
+    };
+    if requested.is_absolute()
+        || requested
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("Export path must be relative and cannot contain `..`".to_string());
+    }
+    Ok(Path::new(root).join(requested))
 }
 
 fn write_response(output: &mut impl Write, response: &JsonValue) -> Result<(), String> {
@@ -211,6 +254,17 @@ fn write_response(output: &mut impl Write, response: &JsonValue) -> Result<(), S
         .map_err(|error| format!("Cannot flush response: {error}"))
 }
 
+fn error_response(code: &str, error: impl Into<String>) -> JsonValue {
+    json!({ "ok": false, "code": code, "error": error.into() })
+}
+
+fn add_id(mut response: JsonValue, id: Option<&JsonValue>) -> JsonValue {
+    if let Some(id) = id {
+        response["id"] = id.clone();
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,7 +272,7 @@ mod tests {
     use serde_json::json;
 
     fn respond(schema: &mut Schema, request: &JsonValue) -> JsonValue {
-        match handle_request(schema, request) {
+        match handle_request(schema, request, None) {
             Outcome::Respond(response) => response,
             Outcome::Exit => panic!("unexpected exit outcome"),
         }
@@ -333,7 +387,7 @@ mod tests {
     fn exit_op_returns_exit_outcome() {
         let mut schema = schema();
         assert!(matches!(
-            handle_request(&mut schema, &json!({ "op": "exit" })),
+            handle_request(&mut schema, &json!({ "op": "exit" }), None),
             Outcome::Exit
         ));
     }
@@ -343,7 +397,36 @@ mod tests {
         let mut schema = schema();
         let response = respond(&mut schema, &json!({ "sql": "SELECT 1" }));
         assert_eq!(response["ok"], false);
+        assert_eq!(response["code"], "invalid_request");
         assert!(response["error"].as_str().unwrap().contains("Unknown op"));
+    }
+
+    #[test]
+    fn export_root_rejects_absolute_and_parent_paths() {
+        let mut schema = schema();
+        for path in ["../out.csv", "C:\\out.csv"] {
+            let response = match handle_request(
+                &mut schema,
+                &json!({ "op": "export", "sql": "SELECT 1", "path": path }),
+                Some("exports"),
+            ) {
+                Outcome::Respond(response) => response,
+                Outcome::Exit => panic!("unexpected exit outcome"),
+            };
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["code"], "invalid_request");
+        }
+    }
+
+    #[test]
+    fn request_id_is_echoed_in_server_response() {
+        let mut schema = schema();
+        let response = match handle_request(&mut schema, &json!({ "id": 7, "op": "list" }), None) {
+            Outcome::Respond(response) => response,
+            Outcome::Exit => panic!("unexpected exit outcome"),
+        };
+        let response = add_id(response, Some(&json!(7)));
+        assert_eq!(response["id"], 7);
     }
 
     #[test]

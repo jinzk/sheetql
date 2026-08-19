@@ -1,3 +1,4 @@
+use std::io::{self, BufRead, IsTerminal};
 use std::path::Path;
 use std::time::Instant;
 
@@ -54,8 +55,9 @@ fn main() {
                     return;
                 }
             };
-            if let Err(error) = server::run(&mut schema) {
+            if let Err(error) = server::run(&mut schema, arguments.export_root.as_deref()) {
                 eprintln!("{error}");
+                std::process::exit(1);
             }
         }
         Command::Help => arguments::print_help_list(),
@@ -163,7 +165,31 @@ fn launch_repl(arguments: arguments::Arguments) {
         }
     };
 
-    if let Err(error) = ui::run(&mut schema) {
+    let result = if io::stdin().is_terminal() {
+        ui::run(&mut schema).map_err(|error| error.to_string())
+    } else {
+        run_piped_queries(&mut schema)
+    };
+    if let Err(error) = result {
         eprintln!("{error}");
     }
+}
+
+/// Execute one SQL statement per stdin line without enabling terminal raw mode.
+fn run_piped_queries(schema: &mut Schema) -> Result<(), String> {
+    for line in io::stdin().lock().lines() {
+        let query = line.map_err(|error| format!("Cannot read query: {error}"))?;
+        let query = query.trim();
+        if query.is_empty() {
+            continue;
+        }
+        match engine::run_query(schema, query) {
+            Ok(result) => print!(
+                "{}",
+                render(OutputFormat::Table, &result.columns, &result.rows)
+            ),
+            Err(error) => eprintln!("{error}"),
+        }
+    }
+    Ok(())
 }

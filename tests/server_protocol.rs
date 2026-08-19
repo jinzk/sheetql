@@ -59,8 +59,11 @@ impl Server {
     }
 
     fn shutdown(mut self) {
-        let response = self.request(r#"{ "op": "exit" }"#);
-        assert_eq!(response, serde_json::json!({ "ok": true }));
+        let response = self.request(r#"{ "id": "shutdown", "op": "exit" }"#);
+        assert_eq!(
+            response,
+            serde_json::json!({ "id": "shutdown", "ok": true })
+        );
         let status = self.child.wait().expect("wait");
         assert!(status.success());
     }
@@ -74,8 +77,9 @@ fn server_supports_query_list_and_export() {
 
     let mut server = Server::start(&csv);
 
-    let list = server.request(r#"{ "op": "list" }"#);
+    let list = server.request(r#"{ "id": 1, "op": "list" }"#);
     assert_eq!(list["ok"], true);
+    assert_eq!(list["id"], 1);
     let db = &list["data"]["databases"][0];
     assert!(db["name"].as_str().unwrap().ends_with("people_csv"));
     assert_eq!(db["tables"][0]["name"], "people");
@@ -120,14 +124,17 @@ fn server_recovers_from_errors_without_exiting() {
 
     let bad_sql = server.request(r#"{ "op": "query", "sql": "SELECT nope FROM missing" }"#);
     assert_eq!(bad_sql["ok"], false);
+    assert_eq!(bad_sql["code"], "query_error");
     assert!(bad_sql["error"].as_str().is_some());
 
     let bad_json = server.request(r#"this is not json"#);
     assert_eq!(bad_json["ok"], false);
+    assert_eq!(bad_json["code"], "invalid_json");
     assert!(bad_json["error"].as_str().unwrap().contains("Invalid JSON"));
 
     let unknown = server.request(r#"{ "op": "warp" }"#);
     assert_eq!(unknown["ok"], false);
+    assert_eq!(unknown["code"], "invalid_request");
     assert!(unknown["error"].as_str().unwrap().contains("Unknown op"));
 
     let ok_after =
@@ -280,5 +287,28 @@ fn export_respects_overwrite_false() {
     );
 
     server.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn piped_input_uses_non_interactive_mode() {
+    let dir = temp_dir("piped");
+    let csv = sample_csv(&dir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sheetql"))
+        .args(["-f", csv.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sheetql");
+    {
+        let mut input = child.stdin.take().expect("child stdin");
+        writeln!(input, "SELECT COUNT(*) AS n FROM people").expect("write query");
+    }
+    let output = child.wait_with_output().expect("wait for piped mode");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("n"), "stdout was: {stdout}");
+    assert!(stdout.contains("3"), "stdout was: {stdout}");
     std::fs::remove_dir_all(&dir).ok();
 }

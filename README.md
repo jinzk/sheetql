@@ -33,6 +33,7 @@ Options:
   -o,  --output               Set output format [render, json, csv, yaml]
   -s,  --save <path>          Save --query result as a CSV file
   -S,  --server               Start a JSONL server on stdin/stdout
+       --export-root <path>   Restrict server exports to this directory
   -a,  --analysis             Print Query analysis
   -h,  --help                 Print Sheetql help
   -v,  --version              Print Sheetql Current Version
@@ -49,6 +50,7 @@ Option details:
 | `-o, --output`     | Output format:`render` (default), `json`, `csv`, `yaml`.                                            |
 | `-s, --save`       | Write the`--query` result to `<path>` as CSV. Only valid with `--query` (REPL prints an error).       |
 | `-S, --server`    | Start a JSONL server on stdin/stdout for programmatic access (see [Server mode](#server-mode)).             |
+| `--export-root`   | Restrict `op=export` paths to this directory. Only valid with `--server`; paths must be relative and cannot contain `..`. |
 | `-a, --analysis`  | Print the row count and execution time after the result.                                                    |
 | `-h, --help`       | Print help.                                                                                                 |
 | `-v, --version`    | Print the current version.                                                                                  |
@@ -319,10 +321,16 @@ Both options always produce CSV (header + comma-separated rows), regardless of `
 
 ### Server mode
 
-`-S, --server` starts a persistent JSONL server over stdin/stdout. Each line of stdin is one JSON request; each response is one JSON object printed to stdout and flushed. The files are loaded once when the server starts, then kept in memory across requests.
+`-S, --server` starts a persistent JSONL server over stdin/stdout. Each line of stdin is one JSON request; each response is one JSON object printed to stdout and flushed. The files are loaded once when the server starts, then kept in memory across requests. `--server` cannot be combined with `--query` or `--save`.
 
 ```sh
 sheetql -f data/sales.csv data/customers.csv --server
+```
+
+To restrict exports to a trusted directory:
+
+```sh
+sheetql -f data/sales.csv --server --export-root ./exports
 ```
 
 Requests and responses:
@@ -340,7 +348,7 @@ Successful query response:
 { "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2 }
 ```
 
-`rows` is an array of arrays. Non-finite floats are serialized as `null`. Errors (bad JSON, unknown op, query failure, export failure) return `{ "ok": false, "error": "…" }` and do **not** stop the server.
+`rows` is an array of arrays. Non-finite floats are serialized as `null`. If a request contains `id`, the same value is echoed in the response. Errors include a machine-readable `code`, for example `{ "ok": false, "code": "query_error", "error": "…" }`, and do **not** stop the server.
 
 Successful `list` response:
 

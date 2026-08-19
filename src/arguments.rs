@@ -11,6 +11,7 @@ pub struct Arguments {
     pub output_format: OutputFormat,
     pub output_file: Option<String>,
     pub server: bool,
+    pub export_root: Option<String>,
 }
 
 impl Arguments {
@@ -23,6 +24,7 @@ impl Arguments {
             output_format: OutputFormat::Table,
             output_file: None,
             server: false,
+            export_root: None,
         }
     }
 }
@@ -130,6 +132,10 @@ pub fn parse_arguments(args: &[String]) -> Command {
                 arguments.server = true;
                 arg_index += 1;
             }
+            "--export-root" => match take_value(args, &mut arg_index, arg, "an export directory") {
+                Ok(path) => arguments.export_root = Some(path.to_string()),
+                Err(message) => return Command::Error(message),
+            },
             _ => return Command::Error(format!("Unknown argument {arg}")),
         }
     }
@@ -145,12 +151,22 @@ pub fn parse_arguments(args: &[String]) -> Command {
         );
     }
 
+    if arguments.server {
+        if optional_query.is_some() {
+            return Command::Error("--server cannot be combined with --query".to_string());
+        }
+        if arguments.output_file.is_some() {
+            return Command::Error("--server cannot be combined with --save".to_string());
+        }
+        return Command::ServerMode(arguments);
+    }
+
     if arguments.output_file.is_some() && optional_query.is_none() {
         return Command::Error("--save requires --query".to_string());
     }
 
-    if arguments.server {
-        return Command::ServerMode(arguments);
+    if arguments.export_root.is_some() {
+        return Command::Error("--export-root requires --server".to_string());
     }
 
     match optional_query {
@@ -230,6 +246,7 @@ pub fn print_help_list() {
     println!("-o,  --output                Set output format [render, json, csv, yaml]");
     println!("-s,  --save <path>           Save --query result as a CSV file");
     println!("-S,  --server                Start a JSONL server on stdin/stdout");
+    println!("     --export-root <path>    Restrict server exports to this directory");
     println!("-a,  --analysis              Print Query analysis");
     println!("-h,  --help                  Print Sheetql help");
     println!("-v,  --version               Print Sheetql Current Version");
@@ -299,6 +316,26 @@ mod tests {
         assert!(matches!(
             parse_arguments(&args(&["-f", "data.csv", "--server"])),
             Command::ServerMode(_)
+        ));
+    }
+
+    #[test]
+    fn server_conflicts_with_query_and_save() {
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "-S", "-q", "SELECT 1"])),
+            Command::Error(message) if message.contains("--server cannot be combined with --query")
+        ));
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "-S", "-s", "out.csv"])),
+            Command::Error(message) if message.contains("--server cannot be combined with --save")
+        ));
+    }
+
+    #[test]
+    fn export_root_requires_server() {
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "--export-root", "exports"])),
+            Command::Error(message) if message.contains("--export-root requires --server")
         ));
     }
 

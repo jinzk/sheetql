@@ -33,6 +33,7 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
   -o,  --output               设置输出格式 [render, json, csv, yaml]
   -s,  --save <path>          将 --query 结果保存为 CSV 文件
   -S,  --server               在 stdin/stdout 上启动 JSONL 服务器
+       --export-root <path>   将服务器导出限制在此目录
   -a,  --analysis             打印查询分析信息
   -h,  --help                 打印 Sheetql 帮助
   -v,  --version              打印 Sheetql 当前版本
@@ -49,6 +50,7 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
 | `-o, --output`     | 输出格式：`render`（默认）、`json`、`csv`、`yaml`。                                |
 | `-s, --save`       | 将`--query` 的结果以 CSV 写入 `<path>`。仅能与 `--query` 配合使用（REPL 下会报错）。 |
 | `-S, --server`    | 在 stdin/stdout 上启动 JSONL 服务器，供程序化访问（见[服务器模式](#服务器模式)）。   |
+| `--export-root`   | 将 `op=export` 限制在该目录内；仅能与 `--server` 配合，路径必须是相对路径且不能包含 `..`。 |
 | `-a, --analysis`   | 在结果后打印行数与执行耗时。                                                               |
 | `-h, --help`       | 打印帮助。                                                                                 |
 | `-v, --version`    | 打印当前版本。                                                                             |
@@ -319,10 +321,16 @@ SELECT name, city FROM sales ORDER BY name INTO OUTFILE 'result.csv'
 
 ### 服务器模式
 
-`-S, --server` 在 stdin/stdout 上启动一个持久的 JSONL 服务器。stdin 的每一行是一条 JSON 请求；每条响应都是一个 JSON 对象，打印到 stdout 并逐条 flush。文件在服务器启动时加载一次，之后常驻内存供多次请求使用。
+`-S, --server` 在 stdin/stdout 上启动一个持久的 JSONL 服务器。stdin 的每一行是一条 JSON 请求；每条响应都是一个 JSON 对象，打印到 stdout 并逐条 flush。文件在服务器启动时加载一次，之后常驻内存供多次请求使用。`--server` 不能与 `--query` 或 `--save` 同时使用。
 
 ```sh
 sheetql -f data/sales.csv data/customers.csv --server
+```
+
+限制导出只能写入指定目录：
+
+```sh
+sheetql -f data/sales.csv --server --export-root ./exports
 ```
 
 请求与响应:
@@ -340,7 +348,7 @@ sheetql -f data/sales.csv data/customers.csv --server
 { "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2 }
 ```
 
-`rows` 是二维数组。非有限浮点数序列化为 `null`。错误（非法 JSON、未知 op、查询失败、导出失败）返回 `{ "ok": false, "error": "…" }`，并且**不会**终止服务器。
+`rows` 是二维数组。如果请求包含 `id`，响应会原样返回该值。错误包含机器可读的 `code`，例如 `{ "ok": false, "code": "query_error", "error": "…" }`，并且**不会**终止服务器。
 
 `list` 成功响应:
 
