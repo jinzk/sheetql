@@ -34,6 +34,11 @@ Options:
   -s,  --save <path>          Save --query result as a CSV file
   -S,  --server               Start a JSONL server on stdin/stdout
        --export-root <path>   Restrict server exports to this directory
+       --max-rows <number>    Reject input tables exceeding this many rows
+       --max-file-bytes <n>   Reject input files exceeding this many bytes
+       --delimiter <char>     CSV field delimiter [default: ,]
+       --no-header            Treat CSV rows as data and generate column names
+       --null-value <text>    Treat this CSV value as NULL
   -a,  --analysis             Print Query analysis
   -h,  --help                 Print Sheetql help
   -v,  --version              Print Sheetql Current Version
@@ -51,6 +56,11 @@ Option details:
 | `-s, --save`       | Write the`--query` result to `<path>` as CSV. Only valid with `--query` (REPL prints an error).       |
 | `-S, --server`    | Start a JSONL server on stdin/stdout for programmatic access (see [Server mode](#server-mode)).             |
 | `--export-root`   | Restrict `op=export` paths to this directory. Only valid with `--server`; paths must be relative and cannot contain `..`. |
+| `--max-rows`      | Reject loading a table after it exceeds this many data rows. Unset by default; applies to CSV and each spreadsheet sheet. |
+| `--max-file-bytes` | Reject input files larger than this many bytes before loading. Unset by default. |
+| `--delimiter`      | Set the CSV field delimiter to one ASCII character. Defaults to `,`. |
+| `--no-header`      | Treat every CSV row as data and generate `col1`, `col2`, ... column names. |
+| `--null-value`     | Treat the exact CSV field value as `NULL`. |
 | `-a, --analysis`  | Print the row count and execution time after the result.                                                    |
 | `-h, --help`       | Print help.                                                                                                 |
 | `-v, --version`    | Print the current version.                                                                                  |
@@ -156,7 +166,7 @@ The first row of each sheet / CSV file is treated as the header.
 
 ### Data types
 
-Cell values are inferred automatically. CSV cells are parsed as `Integer`, `Float`, `Boolean` (`true` / `false`) or `Text`; empty cells and spreadsheet errors become `NULL`. Spreadsheet cells keep their native type.
+Cell values are inferred automatically. CSV cells are parsed as `Integer`, `Float`, `Boolean` (`true` / `false`) or `Text`; empty cells and spreadsheet errors become `NULL`. Spreadsheet dates are represented as `Date` or `DateTime` values.
 
 | Type    | Examples            |
 | ------- | ------------------- |
@@ -164,6 +174,8 @@ Cell values are inferred automatically. CSV cells are parsed as `Integer`, `Floa
 | Float   | `3.14`, `1.5e3` |
 | Boolean | `true`, `false` |
 | Text    | `Alice`, `NY`   |
+| Date    | `2026-08-14` |
+| DateTime | `2026-08-14 10:30:00` |
 | NULL    | empty cells         |
 
 Edge cases:
@@ -339,13 +351,13 @@ Requests and responses:
 | --- | --- |
 | `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | Run a query. `db` optionally scopes the query to one database (the process-wide `USE` state is unchanged). `format` controls the `text` field: `json` (default), `csv`, `yaml`, `table`. |
 | `{ "op": "list" }` | List every database, its tables, and their columns. |
-| `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | Run a query and write the result as CSV. `overwrite` defaults to `true`; set to `false` to fail if the file already exists. |
+| `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | Run a query and write the result as CSV. `overwrite` defaults to `false`; set to `true` to replace an existing file. |
 | `{ "op": "exit" }` | Acknowledge with `{ "ok": true }` and terminate. The server also exits cleanly on stdin EOF. |
 
 Successful query response:
 
 ```json
-{ "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2 }
+{ "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2, "stats": { "elapsed_ms": 2, "input_rows": 100, "output_rows": 2 } }
 ```
 
 `rows` is an array of arrays. Non-finite floats are serialized as `null`. If a request contains `id`, the same value is echoed in the response. Errors include a machine-readable `code`, for example `{ "ok": false, "code": "query_error", "error": "…" }`, and do **not** stop the server.

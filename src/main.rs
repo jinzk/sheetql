@@ -23,50 +23,53 @@ use printer::{OutputFormat, render};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match parse_arguments(&args) {
-        Command::ReplMode(arguments) => launch_repl(arguments),
+        Command::ReplMode(arguments) => {
+            if let Err(error) = launch_repl(arguments) {
+                fail(1, error);
+            }
+        }
         Command::QueryMode(query, arguments) => {
-            if let Err(error) = validate_files(&arguments.files) {
-                eprintln!("{error}");
-                return;
+            if let Err(error) = validate_files(&arguments.files, arguments.max_file_bytes) {
+                fail(3, error);
             }
 
-            let mut schema = match loader::load_schema(&arguments.files) {
-                Ok(schema) => schema,
-                Err(error) => {
-                    eprintln!("{error}");
-                    return;
-                }
-            };
+            let csv_options = csv_options(&arguments);
+            let mut schema =
+                match loader::load_schema(&arguments.files, arguments.max_rows, &csv_options) {
+                    Ok(schema) => schema,
+                    Err(error) => fail(3, error),
+                };
             if let Err(error) = execute_query(&query, &arguments, &mut schema) {
-                eprintln!("{error}");
-                std::process::exit(1);
+                fail(4, error);
             }
         }
         Command::ServerMode(arguments) => {
-            if let Err(error) = validate_files(&arguments.files) {
-                eprintln!("{error}");
-                return;
+            if let Err(error) = validate_files(&arguments.files, arguments.max_file_bytes) {
+                fail(3, error);
             }
 
-            let mut schema = match loader::load_schema(&arguments.files) {
-                Ok(schema) => schema,
-                Err(error) => {
-                    eprintln!("{error}");
-                    return;
-                }
-            };
+            let csv_options = csv_options(&arguments);
+            let mut schema =
+                match loader::load_schema(&arguments.files, arguments.max_rows, &csv_options) {
+                    Ok(schema) => schema,
+                    Err(error) => fail(3, error),
+                };
             if let Err(error) = server::run(&mut schema, arguments.export_root.as_deref()) {
-                eprintln!("{error}");
-                std::process::exit(1);
+                fail(1, error);
             }
         }
         Command::Help => arguments::print_help_list(),
         Command::Version => println!("Sheetql version {}", env!("CARGO_PKG_VERSION")),
-        Command::Error(error) => println!("{error}"),
+        Command::Error(error) => fail(2, error),
     }
 }
 
-fn validate_files(files: &[String]) -> Result<(), String> {
+fn fail(code: i32, error: String) -> ! {
+    eprintln!("{error}");
+    std::process::exit(code);
+}
+
+fn validate_files(files: &[String], max_file_bytes: Option<u64>) -> Result<(), String> {
     for file in files {
         if !Path::new(file).exists() {
             return Err(format!("File `{file}` does not exist"));
@@ -76,6 +79,17 @@ fn validate_files(files: &[String]) -> Result<(), String> {
             return Err(format!(
                 "Unsupported file format for `{file}`, expected one of: xls, xlsx, xlsm, csv"
             ));
+        }
+
+        if let Some(max_file_bytes) = max_file_bytes {
+            let size = std::fs::metadata(file)
+                .map_err(|error| format!("Cannot inspect file `{file}`: {error}"))?
+                .len();
+            if size > max_file_bytes {
+                return Err(format!(
+                    "File `{file}` is {size} bytes, exceeding the maximum of {max_file_bytes} bytes"
+                ));
+            }
         }
     }
     Ok(())
@@ -96,7 +110,12 @@ fn execute_query(
 
             if arguments.analysis {
                 let plural = if result.rows.len() == 1 { "" } else { "s" };
-                println!("{} row{plural} in set ({:?})", result.rows.len(), duration);
+                println!(
+                    "{} row{plural} in set ({:?}); scanned {} row(s)",
+                    result.rows.len(),
+                    duration,
+                    result.stats.input_rows
+                );
             }
             Ok(())
         }
@@ -151,27 +170,23 @@ fn save_result(
     Ok(())
 }
 
-fn launch_repl(arguments: arguments::Arguments) {
-    if let Err(error) = validate_files(&arguments.files) {
-        eprintln!("{error}");
-        return;
-    }
+fn launch_repl(arguments: arguments::Arguments) -> Result<(), String> {
+    validate_files(&arguments.files, arguments.max_file_bytes)?;
+    let csv_options = csv_options(&arguments);
+    let mut schema = loader::load_schema(&arguments.files, arguments.max_rows, &csv_options)?;
 
-    let mut schema = match loader::load_schema(&arguments.files) {
-        Ok(schema) => schema,
-        Err(error) => {
-            eprintln!("{error}");
-            return;
-        }
-    };
-
-    let result = if io::stdin().is_terminal() {
+    if io::stdin().is_terminal() {
         ui::run(&mut schema).map_err(|error| error.to_string())
     } else {
         run_piped_queries(&mut schema)
-    };
-    if let Err(error) = result {
-        eprintln!("{error}");
+    }
+}
+
+fn csv_options(arguments: &arguments::Arguments) -> loader::CsvOptions {
+    loader::CsvOptions {
+        delimiter: arguments.csv_delimiter,
+        has_header: !arguments.csv_no_header,
+        null_value: arguments.csv_null_value.clone(),
     }
 }
 
@@ -192,4 +207,23 @@ fn run_piped_queries(schema: &mut Schema) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_files_rejects_files_over_byte_limit() {
+        let path =
+            std::env::temp_dir().join(format!("sheetql_file_limit_{}.csv", std::process::id()));
+        std::fs::write(&path, "a\n12345\n").unwrap();
+        let files = vec![path.to_string_lossy().into_owned()];
+        let error = validate_files(&files, Some(1)).unwrap_err();
+        assert!(
+            error.contains("exceeding the maximum of 1 bytes"),
+            "got: {error}"
+        );
+        std::fs::remove_file(path).ok();
+    }
 }

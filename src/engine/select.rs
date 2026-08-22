@@ -5,8 +5,8 @@ use std::collections::HashSet;
 
 use chrono::Local;
 use sqlparser::ast::{
-    Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Offset, OrderByKind,
-    Query, Select, SelectItem, SetExpr, TableFactor,
+    BinaryOperator, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Offset,
+    OrderByKind, Query, Select, SelectItem, SetExpr, TableFactor,
 };
 
 use crate::database::Schema;
@@ -101,7 +101,9 @@ pub(crate) fn execute_query<'a>(
 
     let mut order_columns: HashMap<String, usize> = HashMap::new();
     for (name, index) in &lookup {
-        order_columns.insert(name.clone(), output_titles.len() + index);
+        if *index != usize::MAX {
+            order_columns.insert(name.clone(), output_titles.len() + index);
+        }
     }
     for (index, title) in output_titles.iter().enumerate() {
         order_columns.insert(title.clone(), index);
@@ -178,6 +180,10 @@ pub(crate) fn execute_query<'a>(
     Ok(crate::engine::QueryResult {
         columns: titles(&plan),
         rows: final_rows,
+        stats: crate::engine::QueryStats {
+            input_rows: rows_view.len(),
+            ..Default::default()
+        },
     })
 }
 
@@ -527,34 +533,27 @@ fn apply_join(
     let mut matched_right = vec![false; right.rows.len()];
 
     let using_pairs = using_column_pairs(operator, left_schema, &right.schema)?;
+    let equi_pairs = using_pairs.or_else(|| on_column_pairs(operator, left_schema, &right.schema));
 
-    for (left_index, left_row) in left_rows.iter().enumerate() {
-        for (right_index, right_row) in right.rows.iter().enumerate() {
-            let mut combined: Option<Vec<Value>> = None;
-            let keep = match &using_pairs {
-                Some(pairs) => pairs.iter().all(|&(left_col, right_col)| {
-                    values_eq(&left_row[left_col], &right_row[right_col])
-                }),
-                None => {
-                    let mut row = left_row.clone();
-                    row.extend_from_slice(right_row);
-                    let keep = join_keep(operator, &lookup, now, &row)?;
-                    combined = Some(row);
-                    keep
+    if let Some(pairs) = &equi_pairs {
+        hash_using_join(
+            left_rows,
+            right.rows,
+            pairs,
+            &mut output,
+            &mut matched_left,
+            &mut matched_right,
+        );
+    } else {
+        for (left_index, left_row) in left_rows.iter().enumerate() {
+            for (right_index, right_row) in right.rows.iter().enumerate() {
+                let mut row = left_row.clone();
+                row.extend_from_slice(right_row);
+                if join_keep(operator, &lookup, now, &row)? {
+                    matched_left[left_index] = true;
+                    matched_right[right_index] = true;
+                    output.push(row);
                 }
-            };
-            if keep {
-                matched_left[left_index] = true;
-                matched_right[right_index] = true;
-                let row = match combined {
-                    Some(row) => row,
-                    None => {
-                        let mut row = left_row.clone();
-                        row.extend_from_slice(right_row);
-                        row
-                    }
-                };
-                output.push(row);
             }
         }
     }
@@ -587,6 +586,154 @@ fn apply_join(
     }
 
     Ok((schema, output))
+}
+
+fn hash_using_join(
+    left_rows: &[Vec<Value>],
+    right_rows: &[Vec<Value>],
+    pairs: &[(usize, usize)],
+    output: &mut Vec<Vec<Value>>,
+    matched_left: &mut [bool],
+    matched_right: &mut [bool],
+) {
+    let mut index: HashMap<Vec<GroupKey>, Vec<usize>> = HashMap::new();
+    for (right_index, row) in right_rows.iter().enumerate() {
+        let key = pairs
+            .iter()
+            .map(|&(_, right_column)| group_key(&row[right_column]))
+            .collect();
+        index.entry(key).or_default().push(right_index);
+    }
+
+    for (left_index, left_row) in left_rows.iter().enumerate() {
+        let key = pairs
+            .iter()
+            .map(|&(left_column, _)| group_key(&left_row[left_column]))
+            .collect::<Vec<_>>();
+        if let Some(right_indices) = index.get(&key) {
+            for &right_index in right_indices {
+                if !pairs.iter().all(|&(left_column, right_column)| {
+                    values_eq(
+                        &left_row[left_column],
+                        &right_rows[right_index][right_column],
+                    )
+                }) {
+                    continue;
+                }
+                matched_left[left_index] = true;
+                matched_right[right_index] = true;
+                let mut row = left_row.clone();
+                row.extend_from_slice(&right_rows[right_index]);
+                output.push(row);
+            }
+        }
+    }
+}
+
+fn on_column_pairs(
+    operator: &JoinOperator,
+    left_schema: &[ColumnRef],
+    right_schema: &[ColumnRef],
+) -> Option<Vec<(usize, usize)>> {
+    let JoinConstraint::On(expr) = join_constraint(operator)? else {
+        return None;
+    };
+    let mut pairs = Vec::new();
+    collect_equi_pairs(expr, left_schema, right_schema, &mut pairs)?;
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+fn collect_equi_pairs(
+    expr: &Expr,
+    left_schema: &[ColumnRef],
+    right_schema: &[ColumnRef],
+    pairs: &mut Vec<(usize, usize)>,
+) -> Option<()> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_equi_pairs(left, left_schema, right_schema, pairs)?;
+            collect_equi_pairs(right, left_schema, right_schema, pairs)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            let left_column = resolve_join_column(left, left_schema, right_schema)?;
+            let right_column = resolve_join_column(right, left_schema, right_schema)?;
+            match (left_column, right_column) {
+                (JoinColumn::Left(left_index), JoinColumn::Right(right_index)) => {
+                    pairs.push((left_index, right_index));
+                    Some(())
+                }
+                (JoinColumn::Right(right_index), JoinColumn::Left(left_index)) => {
+                    pairs.push((left_index, right_index));
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+enum JoinColumn {
+    Left(usize),
+    Right(usize),
+}
+
+fn resolve_join_column(
+    expr: &Expr,
+    left_schema: &[ColumnRef],
+    right_schema: &[ColumnRef],
+) -> Option<JoinColumn> {
+    let parts = match expr {
+        Expr::Identifier(identifier) => vec![identifier.value.to_lowercase()],
+        Expr::CompoundIdentifier(parts) => {
+            parts.iter().map(|part| part.value.to_lowercase()).collect()
+        }
+        _ => return None,
+    };
+    let (qualifier, column) = match parts.as_slice() {
+        [column] => (None, column.as_str()),
+        [qualifier, column] => (Some(qualifier.as_str()), column.as_str()),
+        _ => return None,
+    };
+
+    let find = |schema: &[ColumnRef]| {
+        let mut matches = schema.iter().enumerate().filter(|(_, reference)| {
+            reference.column == column
+                && qualifier.is_none_or(|qualifier| {
+                    reference.qualifier == qualifier || reference.table_name == qualifier
+                })
+        });
+        let (index, _) = matches.next()?;
+        matches.next().is_none().then_some(index)
+    };
+
+    match (find(left_schema), find(right_schema)) {
+        (Some(index), None) => Some(JoinColumn::Left(index)),
+        (None, Some(index)) => Some(JoinColumn::Right(index)),
+        _ => None,
+    }
+}
+
+fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
+    match operator {
+        JoinOperator::Join(constraint)
+        | JoinOperator::Inner(constraint)
+        | JoinOperator::Left(constraint)
+        | JoinOperator::LeftOuter(constraint)
+        | JoinOperator::Right(constraint)
+        | JoinOperator::RightOuter(constraint)
+        | JoinOperator::FullOuter(constraint)
+        | JoinOperator::CrossJoin(constraint) => Some(constraint),
+        _ => None,
+    }
 }
 
 fn using_column_pairs(
@@ -662,25 +809,28 @@ fn build_lookup(schema: &[ColumnRef]) -> Result<HashMap<String, usize>, String> 
     let mut map: HashMap<String, Vec<usize>> = HashMap::new();
 
     for (index, column) in schema.iter().enumerate() {
-        map.entry(column.column.clone()).or_default().push(index);
-        map.entry(format!("{}.{}", column.qualifier, column.column))
-            .or_default()
-            .push(index);
-        map.entry(format!("{}.{}", column.table_name, column.column))
-            .or_default()
-            .push(index);
+        for name in [
+            column.column.clone(),
+            format!("{}.{}", column.qualifier, column.column),
+            format!("{}.{}", column.table_name, column.column),
+        ] {
+            let indices = map.entry(name).or_default();
+            if !indices.contains(&index) {
+                indices.push(index);
+            }
+        }
     }
 
     let mut lookup: HashMap<String, usize> = HashMap::new();
     for (name, indices) in &map {
-        if indices.len() == 1 {
-            lookup.insert(name.clone(), indices[0]);
-        }
+        lookup.insert(
+            name.clone(),
+            if indices.len() == 1 {
+                indices[0]
+            } else {
+                usize::MAX
+            },
+        );
     }
-
-    if lookup.is_empty() {
-        return Ok(lookup);
-    }
-
     Ok(lookup)
 }

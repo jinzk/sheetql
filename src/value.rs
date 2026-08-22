@@ -2,12 +2,16 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::Hash;
 
+use chrono::{NaiveDate, NaiveDateTime};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
     Text(String),
+    Date(String),
+    DateTime(String),
     Null,
 }
 
@@ -42,6 +46,7 @@ impl Value {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Value::Text(value) => Some(value.as_str()),
+            Value::Date(value) | Value::DateTime(value) => Some(value.as_str()),
             _ => None,
         }
     }
@@ -58,6 +63,7 @@ impl Value {
                 }
             }
             Value::Text(value) => value.clone(),
+            Value::Date(value) | Value::DateTime(value) => value.clone(),
             Value::Null => "NULL".to_string(),
         }
     }
@@ -68,6 +74,7 @@ impl Value {
             Value::Int(value) => *value != 0,
             Value::Float(value) => *value != 0.0,
             Value::Text(value) => !value.is_empty(),
+            Value::Date(value) | Value::DateTime(value) => !value.is_empty(),
             Value::Null => false,
         }
     }
@@ -79,6 +86,8 @@ impl Value {
             Value::Int(_) => 2,
             Value::Float(_) => 3,
             Value::Text(_) => 4,
+            Value::Date(_) => 5,
+            Value::DateTime(_) => 6,
         }
     }
 }
@@ -118,6 +127,14 @@ impl Hash for Value {
                 4u8.hash(state);
                 value.hash(state);
             }
+            Value::Date(value) => {
+                5u8.hash(state);
+                value.hash(state);
+            }
+            Value::DateTime(value) => {
+                6u8.hash(state);
+                value.hash(state);
+            }
             Value::Null => 0u8.hash(state),
         }
     }
@@ -140,6 +157,7 @@ pub fn values_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Float(x), Value::Int(y)) => cmp_int_float(*y, *x).map(Ordering::reverse),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
+        _ if temporal_cmp(a, b).is_some() => temporal_cmp(a, b),
         _ => Some(a.type_rank().cmp(&b.type_rank())),
     }
 }
@@ -152,9 +170,59 @@ pub fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Int(y)) => eq_int_float(*y, *x),
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x == y,
+        _ if temporal_cmp(a, b).is_some() => temporal_cmp(a, b) == Some(Ordering::Equal),
         (Value::Null, Value::Null) => true,
         _ => false,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemporalKind {
+    Date,
+    DateTime,
+}
+
+fn temporal_cmp(a: &Value, b: &Value) -> Option<Ordering> {
+    let (kind_a, value_a) = temporal_value(a)?;
+    let (kind_b, value_b) = temporal_value(b)?;
+    if kind_a != kind_b {
+        return None;
+    }
+    Some(value_a.cmp(&value_b))
+}
+
+fn temporal_value(value: &Value) -> Option<(TemporalKind, String)> {
+    let text = match value {
+        Value::Date(text) => text.as_str(),
+        Value::DateTime(text) => text.as_str(),
+        Value::Text(text) => text.as_str(),
+        _ => return None,
+    };
+    let trimmed = text.trim();
+    let date_part = trimmed.split_whitespace().next()?;
+    let parts: Vec<&str> = date_part.split(['-', '/', '.']).collect();
+    if parts.len() != 3 || parts[0].len() != 4 || !parts[0].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let year = parts[0].parse::<i32>().ok()?;
+    let month = parts[1].parse::<u32>().ok()?;
+    let day = parts[2].parse::<u32>().ok()?;
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let has_time = trimmed.contains(char::is_whitespace);
+    if !has_time {
+        return Some((TemporalKind::Date, date.format("%Y-%m-%d").to_string()));
+    }
+
+    let time = trimmed.split_once(char::is_whitespace)?.1.trim();
+    let datetime = NaiveDateTime::parse_from_str(
+        &format!("{} {time}", date.format("%Y-%m-%d")),
+        "%Y-%m-%d %H:%M:%S",
+    )
+    .ok()?;
+    Some((
+        TemporalKind::DateTime,
+        datetime.format("%Y-%m-%d %H:%M:%S").to_string(),
+    ))
 }
 
 fn cmp_int_float(int: i64, float: f64) -> Option<Ordering> {
@@ -228,6 +296,8 @@ pub fn group_key(value: &Value) -> GroupKey {
             }
         }
         Value::Text(value) => GroupKey::Text(value.clone()),
+        Value::Date(value) => GroupKey::Text(value.clone()),
+        Value::DateTime(value) => GroupKey::Text(value.clone()),
     }
 }
 
@@ -245,6 +315,14 @@ mod tests {
         assert_eq!(Value::Bool(false).to_display_string(), "false");
         assert_eq!(Value::Text("hi".to_string()).to_display_string(), "hi");
         assert_eq!(Value::Null.to_display_string(), "NULL");
+        assert_eq!(
+            Value::Date("2026-08-14".into()).to_display_string(),
+            "2026-08-14"
+        );
+        assert_eq!(
+            Value::DateTime("2026-08-14 10:30:00".into()).to_display_string(),
+            "2026-08-14 10:30:00"
+        );
     }
 
     #[test]
@@ -342,6 +420,37 @@ mod tests {
         );
         assert!(values_eq(&Value::Bool(true), &Value::Bool(true)));
         assert!(!values_eq(&Value::Bool(true), &Value::Bool(false)));
+    }
+
+    #[test]
+    fn date_values_sort_and_group_by_value() {
+        assert_eq!(
+            values_partial_cmp(
+                &Value::Date("2026-01-01".into()),
+                &Value::Date("2026-08-14".into())
+            ),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            group_key(&Value::Date("2026-08-14".into())),
+            group_key(&Value::Text("2026-08-14".into()))
+        );
+        assert_ne!(
+            Value::Date("2026-08-14".into()),
+            Value::DateTime("2026-08-14 00:00:00".into())
+        );
+        assert!(values_eq(
+            &Value::Date("2026/5/7".into()),
+            &Value::Text("2026-05-07".into())
+        ));
+        assert!(values_eq(
+            &Value::DateTime("2026/5/7 10:30:00".into()),
+            &Value::Text("2026-05-07 10:30:00".into())
+        ));
+        assert!(!values_eq(
+            &Value::Date("2026/5/7".into()),
+            &Value::Text("not-a-date".into())
+        ));
     }
 
     #[test]

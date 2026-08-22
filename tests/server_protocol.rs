@@ -22,9 +22,22 @@ struct Server {
 
 impl Server {
     fn start(csv: &Path) -> Server {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_sheetql"))
+        Self::start_with_args(csv, &[])
+    }
+
+    fn start_with_args(csv: &Path, extra_args: &[&str]) -> Server {
+        let binary = std::env::var_os("CARGO_BIN_EXE_sheetql")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("debug")
+                    .join("sheetql.exe")
+            });
+        let mut child = Command::new(binary)
             .arg("-S")
             .args(["-f", csv.to_str().unwrap()])
+            .args(extra_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -96,6 +109,8 @@ fn server_supports_query_list_and_export() {
         query["rows"],
         serde_json::json!([["alice", "LA"], ["bob", "NY"], ["carol", null]])
     );
+    assert_eq!(query["stats"]["output_rows"], 3);
+    assert_eq!(query["stats"]["input_rows"], 3);
 
     let export_req = server.request(
         &serde_json::json!({
@@ -148,11 +163,125 @@ fn server_recovers_from_errors_without_exiting() {
 }
 
 #[test]
+fn server_rejects_oversized_requests_and_continues() {
+    let dir = temp_dir("request_limit");
+    let csv = sample_csv(&dir);
+    let mut server = Server::start(&csv);
+    let oversized = format!(
+        "{{\"op\":\"query\",\"sql\":\"{}\"}}",
+        "x".repeat(1024 * 1024)
+    );
+    let response = server.request(&oversized);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["code"], "invalid_request");
+    assert!(response["error"].as_str().unwrap().contains("byte limit"));
+
+    let ok = server.request(r#"{ "op": "query", "sql": "SELECT COUNT(*) AS n FROM people" }"#);
+    assert_eq!(ok["ok"], true);
+    server.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn server_applies_csv_options_before_query_execution() {
+    let dir = temp_dir("csv_options");
+    let csv = dir.join("values.csv");
+    std::fs::write(&csv, "1;NA\n2;ok\n").unwrap();
+    let mut server = Server::start_with_args(
+        &csv,
+        &["--delimiter", ";", "--no-header", "--null-value", "NA"],
+    );
+    let response = server
+        .request(r#"{ "op": "query", "sql": "SELECT col1, col2 FROM values ORDER BY col1" }"#);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["rows"], serde_json::json!([[1, null], [2, "ok"]]));
+    server.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn server_returns_date_values_and_query_statistics() {
+    let dir = temp_dir("date_stats");
+    let csv = sample_csv(&dir);
+    let mut server = Server::start(&csv);
+    let response = server.request(
+        r#"{ "op": "query", "sql": "SELECT DATE('2026/8/14') AS day, NOW() AS created" }"#,
+    );
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["rows"][0][0], "2026-08-14");
+    assert!(response["rows"][0][1].as_str().unwrap().contains("2026-"));
+    assert_eq!(response["stats"]["input_rows"], 1);
+    assert_eq!(response["stats"]["output_rows"], 1);
+    assert!(response["stats"]["elapsed_ms"].is_number());
+    server.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn server_rejects_input_over_max_rows_before_serving() {
+    let dir = temp_dir("max_rows");
+    let csv = sample_csv(&dir);
+    let binary = std::env::var_os("CARGO_BIN_EXE_sheetql")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("debug")
+                .join("sheetql.exe")
+        });
+    let output = Command::new(binary)
+        .args(["-S", "-f", csv.to_str().unwrap(), "--max-rows", "2"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn sheetql");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("maximum of 2 data rows"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cli_returns_nonzero_exit_codes_for_argument_and_query_errors() {
+    let binary = std::env::var_os("CARGO_BIN_EXE_sheetql")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("debug")
+                .join("sheetql.exe")
+        });
+
+    let argument_error = Command::new(&binary)
+        .args(["--unknown"])
+        .output()
+        .expect("spawn sheetql");
+    assert_eq!(argument_error.status.code(), Some(2));
+
+    let query_error = Command::new(binary)
+        .args([
+            "-f",
+            "test_data/people.csv",
+            "-q",
+            "SELECT nope FROM missing",
+        ])
+        .output()
+        .expect("spawn sheetql");
+    assert_eq!(query_error.status.code(), Some(4));
+}
+
+#[test]
 fn server_exits_on_stdin_eof() {
     let dir = temp_dir("eof");
     let csv = sample_csv(&dir);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sheetql"))
+    let binary = std::env::var_os("CARGO_BIN_EXE_sheetql")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("debug")
+                .join("sheetql.exe")
+        });
+    let mut child = Command::new(binary)
         .arg("-S")
         .args(["-f", csv.to_str().unwrap()])
         .stdin(Stdio::piped())

@@ -232,10 +232,18 @@ fn eval_sql_value(value: &SqlValue) -> Result<Value, String> {
 
 fn resolve_column(ctx: &EvalContext, name: &str, current: &[Value]) -> Result<Value, String> {
     if let Some(index) = ctx.columns.get(name) {
+        if *index == usize::MAX {
+            return Err(format!(
+                "Column `{name}` is ambiguous; qualify it with a table name"
+            ));
+        }
         return Ok(current.get(*index).cloned().unwrap_or(Value::Null));
     }
     let lowered = name.to_lowercase();
     match ctx.columns.get(&lowered) {
+        Some(index) if *index == usize::MAX => Err(format!(
+            "Column `{lowered}` is ambiguous; qualify it with a table name"
+        )),
         Some(index) => Ok(current.get(*index).cloned().unwrap_or(Value::Null)),
         None => Err(format!("Column `{lowered}` not found")),
     }

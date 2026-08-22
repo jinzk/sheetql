@@ -34,6 +34,11 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
   -s,  --save <path>          将 --query 结果保存为 CSV 文件
   -S,  --server               在 stdin/stdout 上启动 JSONL 服务器
        --export-root <path>   将服务器导出限制在此目录
+       --max-rows <number>    超过此数据行数时拒绝加载输入表
+       --max-file-bytes <n>   超过此字节数时拒绝加载输入文件
+       --delimiter <char>     CSV 字段分隔符 [默认: ,]
+       --no-header            将 CSV 行视为数据并生成列名
+       --null-value <text>    将此 CSV 值视为 NULL
   -a,  --analysis             打印查询分析信息
   -h,  --help                 打印 Sheetql 帮助
   -v,  --version              打印 Sheetql 当前版本
@@ -51,6 +56,11 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
 | `-s, --save`       | 将`--query` 的结果以 CSV 写入 `<path>`。仅能与 `--query` 配合使用（REPL 下会报错）。 |
 | `-S, --server`    | 在 stdin/stdout 上启动 JSONL 服务器，供程序化访问（见[服务器模式](#服务器模式)）。   |
 | `--export-root`   | 将 `op=export` 限制在该目录内；仅能与 `--server` 配合，路径必须是相对路径且不能包含 `..`。 |
+| `--max-rows`      | 单个输入表超过此数据行数时拒绝加载。默认不限制；适用于 CSV 和电子表格中的每个工作表。 |
+| `--max-file-bytes` | 输入文件超过此字节数时在加载前拒绝。默认不限制。 |
+| `--delimiter`      | 设置 CSV 字段分隔符，必须是一个 ASCII 字符，默认为 `,`。 |
+| `--no-header`      | 将 CSV 每一行都视为数据，并生成 `col1`、`col2` 等列名。 |
+| `--null-value`     | 将完全匹配的 CSV 字段值视为 `NULL`。 |
 | `-a, --analysis`   | 在结果后打印行数与执行耗时。                                                               |
 | `-h, --help`       | 打印帮助。                                                                                 |
 | `-v, --version`    | 打印当前版本。                                                                             |
@@ -156,7 +166,7 @@ DESCRIBE sales
 
 ### 数据类型
 
-单元格值自动推断。CSV 单元格解析为 `Integer`、`Float`、`Boolean`（`true` / `false`）或 `Text`；空单元格与电子表格错误值变为 `NULL`。电子表格单元格保留其原生类型。
+单元格值自动推断。CSV 单元格解析为 `Integer`、`Float`、`Boolean`（`true` / `false`）或 `Text`；空单元格与电子表格错误值变为 `NULL`。电子表格日期表示为 `Date` 或 `DateTime`。
 
 | 类型    | 示例                |
 | ------- | ------------------- |
@@ -164,6 +174,8 @@ DESCRIBE sales
 | Float   | `3.14`, `1.5e3` |
 | Boolean | `true`, `false` |
 | Text    | `Alice`, `NY`   |
+| Date    | `2026-08-14` |
+| DateTime | `2026-08-14 10:30:00` |
 | NULL    | 空单元格            |
 
 边界情况:
@@ -339,13 +351,13 @@ sheetql -f data/sales.csv --server --export-root ./exports
 | --- | --- |
 | `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | 运行查询。`db` 可选，仅将本次查询限定在该数据库内（进程级 `USE` 状态不变）。`format` 控制 `text` 字段：`json`（默认）、`csv`、`yaml`、`table`。 |
 | `{ "op": "list" }` | 列出所有数据库、其中的表及各表列名。 |
-| `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | 运行查询并将结果写成 CSV。`overwrite` 默认 `true`；设为 `false` 时若文件已存在则报错。 |
+| `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | 运行查询并将结果写成 CSV。`overwrite` 默认 `false`；设为 `true` 才会替换已存在的文件。 |
 | `{ "op": "exit" }` | 先返回 `{ "ok": true }` 再退出。stdin 关闭（EOF）时服务器也会干净退出。 |
 
 查询成功响应:
 
 ```json
-{ "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2 }
+{ "ok": true, "columns": ["name","city"], "rows": [["Alice","NY"],["Bob","LA"]], "text": "…", "elapsed_ms": 2, "stats": { "elapsed_ms": 2, "input_rows": 100, "output_rows": 2 } }
 ```
 
 `rows` 是二维数组。如果请求包含 `id`，响应会原样返回该值。错误包含机器可读的 `code`，例如 `{ "ok": false, "code": "query_error", "error": "…" }`，并且**不会**终止服务器。

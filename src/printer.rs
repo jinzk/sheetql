@@ -32,6 +32,7 @@ pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
         }
         Value::Bool(boolean) => json!(boolean),
         Value::Text(text) => json!(text),
+        Value::Date(text) | Value::DateTime(text) => json!(text),
         Value::Null => serde_json::Value::Null,
     }
 }
@@ -238,6 +239,22 @@ mod tests {
         let rows = vec![vec![Value::Float(f64::NAN)]];
         let out = render(OutputFormat::Json, &columns, &rows);
         assert!(out.contains("\"n\": null"), "got: {out}");
+    }
+
+    #[test]
+    fn json_and_csv_preserve_date_values_as_strings() {
+        let columns = vec!["day".to_string(), "created".to_string()];
+        let rows = vec![vec![
+            Value::Date("2026-08-14".into()),
+            Value::DateTime("2026-08-14 10:30:00".into()),
+        ]];
+        let json = render(OutputFormat::Json, &columns, &rows);
+        assert!(json.contains("2026-08-14"));
+        assert!(json.contains("2026-08-14 10:30:00"));
+        assert_eq!(
+            render(OutputFormat::Csv, &columns, &rows),
+            "day,created\n2026-08-14,2026-08-14 10:30:00\n"
+        );
     }
 
     #[test]

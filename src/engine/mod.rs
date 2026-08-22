@@ -4,6 +4,7 @@ mod select;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
+use std::time::Instant;
 
 use crate::database::Schema;
 use crate::printer::OutputFormat;
@@ -15,13 +16,22 @@ use crate::engine::metadata::{
 };
 use crate::engine::select::{execute_query, object_name_to_parts};
 
+#[derive(Debug, Clone, Default)]
+pub struct QueryStats {
+    pub elapsed_ms: u128,
+    pub input_rows: usize,
+    pub output_rows: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+    pub stats: QueryStats,
 }
 
 pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, String> {
+    let started = Instant::now();
     let (query_sql, outfile) = strip_into_outfile(sql);
     let trimmed = query_sql.trim();
     let lower = trimmed
@@ -33,30 +43,33 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, String> 
     if lower.starts_with("show databases") {
         let rest = lower.strip_prefix("show databases").unwrap().trim();
         let (_, like) = parse_show_clauses(rest)?;
-        return run_show_databases(schema, like.as_deref());
+        return finalize_result(run_show_databases(schema, like.as_deref()), started);
     }
     if lower.starts_with("show schemas") {
         let rest = lower.strip_prefix("show schemas").unwrap().trim();
         let (_, like) = parse_show_clauses(rest)?;
-        return run_show_databases(schema, like.as_deref());
+        return finalize_result(run_show_databases(schema, like.as_deref()), started);
     }
     if lower.starts_with("show tables") {
         let rest = lower.strip_prefix("show tables").unwrap().trim();
         let (database, like) = parse_show_clauses(rest)?;
-        return run_show_tables(schema, database.as_deref(), like.as_deref());
+        return finalize_result(
+            run_show_tables(schema, database.as_deref(), like.as_deref()),
+            started,
+        );
     }
     if let Some(rest) = lower.strip_prefix("describe ") {
-        return run_describe_table(schema, rest.trim());
+        return finalize_result(run_describe_table(schema, rest.trim()), started);
     }
     if let Some(rest) = lower.strip_prefix("desc ") {
-        return run_describe_table(schema, rest.trim());
+        return finalize_result(run_describe_table(schema, rest.trim()), started);
     }
     if let Some(name) = lower.strip_prefix("use ") {
         let name = name.trim();
         if name.is_empty() {
             return Err("USE requires a database name".to_string());
         }
-        return run_use(schema, name);
+        return finalize_result(run_use(schema, name), started);
     }
 
     let dialect = MySqlDialect {};
@@ -97,10 +110,26 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, String> 
                 result.rows.len(),
                 path
             ))]],
+            stats: QueryStats {
+                elapsed_ms: started.elapsed().as_millis(),
+                output_rows: 1,
+                ..Default::default()
+            },
         });
     }
 
-    result
+    finalize_result(result, started)
+}
+
+fn finalize_result(
+    result: Result<QueryResult, String>,
+    started: Instant,
+) -> Result<QueryResult, String> {
+    result.map(|mut result| {
+        result.stats.elapsed_ms = started.elapsed().as_millis();
+        result.stats.output_rows = result.rows.len();
+        result
+    })
 }
 
 /// Split a trailing `INTO OUTFILE 'path'` clause (case-insensitive) off a SQL
@@ -543,6 +572,57 @@ mod tests {
     }
 
     #[test]
+    fn inner_join_hashes_reversed_and_multiple_equality_keys() {
+        let mut database = Database::named("test");
+        database.add_table(Table {
+            name: "left_table".to_string(),
+            columns: vec!["id".to_string(), "kind".to_string(), "value".to_string()],
+            rows: vec![
+                vec![Value::Int(1), Value::Text("a".into()), Value::Int(10)],
+                vec![Value::Int(1), Value::Text("b".into()), Value::Int(20)],
+                vec![Value::Int(2), Value::Text("a".into()), Value::Int(30)],
+            ],
+        });
+        database.add_table(Table {
+            name: "right_table".to_string(),
+            columns: vec!["id".to_string(), "kind".to_string(), "label".to_string()],
+            rows: vec![
+                vec![
+                    Value::Int(1),
+                    Value::Text("b".into()),
+                    Value::Text("B".into()),
+                ],
+                vec![
+                    Value::Int(1),
+                    Value::Text("a".into()),
+                    Value::Text("A".into()),
+                ],
+                vec![
+                    Value::Int(3),
+                    Value::Text("a".into()),
+                    Value::Text("C".into()),
+                ],
+            ],
+        });
+        let mut schema = Schema::new();
+        schema.add_database(database);
+        schema.set_current_database("test").unwrap();
+
+        let result = run(
+            &mut schema,
+            "SELECT l.value, r.label FROM left_table l JOIN right_table r \
+             ON r.id = l.id AND l.kind = r.kind ORDER BY l.value",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int(10), Value::Text("A".into())],
+                vec![Value::Int(20), Value::Text("B".into())],
+            ]
+        );
+    }
+
+    #[test]
     fn left_join_keeps_unmatched_left_rows() {
         let mut schema = make_schema();
         let result = run(
@@ -608,6 +688,35 @@ mod tests {
             "SELECT p.name, r.region FROM people p INNER JOIN regions r USING (id)",
         );
         assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn using_join_keeps_outer_join_rows_with_hash_lookup() {
+        let mut schema = make_schema();
+        let mut regions_db = Database::named("regions_db");
+        regions_db.add_table(Table {
+            name: "regions".to_string(),
+            columns: vec!["id".to_string(), "region".to_string()],
+            rows: vec![
+                vec![Value::Int(1), Value::Text("East".into())],
+                vec![Value::Int(3), Value::Text("West".into())],
+            ],
+        });
+        schema.add_database(regions_db);
+        let result = run(
+            &mut schema,
+            "SELECT p.name, r.region FROM people p LEFT JOIN regions r USING (id)",
+        );
+        assert_eq!(result.rows.len(), 5);
+        assert_eq!(
+            result.rows[0],
+            vec![Value::Text("Alice".into()), Value::Text("East".into())]
+        );
+        assert_eq!(
+            result.rows[1],
+            vec![Value::Text("Carol".into()), Value::Text("West".into())]
+        );
+        assert_eq!(result.rows[2][1], Value::Null);
     }
 
     #[test]
@@ -699,7 +808,26 @@ mod tests {
         assert_eq!(now.len(), 19, "got: {now}");
         let today = result.rows[0][1].to_display_string();
         assert_eq!(today.len(), 10, "got: {today}");
-        assert_eq!(result.rows[0][2], Value::Text("2026-08-14".to_string()));
+        assert_eq!(result.rows[0][2], Value::Date("2026-08-14".to_string()));
+    }
+
+    #[test]
+    fn where_matches_date_cell_with_slash_and_unpadded_literal() {
+        let mut database = Database::named("dates");
+        database.add_table(Table {
+            name: "events".to_string(),
+            columns: vec!["id".to_string(), "day".to_string()],
+            rows: vec![
+                vec![Value::Int(1), Value::Date("2026-05-07".into())],
+                vec![Value::Int(2), Value::Date("2026-05-08".into())],
+            ],
+        });
+        let mut schema = Schema::new();
+        schema.add_database(database);
+        schema.set_current_database("dates").unwrap();
+
+        let result = run(&mut schema, "SELECT id FROM events WHERE day = '2026/5/7'");
+        assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
     }
 
     #[test]
@@ -742,6 +870,14 @@ mod tests {
     fn malformed_sql_returns_error() {
         let mut schema = make_schema();
         assert!(run_query(&mut schema, "SELECT FROM").is_err());
+    }
+
+    #[test]
+    fn query_result_contains_execution_statistics() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT * FROM people LIMIT 2");
+        assert_eq!(result.stats.input_rows, 5);
+        assert_eq!(result.stats.output_rows, 2);
     }
 
     #[test]

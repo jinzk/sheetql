@@ -12,6 +12,11 @@ pub struct Arguments {
     pub output_file: Option<String>,
     pub server: bool,
     pub export_root: Option<String>,
+    pub max_rows: Option<usize>,
+    pub max_file_bytes: Option<u64>,
+    pub csv_delimiter: u8,
+    pub csv_no_header: bool,
+    pub csv_null_value: Option<String>,
 }
 
 impl Arguments {
@@ -25,6 +30,11 @@ impl Arguments {
             output_file: None,
             server: false,
             export_root: None,
+            max_rows: None,
+            max_file_bytes: None,
+            csv_delimiter: b',',
+            csv_no_header: false,
+            csv_null_value: None,
         }
     }
 }
@@ -134,6 +144,57 @@ pub fn parse_arguments(args: &[String]) -> Command {
             }
             "--export-root" => match take_value(args, &mut arg_index, arg, "an export directory") {
                 Ok(path) => arguments.export_root = Some(path.to_string()),
+                Err(message) => return Command::Error(message),
+            },
+            "--max-rows" => match take_value(args, &mut arg_index, arg, "the maximum rows") {
+                Ok(max_rows) => match max_rows.parse::<usize>() {
+                    Ok(max_rows) if max_rows > 0 => arguments.max_rows = Some(max_rows),
+                    Ok(_) => {
+                        return Command::Error(
+                            "Maximum rows must be greater than zero".to_string(),
+                        );
+                    }
+                    Err(_) => return Command::Error("Invalid maximum rows".to_string()),
+                },
+                Err(message) => return Command::Error(message),
+            },
+            "--max-file-bytes" => {
+                match take_value(args, &mut arg_index, arg, "the maximum file size") {
+                    Ok(max_file_bytes) => match max_file_bytes.parse::<u64>() {
+                        Ok(max_file_bytes) if max_file_bytes > 0 => {
+                            arguments.max_file_bytes = Some(max_file_bytes)
+                        }
+                        Ok(_) => {
+                            return Command::Error(
+                                "Maximum file size must be greater than zero".to_string(),
+                            );
+                        }
+                        Err(_) => return Command::Error("Invalid maximum file size".to_string()),
+                    },
+                    Err(message) => return Command::Error(message),
+                }
+            }
+            "--delimiter" => match take_value(args, &mut arg_index, arg, "the CSV delimiter") {
+                Ok(value) => {
+                    let mut chars = value.chars();
+                    let Some(delimiter) = chars.next() else {
+                        return Command::Error("CSV delimiter cannot be empty".to_string());
+                    };
+                    if chars.next().is_some() || !delimiter.is_ascii() {
+                        return Command::Error(
+                            "CSV delimiter must be one ASCII character".to_string(),
+                        );
+                    }
+                    arguments.csv_delimiter = delimiter as u8;
+                }
+                Err(message) => return Command::Error(message),
+            },
+            "--no-header" => {
+                arguments.csv_no_header = true;
+                arg_index += 1;
+            }
+            "--null-value" => match take_value(args, &mut arg_index, arg, "the CSV NULL value") {
+                Ok(value) => arguments.csv_null_value = Some(value.to_string()),
                 Err(message) => return Command::Error(message),
             },
             _ => return Command::Error(format!("Unknown argument {arg}")),
@@ -247,6 +308,11 @@ pub fn print_help_list() {
     println!("-s,  --save <path>           Save --query result as a CSV file");
     println!("-S,  --server                Start a JSONL server on stdin/stdout");
     println!("     --export-root <path>    Restrict server exports to this directory");
+    println!("     --max-rows <number>     Reject input tables exceeding this many rows");
+    println!("     --max-file-bytes <n>   Reject input files exceeding this many bytes");
+    println!("     --delimiter <char>     CSV field delimiter [default: ,]");
+    println!("     --no-header           Treat CSV rows as data and generate column names");
+    println!("     --null-value <text>    Treat this CSV value as NULL");
     println!("-a,  --analysis              Print Query analysis");
     println!("-h,  --help                  Print Sheetql help");
     println!("-v,  --version               Print Sheetql Current Version");
@@ -390,6 +456,54 @@ mod tests {
             Command::Error(message) => assert!(message.contains("greater than zero")),
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn max_rows_is_parsed_and_must_be_positive() {
+        match parse_arguments(&args(&["-f", "data.csv", "--max-rows", "42"])) {
+            Command::ReplMode(arguments) => assert_eq!(arguments.max_rows, Some(42)),
+            other => panic!("expected ReplMode, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "--max-rows", "0"])),
+            Command::Error(message) if message.contains("greater than zero")
+        ));
+    }
+
+    #[test]
+    fn max_file_bytes_is_parsed_and_must_be_positive() {
+        match parse_arguments(&args(&["-f", "data.csv", "--max-file-bytes", "1024"])) {
+            Command::ReplMode(arguments) => assert_eq!(arguments.max_file_bytes, Some(1024)),
+            other => panic!("expected ReplMode, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "--max-file-bytes", "0"])),
+            Command::Error(message) if message.contains("greater than zero")
+        ));
+    }
+
+    #[test]
+    fn csv_options_are_parsed_and_delimiter_must_be_one_ascii_character() {
+        match parse_arguments(&args(&[
+            "-f",
+            "data.csv",
+            "--delimiter",
+            ";",
+            "--no-header",
+            "--null-value",
+            "NA",
+        ])) {
+            Command::ReplMode(arguments) => {
+                assert_eq!(arguments.csv_delimiter, b';');
+                assert!(arguments.csv_no_header);
+                assert_eq!(arguments.csv_null_value.as_deref(), Some("NA"));
+            }
+            other => panic!("expected ReplMode, got {other:?}"),
+        }
+        assert!(matches!(
+            parse_arguments(&args(&["-f", "data.csv", "--delimiter", "||"])),
+            Command::Error(message) if message.contains("one ASCII character")
+        ));
     }
 
     #[test]

@@ -14,7 +14,11 @@ pub(crate) fn run_show_databases(
         .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false, None)))
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
-    Ok(crate::engine::QueryResult { columns, rows })
+    Ok(crate::engine::QueryResult {
+        columns,
+        rows,
+        stats: Default::default(),
+    })
 }
 
 pub(crate) fn run_use(
@@ -25,6 +29,7 @@ pub(crate) fn run_use(
     Ok(crate::engine::QueryResult {
         columns: vec!["Status".to_string()],
         rows: vec![vec![Value::Text("Database changed".to_string())]],
+        stats: Default::default(),
     })
 }
 
@@ -50,7 +55,11 @@ pub(crate) fn run_show_tables(
         .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false, None)))
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
-    Ok(crate::engine::QueryResult { columns, rows })
+    Ok(crate::engine::QueryResult {
+        columns,
+        rows,
+        stats: Default::default(),
+    })
 }
 
 pub(crate) fn run_describe_table(
@@ -82,6 +91,7 @@ fn describe_table(table: &Table) -> Result<crate::engine::QueryResult, String> {
                 Some(Value::Float(_)) => has_float[index] = true,
                 Some(Value::Bool(_)) => has_bool[index] = true,
                 Some(Value::Text(_)) => has_text[index] = true,
+                Some(Value::Date(_) | Value::DateTime(_)) => has_text[index] = true,
                 _ => {}
             }
         }
@@ -106,7 +116,11 @@ fn describe_table(table: &Table) -> Result<crate::engine::QueryResult, String> {
             vec![Value::Text(column.clone()), Value::Text(kind.to_string())]
         })
         .collect();
-    Ok(crate::engine::QueryResult { columns, rows })
+    Ok(crate::engine::QueryResult {
+        columns,
+        rows,
+        stats: Default::default(),
+    })
 }
 
 /// Split the tail of a `SHOW ... [FROM <database>] [LIKE 'pattern']` clause

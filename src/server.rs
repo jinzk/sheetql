@@ -8,6 +8,8 @@ use crate::database::Schema;
 use crate::engine::{self, QueryResult};
 use crate::printer::{self, OutputFormat};
 
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
 /// Serve a JSONL protocol on stdin/stdout: one request per line, one response
 /// per line. Returns on stdin EOF or an `{"op":"exit"}` request.
 pub fn run(schema: &mut Schema, export_root: Option<&str>) -> Result<(), String> {
@@ -23,6 +25,16 @@ pub fn run(schema: &mut Schema, export_root: Option<&str>) -> Result<(), String>
             Ok(0) => break,
             Ok(_) => {}
             Err(error) => return Err(format!("Cannot read request: {error}")),
+        }
+        if line.len() > MAX_REQUEST_BYTES {
+            write_response(
+                &mut output,
+                &error_response(
+                    "invalid_request",
+                    format!("Request exceeds the {} byte limit", MAX_REQUEST_BYTES),
+                ),
+            )?;
+            continue;
         }
         if line.trim().is_empty() {
             continue;
@@ -115,6 +127,11 @@ fn handle_query(schema: &mut Schema, request: &JsonValue) -> JsonValue {
                 "columns": result.columns,
                 "rows": rows,
                 "text": text,
+                "stats": {
+                    "elapsed_ms": result.stats.elapsed_ms,
+                    "input_rows": result.stats.input_rows,
+                    "output_rows": result.stats.output_rows,
+                },
             })
         },
     )
@@ -157,7 +174,7 @@ fn handle_export(schema: &mut Schema, request: &JsonValue, export_root: Option<&
     let overwrite = request
         .get("overwrite")
         .and_then(JsonValue::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let export_path = match resolve_export_path(path, export_root) {
         Ok(path) => path,
@@ -223,10 +240,23 @@ fn respond_with_result(
 }
 
 fn write_export(path: &Path, content: &str, overwrite: bool) -> Result<(), String> {
-    if !overwrite && path.exists() {
-        return Err(format!("Output file `{}` already exists", path.display()));
+    if overwrite {
+        return std::fs::write(path, content)
+            .map_err(|error| format!("Cannot write file `{}`: {error}", path.display()));
     }
-    std::fs::write(path, content)
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("Output file `{}` already exists", path.display())
+            } else {
+                format!("Cannot write file `{}`: {error}", path.display())
+            }
+        })?;
+    file.write_all(content.as_bytes())
         .map_err(|error| format!("Cannot write file `{}`: {error}", path.display()))
 }
 
@@ -242,7 +272,23 @@ fn resolve_export_path(path: &str, export_root: Option<&str>) -> Result<PathBuf,
     {
         return Err("Export path must be relative and cannot contain `..`".to_string());
     }
-    Ok(Path::new(root).join(requested))
+    let root = Path::new(root);
+    let joined = root.join(requested);
+
+    // Existing symlinks must not provide an escape hatch from the configured root.
+    if joined.exists() {
+        let root = root
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve export root `{}`: {error}", root.display()))?;
+        let target = joined.canonicalize().map_err(|error| {
+            format!("Cannot resolve export path `{}`: {error}", joined.display())
+        })?;
+        if !target.starts_with(&root) {
+            return Err("Export path must stay within the export root".to_string());
+        }
+    }
+
+    Ok(joined)
 }
 
 fn write_response(output: &mut impl Write, response: &JsonValue) -> Result<(), String> {
@@ -492,9 +538,9 @@ mod tests {
 
         let again = respond(
             &mut schema,
-            &json!({ "op": "export", "sql": "SELECT 1 AS x", "path": path }),
+            &json!({ "op": "export", "sql": "SELECT 1 AS x", "path": path, "overwrite": true }),
         );
-        assert_eq!(again["ok"], true, "overwrite defaults to true");
+        assert_eq!(again["ok"], true);
 
         let no_overwrite = respond(
             &mut schema,
@@ -507,6 +553,12 @@ mod tests {
                 .unwrap()
                 .contains("already exists")
         );
+
+        let default_no_overwrite = respond(
+            &mut schema,
+            &json!({ "op": "export", "sql": "SELECT 1 AS x", "path": path }),
+        );
+        assert_eq!(default_no_overwrite["ok"], false);
 
         std::fs::remove_file(&path).ok();
     }

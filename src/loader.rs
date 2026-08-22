@@ -23,10 +23,14 @@ pub fn is_supported_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn load_schema(files: &[String]) -> Result<Schema, String> {
+pub fn load_schema(
+    files: &[String],
+    max_rows: Option<usize>,
+    csv_options: &CsvOptions,
+) -> Result<Schema, String> {
     let mut schema = Schema::new();
     for file in files {
-        let database = load_database(file)?;
+        let database = load_database_with_options(file, max_rows, csv_options)?;
         schema.add_database(database);
     }
     if schema.database_names().len() == 1 {
@@ -36,7 +40,28 @@ pub fn load_schema(files: &[String]) -> Result<Schema, String> {
     Ok(schema)
 }
 
-pub fn load_database(path: &str) -> Result<Database, String> {
+#[derive(Debug, Clone)]
+pub struct CsvOptions {
+    pub delimiter: u8,
+    pub has_header: bool,
+    pub null_value: Option<String>,
+}
+
+impl Default for CsvOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: b',',
+            has_header: true,
+            null_value: None,
+        }
+    }
+}
+
+pub fn load_database_with_options(
+    path: &str,
+    max_rows: Option<usize>,
+    csv_options: &CsvOptions,
+) -> Result<Database, String> {
     let extension = Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -45,8 +70,8 @@ pub fn load_database(path: &str) -> Result<Database, String> {
 
     let mut database = Database::named(database_name(path));
     match extension.as_str() {
-        "xls" | "xlsx" | "xlsm" => load_spreadsheet(&mut database, path, &extension)?,
-        "csv" => load_csv(&mut database, path)?,
+        "xls" | "xlsx" | "xlsm" => load_spreadsheet(&mut database, path, &extension, max_rows)?,
+        "csv" => load_csv(&mut database, path, max_rows, csv_options)?,
         _ => {
             return Err(format!(
                 "Unsupported file format `.{extension}`, expected one of: xls, xlsx, xlsm, csv"
@@ -56,18 +81,23 @@ pub fn load_database(path: &str) -> Result<Database, String> {
     Ok(database)
 }
 
-fn load_spreadsheet(database: &mut Database, path: &str, extension: &str) -> Result<(), String> {
+fn load_spreadsheet(
+    database: &mut Database,
+    path: &str,
+    extension: &str,
+    max_rows: Option<usize>,
+) -> Result<(), String> {
     let file = File::open(path).map_err(|error| format!("Cannot open file `{path}`: {error}"))?;
     let reader = BufReader::new(file);
 
     if extension == "xls" {
         let mut workbook =
             Xls::new(reader).map_err(|error| format!("Cannot read file `{path}`: {error}"))?;
-        load_workbook(database, path, &mut workbook)
+        load_workbook(database, path, &mut workbook, max_rows)
     } else {
         let mut workbook =
             Xlsx::new(reader).map_err(|error| format!("Cannot read file `{path}`: {error}"))?;
-        load_workbook(database, path, &mut workbook)
+        load_workbook(database, path, &mut workbook, max_rows)
     }
 }
 
@@ -75,6 +105,7 @@ fn load_workbook<R: Reader<BufReader<File>>>(
     database: &mut Database,
     path: &str,
     workbook: &mut R,
+    max_rows: Option<usize>,
 ) -> Result<(), String>
 where
     R::Error: std::fmt::Display,
@@ -109,6 +140,7 @@ where
                 continue;
             }
             rows.push(values);
+            enforce_row_limit(path, &sheet_name, rows.len(), max_rows)?;
         }
 
         let name = spreadsheet_table_name(&sheet_name);
@@ -122,8 +154,14 @@ where
     Ok(())
 }
 
-fn load_csv(database: &mut Database, path: &str) -> Result<(), String> {
+fn load_csv(
+    database: &mut Database,
+    path: &str,
+    max_rows: Option<usize>,
+    options: &CsvOptions,
+) -> Result<(), String> {
     let mut reader = csv::ReaderBuilder::new()
+        .delimiter(options.delimiter)
         .has_headers(false)
         .flexible(true)
         .from_path(path)
@@ -136,9 +174,24 @@ fn load_csv(database: &mut Database, path: &str) -> Result<(), String> {
     for record in reader.records() {
         let record = record.map_err(|error| format!("Cannot parse CSV file `{path}`: {error}"))?;
         match &header {
-            None => {
+            None if options.has_header => {
                 columns = build_columns(record.iter().map(|value| value.to_string()).collect());
                 header = Some(record);
+            }
+            None => {
+                columns = (0..record.len())
+                    .map(|index| format!("col{}", index + 1))
+                    .collect();
+                header = Some(csv::StringRecord::new());
+                let values = build_row_values_with_null(
+                    record.iter().collect(),
+                    columns.len(),
+                    options.null_value.as_deref(),
+                );
+                if !values.iter().all(Value::is_null) {
+                    rows.push(values);
+                    enforce_row_limit(path, "", rows.len(), max_rows)?;
+                }
             }
             Some(_) => {
                 if record.len() > columns.len() {
@@ -152,11 +205,16 @@ fn load_csv(database: &mut Database, path: &str) -> Result<(), String> {
                         columns.len()
                     ));
                 }
-                let values = build_row_values(record.iter().collect(), columns.len());
+                let values = build_row_values_with_null(
+                    record.iter().collect(),
+                    columns.len(),
+                    options.null_value.as_deref(),
+                );
                 if values.iter().all(Value::is_null) {
                     continue;
                 }
                 rows.push(values);
+                enforce_row_limit(path, "", rows.len(), max_rows)?;
             }
         }
     }
@@ -175,13 +233,47 @@ fn load_csv(database: &mut Database, path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn build_row_values(cells: Vec<&str>, column_count: usize) -> Vec<Value> {
+fn enforce_row_limit(
+    path: &str,
+    sheet: &str,
+    row_count: usize,
+    max_rows: Option<usize>,
+) -> Result<(), String> {
+    if let Some(max_rows) = max_rows
+        && row_count > max_rows
+    {
+        let source = if sheet.is_empty() {
+            format!("file `{path}`")
+        } else {
+            format!("sheet `{sheet}` in `{path}`")
+        };
+        return Err(format!(
+            "Input {source} exceeds the maximum of {max_rows} data rows"
+        ));
+    }
+    Ok(())
+}
+
+fn build_row_values_with_null(
+    cells: Vec<&str>,
+    column_count: usize,
+    null_value: Option<&str>,
+) -> Vec<Value> {
     let mut values: Vec<Value> = Vec::with_capacity(column_count);
     for index in 0..column_count {
         let cell = cells.get(index).copied().unwrap_or("");
-        values.push(parse_cell(cell));
+        values.push(if null_value == Some(cell) {
+            Value::Null
+        } else {
+            parse_cell(cell)
+        });
     }
     values
+}
+
+#[cfg(test)]
+fn build_row_values(cells: Vec<&str>, column_count: usize) -> Vec<Value> {
+    build_row_values_with_null(cells, column_count, None)
 }
 
 fn parse_cell(cell: &str) -> Value {
@@ -262,7 +354,14 @@ fn cell_value(cell: &Cell) -> Value {
         Cell::Float(value) => Value::Float(*value),
         Cell::String(value) => Value::Text(value.clone()),
         Cell::Bool(value) => Value::Bool(*value),
-        Cell::DateTime(value) => Value::Text(format_excel_datetime(value)),
+        Cell::DateTime(value) => {
+            let formatted = format_excel_datetime(value);
+            if formatted.len() > 10 {
+                Value::DateTime(formatted)
+            } else {
+                Value::Date(formatted)
+            }
+        }
         Cell::DateTimeIso(_) | Cell::DurationIso(_) => Value::Text(cell.to_string()),
     }
 }
@@ -321,7 +420,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("sheetql_bad_row_{}.csv", std::process::id()));
         std::fs::write(&path, "a,b\n1,2,3\n").unwrap();
         let mut database = crate::database::Database::new();
-        let result = load_csv(&mut database, &path.to_string_lossy());
+        let result = load_csv(
+            &mut database,
+            &path.to_string_lossy(),
+            None,
+            &CsvOptions {
+                delimiter: b',',
+                has_header: true,
+                null_value: None,
+            },
+        );
         let error = result.expect_err("extra fields should be rejected");
         assert!(error.contains("3 fields"), "got: {error}");
         std::fs::remove_file(&path).ok();
@@ -333,9 +441,64 @@ mod tests {
             std::env::temp_dir().join(format!("sheetql_short_row_{}.csv", std::process::id()));
         std::fs::write(&path, "a,b\n1\n").unwrap();
         let mut database = crate::database::Database::new();
-        load_csv(&mut database, &path.to_string_lossy()).unwrap();
+        load_csv(
+            &mut database,
+            &path.to_string_lossy(),
+            None,
+            &CsvOptions {
+                delimiter: b',',
+                has_header: true,
+                null_value: None,
+            },
+        )
+        .unwrap();
         let table = database.tables.first().unwrap();
         assert_eq!(table.rows[0], vec![Value::Int(1), Value::Null]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_csv_rejects_rows_over_configured_limit() {
+        let path =
+            std::env::temp_dir().join(format!("sheetql_max_rows_{}.csv", std::process::id()));
+        std::fs::write(&path, "a\n1\n2\n").unwrap();
+        let mut database = crate::database::Database::new();
+        let error = load_csv(
+            &mut database,
+            &path.to_string_lossy(),
+            Some(1),
+            &CsvOptions {
+                delimiter: b',',
+                has_header: true,
+                null_value: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("maximum of 1 data rows"), "got: {error}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_csv_supports_custom_delimiter_null_value_and_no_header() {
+        let path =
+            std::env::temp_dir().join(format!("sheetql_csv_options_{}.csv", std::process::id()));
+        std::fs::write(&path, "1;NA\n2;ok\n").unwrap();
+        let mut database = crate::database::Database::new();
+        load_csv(
+            &mut database,
+            &path.to_string_lossy(),
+            None,
+            &CsvOptions {
+                delimiter: b';',
+                has_header: false,
+                null_value: Some("NA".to_string()),
+            },
+        )
+        .unwrap();
+        let table = database.tables.first().unwrap();
+        assert_eq!(table.columns, vec!["col1", "col2"]);
+        assert_eq!(table.rows[0], vec![Value::Int(1), Value::Null]);
+        assert_eq!(table.rows[1], vec![Value::Int(2), Value::Text("ok".into())]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -348,7 +511,7 @@ mod tests {
             calamine::Data::DateTime(v) => format_excel_datetime(v),
             _ => unreachable!(),
         };
-        assert_eq!(cell_value(&cell), Value::Text(expected.clone()));
+        assert_eq!(cell_value(&cell), Value::Date(expected.clone()));
         assert!(
             expected.contains('/'),
             "expected a date like Y/M/D, got {expected}"

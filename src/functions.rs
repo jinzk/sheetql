@@ -301,15 +301,15 @@ pub fn eval_function(
         "now" | "current_timestamp" => {
             let values = eval_scalar_args(ctx, &args, current)?;
             require_arity(&name, &values, 0)?;
-            Ok(Value::Text(now_string(&ctx.now)))
+            Ok(Value::DateTime(now_string(&ctx.now)))
         }
         "date" => {
             let values = eval_scalar_args(ctx, &args, current)?;
             if values.is_empty() {
-                return Ok(Value::Text(today_string(&ctx.now)));
+                return Ok(Value::Date(today_string(&ctx.now)));
             }
             require_arity(&name, &values, 1)?;
-            Ok(Value::Text(extract_date(&values[0].to_display_string())))
+            Ok(Value::Date(extract_date(&values[0].to_display_string())))
         }
         "power" | "pow" => {
             let values = eval_scalar_args(ctx, &args, current)?;
@@ -709,17 +709,17 @@ mod tests {
     fn date_parses_padded_and_unpadded() {
         assert_eq!(
             scalar("DATE('2026/5/7')"),
-            Value::Text("2026-05-07".to_string())
+            Value::Date("2026-05-07".to_string())
         );
         assert_eq!(
             scalar("DATE('2026-05-07')"),
-            Value::Text("2026-05-07".to_string())
+            Value::Date("2026-05-07".to_string())
         );
         assert_eq!(
             scalar("DATE('2026/08/14 10:30:00')"),
-            Value::Text("2026-08-14".to_string())
+            Value::Date("2026-08-14".to_string())
         );
-        assert_eq!(scalar("DATE('nope')"), Value::Text("nope".to_string()));
+        assert_eq!(scalar("DATE('nope')"), Value::Date("nope".to_string()));
     }
 
     #[test]
