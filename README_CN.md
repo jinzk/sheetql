@@ -242,6 +242,57 @@ DESCRIBE sales
 | `IFNULL` / `ISNULL`         | 2      | 第一个值非`NULL` 时返回它，否则返回第二个                      |
 | `COALESCE`                    | 2+     | 返回第一个非`NULL` 值                                          |
 
+CSV 和电子表格中的 JSON 单元格默认按文本读取。以下函数会显式解析 JSON，
+并支持 `$.user.name`、`$.items[0]` 等基础 JSON 路径：
+
+| 函数 | 参数 | 说明 |
+| --- | --- | --- |
+| `JSON_VALID` | 1 | 判断值是否为合法 JSON |
+| `JSON_VALUE` | 2 | 提取 JSON 标量并转换为 SQL 值 |
+| `JSON_PARSE` | 1 | 将 JSON 解析为结构化 JSON 值 |
+| `JSON_QUERY` | 2 | 提取 JSON 对象或数组 |
+| `JSON_EXISTS` | 2 | 判断 JSON 路径是否存在 |
+
+```sql
+SELECT JSON_VALUE(profile, '$.name') AS name
+FROM users
+WHERE JSON_EXISTS(profile, '$.active')
+  AND JSON_VALUE(profile, '$.age') >= 18;
+```
+
+除 `JSON_VALID` 外，非法 JSON 会使查询报错。路径不存在时，
+`JSON_VALUE` 和 `JSON_QUERY` 返回 `NULL`，`JSON_EXISTS` 返回 `false`。
+
+### URL、Email 与字符串格式化函数
+
+URL 函数接收 URL 文本。URL 组件不存在时返回 `NULL`，URL 非法时返回错误。
+`URL_PARAM` 返回第一个匹配查询参数，并对参数值执行 URL 解码。
+
+| 函数 | 参数 | 说明 |
+| --- | --- | --- |
+| `URL_SCHEME` | 1 | URL 协议，如 `https` |
+| `URL_HOST` | 1 | 主机名 |
+| `URL_PORT` | 1 | 显式端口，返回文本 |
+| `URL_PATH` | 1 | 路径部分 |
+| `URL_QUERY` | 1 | 原始查询字符串 |
+| `URL_FRAGMENT` | 1 | Fragment 部分 |
+| `URL_PARAM` | 2 | 第一个匹配查询参数的解码值 |
+| `EMAIL_LOCAL` | 1 | `@` 前的本地部分 |
+| `EMAIL_DOMAIN` | 1 | `@` 后的域名部分 |
+| `EMAIL_VALID` | 1 | 基础 Email 语法校验 |
+| `FORMAT` | 1+ | 使用 `{}` 或 `{0}` 占位符格式化字符串 |
+
+```sql
+SELECT
+    URL_HOST(url) AS host,
+    URL_PARAM(url, 'campaign') AS campaign,
+    EMAIL_DOMAIN(email) AS email_domain,
+    FORMAT('{} <{}>', name, email) AS contact
+FROM contacts;
+```
+
+`FORMAT` 模板中的字面量大括号使用 `{{` 和 `}}` 表示。
+
 ### 聚合函数
 
 | 函数                              | 说明                                                 |

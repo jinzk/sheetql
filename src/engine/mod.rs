@@ -549,6 +549,44 @@ mod tests {
     }
 
     #[test]
+    fn url_email_and_format_functions_work_in_sql_filters_and_projection() {
+        let mut schema = Schema::new();
+        let mut database = Database::named("contacts");
+        database.add_table(Table {
+            name: "contacts".into(),
+            columns: vec!["name".into(), "url".into(), "email".into()],
+            rows: vec![
+                vec![
+                    Value::Text("Alice".into()),
+                    Value::Text("https://example.com?a=1".into()),
+                    Value::Text("alice@example.com".into()),
+                ],
+                vec![
+                    Value::Text("Bob".into()),
+                    Value::Text("https://other.test?a=2".into()),
+                    Value::Text("invalid".into()),
+                ],
+            ],
+        });
+        schema.add_database(database);
+        schema.set_current_database("contacts").unwrap();
+
+        let result = run_query(
+            &mut schema,
+            "SELECT FORMAT('{} <{}>', name, EMAIL_DOMAIN(email)) AS contact, URL_PARAM(url, 'a') AS campaign FROM contacts WHERE EMAIL_VALID(email) AND URL_HOST(url) = 'example.com'",
+        )
+        .unwrap();
+        assert_eq!(result.columns, vec!["contact", "campaign"]);
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Text("Alice <example.com>".into()),
+                Value::Text("1".into())
+            ]]
+        );
+    }
+
+    #[test]
     fn group_by_having_aggregates() {
         let mut schema = make_schema();
         let result = run(

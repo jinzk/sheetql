@@ -242,6 +242,60 @@ Type `exit` or `quit` (case-insensitive) to leave the REPL.
 | `IFNULL` / `ISNULL`         | 2         | First value if not`NULL`, otherwise the second                                      |
 | `COALESCE`                    | 2+        | First non-`NULL` value                                                              |
 
+JSON values in CSV and spreadsheet cells are read as text by default. These
+functions explicitly parse JSON and support basic paths such as `$.user.name`
+and `$.items[0]`:
+
+| Function | Arguments | Description |
+| --- | --- | --- |
+| `JSON_VALID` | 1 | Returns whether the value is valid JSON |
+| `JSON_VALUE` | 2 | Extracts a JSON scalar as a SQL value |
+| `JSON_PARSE` | 1 | Parses JSON into a structured JSON value |
+| `JSON_QUERY` | 2 | Extracts a JSON object or array |
+| `JSON_EXISTS` | 2 | Returns whether a JSON path exists |
+
+```sql
+SELECT JSON_VALUE(profile, '$.name') AS name
+FROM users
+WHERE JSON_EXISTS(profile, '$.active')
+  AND JSON_VALUE(profile, '$.age') >= 18;
+```
+
+Invalid JSON is an error for all functions except `JSON_VALID`, which returns
+`false`. Missing paths return `NULL` for `JSON_VALUE` and `JSON_QUERY`, and
+`false` for `JSON_EXISTS`.
+
+### URL, email, and string formatting functions
+
+URL functions accept a URL text value. Missing URL components return `NULL`;
+invalid URLs return an error. `URL_PARAM` returns the first matching query
+parameter after URL decoding.
+
+| Function | Arguments | Description |
+| --- | --- | --- |
+| `URL_SCHEME` | 1 | URL scheme, such as `https` |
+| `URL_HOST` | 1 | Host name |
+| `URL_PORT` | 1 | Explicit port as text |
+| `URL_PATH` | 1 | Path component |
+| `URL_QUERY` | 1 | Raw query component |
+| `URL_FRAGMENT` | 1 | Fragment component |
+| `URL_PARAM` | 2 | Decoded value of the first matching query parameter |
+| `EMAIL_LOCAL` | 1 | Local part before `@` |
+| `EMAIL_DOMAIN` | 1 | Domain part after `@` |
+| `EMAIL_VALID` | 1 | Basic email syntax validation |
+| `FORMAT` | 1+ | Formats a template using `{}` or indexed `{0}` placeholders |
+
+```sql
+SELECT
+    URL_HOST(url) AS host,
+    URL_PARAM(url, 'campaign') AS campaign,
+    EMAIL_DOMAIN(email) AS email_domain,
+    FORMAT('{} <{}>', name, email) AS contact
+FROM contacts;
+```
+
+Use `{{` and `}}` for literal braces in `FORMAT` templates.
+
 ### Aggregate functions
 
 | Function                            | Description                                      |

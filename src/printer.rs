@@ -33,6 +33,7 @@ pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Bool(boolean) => json!(boolean),
         Value::Text(text) => json!(text),
         Value::Date(text) | Value::DateTime(text) => json!(text),
+        Value::Json(value) => value.clone(),
         Value::Null => serde_json::Value::Null,
     }
 }
@@ -239,6 +240,19 @@ mod tests {
         let rows = vec![vec![Value::Float(f64::NAN)]];
         let out = render(OutputFormat::Json, &columns, &rows);
         assert!(out.contains("\"n\": null"), "got: {out}");
+    }
+
+    #[test]
+    fn json_value_renders_as_nested_json() {
+        let columns = vec!["profile".to_string()];
+        let rows = vec![vec![Value::Json(serde_json::json!({
+            "name": "Alice",
+            "roles": ["admin"]
+        }))]];
+        let out = render(OutputFormat::Json, &columns, &rows);
+        assert!(out.contains("\"profile\": {"), "got: {out}");
+        assert!(out.contains("\"roles\": ["), "got: {out}");
+        assert!(!out.contains("\\\"name\\\""), "got: {out}");
     }
 
     #[test]

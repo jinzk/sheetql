@@ -3,6 +3,7 @@ use std::fmt;
 use std::hash::Hash;
 
 use chrono::{NaiveDate, NaiveDateTime};
+use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -12,6 +13,7 @@ pub enum Value {
     Text(String),
     Date(String),
     DateTime(String),
+    Json(JsonValue),
     Null,
 }
 
@@ -64,6 +66,9 @@ impl Value {
             }
             Value::Text(value) => value.clone(),
             Value::Date(value) | Value::DateTime(value) => value.clone(),
+            Value::Json(value) => {
+                serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
+            }
             Value::Null => "NULL".to_string(),
         }
     }
@@ -75,6 +80,7 @@ impl Value {
             Value::Float(value) => *value != 0.0,
             Value::Text(value) => !value.is_empty(),
             Value::Date(value) | Value::DateTime(value) => !value.is_empty(),
+            Value::Json(value) => !value.is_null() && !matches!(value, JsonValue::Bool(false)),
             Value::Null => false,
         }
     }
@@ -88,6 +94,7 @@ impl Value {
             Value::Text(_) => 4,
             Value::Date(_) => 5,
             Value::DateTime(_) => 6,
+            Value::Json(_) => 7,
         }
     }
 }
@@ -135,6 +142,10 @@ impl Hash for Value {
                 6u8.hash(state);
                 value.hash(state);
             }
+            Value::Json(value) => {
+                7u8.hash(state);
+                serde_json::to_string(value).unwrap_or_default().hash(state);
+            }
             Value::Null => 0u8.hash(state),
         }
     }
@@ -157,6 +168,10 @@ pub fn values_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Float(x), Value::Int(y)) => cmp_int_float(*y, *x).map(Ordering::reverse),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
+        (Value::Json(x), Value::Json(y)) => serde_json::to_string(x)
+            .ok()?
+            .partial_cmp(&serde_json::to_string(y).ok()?),
+        (Value::Json(_), _) | (_, Value::Json(_)) => None,
         _ if temporal_cmp(a, b).is_some() => temporal_cmp(a, b),
         _ => Some(a.type_rank().cmp(&b.type_rank())),
     }
@@ -170,6 +185,8 @@ pub fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Int(y)) => eq_int_float(*y, *x),
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Json(x), Value::Json(y)) => x == y,
+        (Value::Json(_), _) | (_, Value::Json(_)) => false,
         _ if temporal_cmp(a, b).is_some() => temporal_cmp(a, b) == Some(Ordering::Equal),
         (Value::Null, Value::Null) => true,
         _ => false,
@@ -277,6 +294,7 @@ pub enum GroupKey {
     Int(i64),
     Float(u64),
     Text(String),
+    Json(String),
 }
 
 /// Build the normalized group key for `value`. `Int` and integral `Float`
@@ -298,6 +316,7 @@ pub fn group_key(value: &Value) -> GroupKey {
         Value::Text(value) => GroupKey::Text(value.clone()),
         Value::Date(value) => GroupKey::Text(value.clone()),
         Value::DateTime(value) => GroupKey::Text(value.clone()),
+        Value::Json(value) => GroupKey::Json(serde_json::to_string(value).unwrap_or_default()),
     }
 }
 

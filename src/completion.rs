@@ -56,6 +56,22 @@ impl Completion {
 
 /// Functions supported by the engine (`src/functions.rs`).
 const FUNCTIONS: &[&str] = &[
+    "url_scheme",
+    "url_host",
+    "url_port",
+    "url_path",
+    "url_query",
+    "url_fragment",
+    "url_param",
+    "email_local",
+    "email_domain",
+    "email_valid",
+    "format",
+    "json_valid",
+    "json_value",
+    "json_parse",
+    "json_query",
+    "json_exists",
     "count",
     "sum",
     "avg",
