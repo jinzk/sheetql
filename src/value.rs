@@ -172,8 +172,7 @@ pub fn values_partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
             .ok()?
             .partial_cmp(&serde_json::to_string(y).ok()?),
         (Value::Json(_), _) | (_, Value::Json(_)) => None,
-        _ if temporal_cmp(a, b).is_some() => temporal_cmp(a, b),
-        _ => Some(a.type_rank().cmp(&b.type_rank())),
+        _ => temporal_cmp(a, b).or_else(|| Some(a.type_rank().cmp(&b.type_rank()))),
     }
 }
 
@@ -187,9 +186,8 @@ pub fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Json(x), Value::Json(y)) => x == y,
         (Value::Json(_), _) | (_, Value::Json(_)) => false,
-        _ if temporal_cmp(a, b).is_some() => temporal_cmp(a, b) == Some(Ordering::Equal),
         (Value::Null, Value::Null) => true,
-        _ => false,
+        _ => temporal_cmp(a, b) == Some(Ordering::Equal),
     }
 }
 

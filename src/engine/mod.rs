@@ -1,19 +1,20 @@
 mod metadata;
 mod select;
 
-use sqlparser::ast::Statement;
+use sqlparser::ast::{
+    ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions, Statement,
+};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use std::time::Instant;
 
 use crate::database::Schema;
+use crate::error::Error;
 use crate::printer::OutputFormat;
 use crate::printer::render;
 use crate::value::Value;
 
-use crate::engine::metadata::{
-    parse_show_clauses, run_describe_table, run_show_databases, run_show_tables, run_use,
-};
+use crate::engine::metadata::{run_describe_table, run_show_databases, run_show_tables, run_use};
 use crate::engine::select::{execute_query, object_name_to_parts};
 
 #[derive(Debug, Clone, Default)]
@@ -30,74 +31,50 @@ pub struct QueryResult {
     pub stats: QueryStats,
 }
 
-pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, String> {
+pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
     let started = Instant::now();
     let (query_sql, outfile) = strip_into_outfile(sql);
-    let trimmed = query_sql.trim();
-    let lower = trimmed
-        .to_lowercase()
-        .trim_end_matches(';')
-        .trim()
-        .to_string();
-
-    if lower.starts_with("show databases") {
-        let rest = lower.strip_prefix("show databases").unwrap().trim();
-        let (_, like) = parse_show_clauses(rest)?;
-        return finalize_result(run_show_databases(schema, like.as_deref()), started);
-    }
-    if lower.starts_with("show schemas") {
-        let rest = lower.strip_prefix("show schemas").unwrap().trim();
-        let (_, like) = parse_show_clauses(rest)?;
-        return finalize_result(run_show_databases(schema, like.as_deref()), started);
-    }
-    if lower.starts_with("show tables") {
-        let rest = lower.strip_prefix("show tables").unwrap().trim();
-        let (database, like) = parse_show_clauses(rest)?;
-        return finalize_result(
-            run_show_tables(schema, database.as_deref(), like.as_deref()),
-            started,
-        );
-    }
-    if let Some(rest) = lower.strip_prefix("describe ") {
-        return finalize_result(run_describe_table(schema, rest.trim()), started);
-    }
-    if let Some(rest) = lower.strip_prefix("desc ") {
-        return finalize_result(run_describe_table(schema, rest.trim()), started);
-    }
-    if let Some(name) = lower.strip_prefix("use ") {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("USE requires a database name".to_string());
-        }
-        return finalize_result(run_use(schema, name), started);
-    }
 
     let dialect = MySqlDialect {};
     let statements = Parser::parse_sql(&dialect, &query_sql)
         .map_err(|error| format!("SQL parse error: {error}"))?;
 
     if statements.len() != 1 {
-        return Err("Only a single statement per query is supported".to_string());
+        return Err("Only a single statement per query is supported"
+            .to_string()
+            .into());
     }
 
     let result = match &statements[0] {
         Statement::Query(query) => execute_query(schema, query),
-        Statement::ShowColumns { show_options, .. } => {
-            if show_options.filter_position.is_some() {
-                return Err("SHOW COLUMNS filters (LIKE/WHERE) are not supported".to_string());
-            }
-            let reference = show_options
+        Statement::ShowColumns { show_options, .. } => run_show_columns(schema, show_options),
+        Statement::ShowDatabases { show_options, .. }
+        | Statement::ShowSchemas { show_options, .. } => {
+            run_show_databases(schema, show_like_pattern(show_options)?.as_deref())
+        }
+        Statement::ShowTables { show_options, .. } => {
+            let database = show_options
                 .show_in
                 .as_ref()
                 .and_then(|show_in| show_in.parent_name.as_ref())
-                .map(|name| object_name_to_parts(name).join("."))
-                .ok_or_else(|| "SHOW COLUMNS requires a table name".to_string())?;
+                .map(|name| object_name_to_parts(name).join("."));
+            run_show_tables(
+                schema,
+                database.as_deref(),
+                show_like_pattern(show_options)?.as_deref(),
+            )
+        }
+        Statement::Use(use_clause) => match use_clause {
+            sqlparser::ast::Use::Object(name) | sqlparser::ast::Use::Database(name) => {
+                run_use(schema, &object_name_to_parts(name).join("."))
+            }
+            _ => Err("Unsupported USE statement".to_string().into()),
+        },
+        Statement::ExplainTable { table_name, .. } => {
+            let reference = object_name_to_parts(table_name).join(".");
             run_describe_table(schema, &reference)
         }
-        Statement::ShowSchemas { .. } | Statement::ShowDatabases { .. } => {
-            run_show_databases(schema, None)
-        }
-        other => Err(format!("Unsupported statement: {other}")),
+        other => Err(format!("Unsupported statement: {other}").into()),
     };
 
     if let Some(path) = outfile {
@@ -121,10 +98,49 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, String> 
     finalize_result(result, started)
 }
 
+/// Extract the `LIKE 'pattern'` filter from a SHOW statement's options. Only
+/// LIKE filters are supported; WHERE/ILIKE filters are rejected.
+fn show_like_pattern(show_options: &ShowStatementOptions) -> Result<Option<String>, Error> {
+    let Some(position) = &show_options.filter_position else {
+        return Ok(None);
+    };
+    let filter = match position {
+        ShowStatementFilterPosition::Infix(filter)
+        | ShowStatementFilterPosition::Suffix(filter) => filter,
+    };
+    match filter {
+        ShowStatementFilter::Like(pattern) => Ok(Some(pattern.clone())),
+        ShowStatementFilter::NoKeyword(pattern) => Ok(Some(pattern.clone())),
+        _ => Err("SHOW ... filters other than LIKE are not supported"
+            .to_string()
+            .into()),
+    }
+}
+
+/// Run `SHOW COLUMNS FROM <table>`, resolving the table name from the
+/// statement's `IN`/`FROM` clause.
+fn run_show_columns(
+    schema: &Schema,
+    show_options: &ShowStatementOptions,
+) -> Result<QueryResult, Error> {
+    if show_options.filter_position.is_some() {
+        return Err("SHOW COLUMNS filters (LIKE/WHERE) are not supported"
+            .to_string()
+            .into());
+    }
+    let reference = show_options
+        .show_in
+        .as_ref()
+        .and_then(|show_in| show_in.parent_name.as_ref())
+        .map(|name| object_name_to_parts(name).join("."))
+        .ok_or_else(|| "SHOW COLUMNS requires a table name".to_string())?;
+    run_describe_table(schema, &reference)
+}
+
 fn finalize_result(
-    result: Result<QueryResult, String>,
+    result: Result<QueryResult, Error>,
     started: Instant,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, Error> {
     result.map(|mut result| {
         result.stats.elapsed_ms = started.elapsed().as_millis();
         result.stats.output_rows = result.rows.len();
@@ -230,9 +246,9 @@ fn find_outfile_pos(sql: &str, marker: &str) -> Option<usize> {
 
 /// Write a query result to a file as CSV (with header). Refuses to overwrite an
 /// existing file to avoid clobbering a data source.
-fn write_outfile(path: &str, result: &QueryResult) -> Result<(), String> {
+fn write_outfile(path: &str, result: &QueryResult) -> Result<(), Error> {
     if std::path::Path::new(path).exists() {
-        return Err(format!("Output file `{path}` already exists"));
+        return Err(format!("Output file `{path}` already exists").into());
     }
     let content = render(OutputFormat::Csv, &result.columns, &result.rows);
     std::fs::write(path, content).map_err(|error| format!("Cannot write to `{path}`: {error}"))?;
@@ -490,6 +506,51 @@ mod tests {
             result.rows[1],
             vec![Value::Text("name".into()), Value::Text("Text".into())]
         );
+    }
+
+    #[test]
+    fn desc_abbreviation_describes_table() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "DESC people");
+        assert_eq!(
+            result.columns,
+            vec!["Column".to_string(), "Type".to_string()]
+        );
+        assert_eq!(result.rows.len(), 4);
+        assert_eq!(result.rows[0][0], Value::Text("id".into()));
+    }
+
+    #[test]
+    fn show_columns_rejects_filters() {
+        let mut schema = make_schema();
+        let err = run_query(&mut schema, "SHOW COLUMNS FROM people LIKE 'i%'").unwrap_err();
+        assert!(err.contains("filters"), "got: {err}");
+    }
+
+    #[test]
+    fn show_tables_rejects_where_filters() {
+        let mut schema = make_schema();
+        let err = run_query(&mut schema, "SHOW TABLES WHERE 1").unwrap_err();
+        assert!(err.contains("LIKE"), "got: {err}");
+    }
+
+    #[test]
+    fn use_with_backticks_switches_database() {
+        let mut schema = make_schema();
+        let mut other = Database::named("other");
+        other.add_table(Table {
+            name: "extra".to_string(),
+            columns: vec!["value".to_string()],
+            rows: vec![vec![Value::Int(7)]],
+        });
+        schema.add_database(other);
+
+        let result = run(&mut schema, "USE `other`");
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Text("Database changed".into())]]
+        );
+        assert_eq!(schema.current_database(), Some("other"));
     }
 
     #[test]
@@ -874,6 +935,34 @@ mod tests {
         let result = run(&mut schema, "SELECT POWER(2, 10) AS p, SQRT(16) AS s");
         assert_eq!(result.rows[0][0], Value::Float(1024.0));
         assert_eq!(result.rows[0][1], Value::Float(4.0));
+    }
+
+    #[test]
+    fn floor_ceil_and_ceiling_round_numerically() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT FLOOR(age / 4.0) AS f, CEIL(age / 4.0) AS c, CEILING(age / 4.0) AS c2 FROM people WHERE id = 1",
+        );
+        // age 30: 30 / 4 = 7.5 -> floor 7, ceil 8
+        assert_eq!(result.rows[0][0], Value::Float(7.0));
+        assert_eq!(result.rows[0][1], Value::Float(8.0));
+        assert_eq!(result.rows[0][2], Value::Float(8.0));
+
+        let err = run_query(&mut schema, "SELECT FLOOR(3.7 TO HOUR)").unwrap_err();
+        assert!(err.contains("TO is not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn isnull_reports_null_in_where_clause() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT name FROM people WHERE ISNULL(age)");
+        assert_eq!(result.rows.len(), 0);
+        let result = run(
+            &mut schema,
+            "SELECT ISNULL(age) AS n FROM people WHERE id = 1",
+        );
+        assert_eq!(result.rows[0][0], Value::Bool(false));
     }
 
     #[test]

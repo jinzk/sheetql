@@ -6,13 +6,14 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::database::Schema;
 use crate::engine::{self, QueryResult};
+use crate::error::Error;
 use crate::printer::{self, OutputFormat};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Serve a JSONL protocol on stdin/stdout: one request per line, one response
 /// per line. Returns on stdin EOF or an `{"op":"exit"}` request.
-pub fn run(schema: &mut Schema, export_root: Option<&str>) -> Result<(), String> {
+pub fn run(schema: &mut Schema, export_root: Option<&str>) -> Result<(), Error> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = stdin.lock();
@@ -24,7 +25,7 @@ pub fn run(schema: &mut Schema, export_root: Option<&str>) -> Result<(), String>
         match input.read_line(&mut line) {
             Ok(0) => break,
             Ok(_) => {}
-            Err(error) => return Err(format!("Cannot read request: {error}")),
+            Err(error) => return Err(format!("Cannot read request: {error}").into()),
         }
         if line.len() > MAX_REQUEST_BYTES {
             write_response(
@@ -95,12 +96,9 @@ fn handle_query(schema: &mut Schema, request: &JsonValue) -> JsonValue {
         .get("format")
         .and_then(JsonValue::as_str)
         .unwrap_or("json");
-    let output_format = match format.to_lowercase().as_str() {
-        "json" => OutputFormat::Json,
-        "csv" => OutputFormat::Csv,
-        "yaml" => OutputFormat::Yaml,
-        "render" | "table" => OutputFormat::Table,
-        _ => {
+    let output_format = match printer::OutputFormat::from_str(format) {
+        Some(output_format) => output_format,
+        None => {
             return error_response(
                 "invalid_request",
                 format!("Unknown format `{format}`, expected one of: json, csv, yaml, table"),
@@ -178,7 +176,7 @@ fn handle_export(schema: &mut Schema, request: &JsonValue, export_root: Option<&
 
     let export_path = match resolve_export_path(path, export_root) {
         Ok(path) => path,
-        Err(error) => return error_response("invalid_request", error),
+        Err(error) => return error_response("invalid_request", error.to_string()),
     };
 
     let db = request.get("db").and_then(JsonValue::as_str);
@@ -192,7 +190,7 @@ fn handle_export(schema: &mut Schema, request: &JsonValue, export_root: Option<&
             let content = printer::render(OutputFormat::Csv, &result.columns, &result.rows);
             match write_export(&export_path, &content, overwrite) {
                 Ok(()) => json!({ "ok": true, "path": export_path.to_string_lossy() }),
-                Err(error) => error_response("export_error", error),
+                Err(error) => error_response("export_error", error.to_string()),
             }
         },
     )
@@ -204,7 +202,7 @@ fn run_query_with_db(
     schema: &mut Schema,
     sql: &str,
     db: Option<&str>,
-) -> Result<QueryResult, String> {
+) -> Result<QueryResult, Error> {
     let previous = schema.current_database().map(str::to_string);
     if let Some(db) = db {
         schema.set_current_database(db)?;
@@ -220,7 +218,7 @@ fn run_query_with_db(
 }
 
 fn respond_with_result(
-    result: Result<QueryResult, String>,
+    result: Result<QueryResult, Error>,
     error_code: &str,
     elapsed_ms: u64,
     ok: impl FnOnce(&QueryResult) -> JsonValue,
@@ -232,17 +230,18 @@ fn respond_with_result(
             response
         }
         Err(error) => {
-            let mut response = error_response(error_code, error);
+            let mut response = error_response(error_code, error.to_string());
             response["elapsed_ms"] = json!(elapsed_ms);
             response
         }
     }
 }
 
-fn write_export(path: &Path, content: &str, overwrite: bool) -> Result<(), String> {
+fn write_export(path: &Path, content: &str, overwrite: bool) -> Result<(), Error> {
     if overwrite {
-        return std::fs::write(path, content)
-            .map_err(|error| format!("Cannot write file `{}`: {error}", path.display()));
+        return std::fs::write(path, content).map_err(|error| {
+            Error::message(format!("Cannot write file `{}`: {error}", path.display()))
+        });
     }
 
     let mut file = std::fs::OpenOptions::new()
@@ -257,10 +256,10 @@ fn write_export(path: &Path, content: &str, overwrite: bool) -> Result<(), Strin
             }
         })?;
     file.write_all(content.as_bytes())
-        .map_err(|error| format!("Cannot write file `{}`: {error}", path.display()))
+        .map_err(|error| Error::message(format!("Cannot write file `{}`: {error}", path.display())))
 }
 
-fn resolve_export_path(path: &str, export_root: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_export_path(path: &str, export_root: Option<&str>) -> Result<PathBuf, Error> {
     let requested = Path::new(path);
     let Some(root) = export_root else {
         return Ok(requested.to_path_buf());
@@ -270,7 +269,9 @@ fn resolve_export_path(path: &str, export_root: Option<&str>) -> Result<PathBuf,
             .components()
             .any(|component| matches!(component, Component::ParentDir))
     {
-        return Err("Export path must be relative and cannot contain `..`".to_string());
+        return Err("Export path must be relative and cannot contain `..`"
+            .to_string()
+            .into());
     }
     let root = Path::new(root);
     let joined = root.join(requested);
@@ -284,20 +285,22 @@ fn resolve_export_path(path: &str, export_root: Option<&str>) -> Result<PathBuf,
             format!("Cannot resolve export path `{}`: {error}", joined.display())
         })?;
         if !target.starts_with(&root) {
-            return Err("Export path must stay within the export root".to_string());
+            return Err("Export path must stay within the export root"
+                .to_string()
+                .into());
         }
     }
 
     Ok(joined)
 }
 
-fn write_response(output: &mut impl Write, response: &JsonValue) -> Result<(), String> {
+fn write_response(output: &mut impl Write, response: &JsonValue) -> Result<(), Error> {
     let line = serde_json::to_string(response)
         .map_err(|error| format!("Cannot serialize response: {error}"))?;
     writeln!(output, "{line}").map_err(|error| format!("Cannot write response: {error}"))?;
     output
         .flush()
-        .map_err(|error| format!("Cannot flush response: {error}"))
+        .map_err(|error| Error::message(format!("Cannot flush response: {error}")))
 }
 
 fn error_response(code: &str, error: impl Into<String>) -> JsonValue {

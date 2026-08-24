@@ -239,7 +239,8 @@ Type `exit` or `quit` (case-insensitive) to leave the REPL.
 | `LEAST`                       | 2+        | Smallest value among arguments                                                        |
 | `NOW` / `CURRENT_TIMESTAMP` | 0         | Current local date and time                                                           |
 | `DATE`                        | 0 or 1    | Current date, or the date part of a value                                             |
-| `IFNULL` / `ISNULL`         | 2         | First value if not`NULL`, otherwise the second                                      |
+| `IFNULL`                     | 2         | First value if not`NULL`, otherwise the second                                      |
+| `ISNULL`                     | 1         | Whether the argument is`NULL`                                                      |
 | `COALESCE`                    | 2+        | First non-`NULL` value                                                              |
 
 JSON values in CSV and spreadsheet cells are read as text by default. These

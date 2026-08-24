@@ -6,6 +6,7 @@ mod arguments;
 mod completion;
 mod database;
 mod engine;
+mod error;
 mod evaluator;
 mod functions;
 mod highlight;
@@ -18,6 +19,7 @@ mod value;
 
 use arguments::{Command, parse_arguments};
 use database::Schema;
+use error::Error;
 use printer::{OutputFormat, render};
 
 fn main() {
@@ -29,31 +31,19 @@ fn main() {
             }
         }
         Command::QueryMode(query, arguments) => {
-            if let Err(error) = validate_files(&arguments.files, arguments.max_file_bytes) {
-                fail(3, error);
-            }
-
-            let csv_options = csv_options(&arguments);
-            let mut schema =
-                match loader::load_schema(&arguments.files, arguments.max_rows, &csv_options) {
-                    Ok(schema) => schema,
-                    Err(error) => fail(3, error),
-                };
+            let mut schema = match load_files(&arguments) {
+                Ok(schema) => schema,
+                Err(error) => fail(3, error),
+            };
             if let Err(error) = execute_query(&query, &arguments, &mut schema) {
                 fail(4, error);
             }
         }
         Command::ServerMode(arguments) => {
-            if let Err(error) = validate_files(&arguments.files, arguments.max_file_bytes) {
-                fail(3, error);
-            }
-
-            let csv_options = csv_options(&arguments);
-            let mut schema =
-                match loader::load_schema(&arguments.files, arguments.max_rows, &csv_options) {
-                    Ok(schema) => schema,
-                    Err(error) => fail(3, error),
-                };
+            let mut schema = match load_files(&arguments) {
+                Ok(schema) => schema,
+                Err(error) => fail(3, error),
+            };
             if let Err(error) = server::run(&mut schema, arguments.export_root.as_deref()) {
                 fail(1, error);
             }
@@ -64,21 +54,22 @@ fn main() {
     }
 }
 
-fn fail(code: i32, error: String) -> ! {
+fn fail(code: i32, error: impl std::fmt::Display) -> ! {
     eprintln!("{error}");
     std::process::exit(code);
 }
 
-fn validate_files(files: &[String], max_file_bytes: Option<u64>) -> Result<(), String> {
+fn validate_files(files: &[String], max_file_bytes: Option<u64>) -> Result<(), Error> {
     for file in files {
         if !Path::new(file).exists() {
-            return Err(format!("File `{file}` does not exist"));
+            return Err(format!("File `{file}` does not exist").into());
         }
 
         if !loader::is_supported_file(file) {
             return Err(format!(
                 "Unsupported file format for `{file}`, expected one of: xls, xlsx, xlsm, csv"
-            ));
+            )
+            .into());
         }
 
         if let Some(max_file_bytes) = max_file_bytes {
@@ -88,7 +79,8 @@ fn validate_files(files: &[String], max_file_bytes: Option<u64>) -> Result<(), S
             if size > max_file_bytes {
                 return Err(format!(
                     "File `{file}` is {size} bytes, exceeding the maximum of {max_file_bytes} bytes"
-                ));
+                )
+                .into());
             }
         }
     }
@@ -99,7 +91,7 @@ fn execute_query(
     query: &str,
     arguments: &arguments::Arguments,
     schema: &mut Schema,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let start = Instant::now();
     match engine::run_query(schema, query) {
         Ok(result) => {
@@ -158,7 +150,7 @@ fn save_result(
     arguments: &arguments::Arguments,
     columns: &[String],
     rows: &[Vec<value::Value>],
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if let Some(path) = &arguments.output_file {
         let content = render(OutputFormat::Csv, columns, rows);
         std::fs::write(path, content)
@@ -170,16 +162,21 @@ fn save_result(
     Ok(())
 }
 
-fn launch_repl(arguments: arguments::Arguments) -> Result<(), String> {
-    validate_files(&arguments.files, arguments.max_file_bytes)?;
-    let csv_options = csv_options(&arguments);
-    let mut schema = loader::load_schema(&arguments.files, arguments.max_rows, &csv_options)?;
+fn launch_repl(arguments: arguments::Arguments) -> Result<(), Error> {
+    let mut schema = load_files(&arguments)?;
 
     if io::stdin().is_terminal() {
-        ui::run(&mut schema).map_err(|error| error.to_string())
+        ui::run(&mut schema).map_err(|error| error.to_string().into())
     } else {
         run_piped_queries(&mut schema)
     }
+}
+
+/// Validate and load the input files into a schema.
+fn load_files(arguments: &arguments::Arguments) -> Result<Schema, Error> {
+    validate_files(&arguments.files, arguments.max_file_bytes)?;
+    let csv_options = csv_options(arguments);
+    loader::load_schema(&arguments.files, arguments.max_rows, &csv_options)
 }
 
 fn csv_options(arguments: &arguments::Arguments) -> loader::CsvOptions {
@@ -191,7 +188,7 @@ fn csv_options(arguments: &arguments::Arguments) -> loader::CsvOptions {
 }
 
 /// Execute one SQL statement per stdin line without enabling terminal raw mode.
-fn run_piped_queries(schema: &mut Schema) -> Result<(), String> {
+fn run_piped_queries(schema: &mut Schema) -> Result<(), Error> {
     for line in io::stdin().lock().lines() {
         let query = line.map_err(|error| format!("Cannot read query: {error}"))?;
         let query = query.trim();
@@ -225,5 +222,28 @@ mod tests {
             "got: {error}"
         );
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn load_files_builds_schema_and_selects_single_database() {
+        let path =
+            std::env::temp_dir().join(format!("sheetql_load_files_{}.csv", std::process::id()));
+        std::fs::write(&path, "name,age\nAlice,30\nBob,25\n").unwrap();
+        let mut arguments = arguments::Arguments::new();
+        arguments.files = vec![path.to_string_lossy().into_owned()];
+
+        let schema = load_files(&arguments).unwrap();
+        assert_eq!(schema.database_names().len(), 1);
+        let name = schema.database_names()[0];
+        assert_eq!(schema.current_database(), Some(name));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn load_files_rejects_missing_files() {
+        let mut arguments = arguments::Arguments::new();
+        arguments.files = vec!["nope_does_not_exist.csv".to_string()];
+        let error = load_files(&arguments).unwrap_err();
+        assert!(error.contains("does not exist"), "got: {error}");
     }
 }

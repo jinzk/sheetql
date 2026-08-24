@@ -10,6 +10,7 @@ use sqlparser::ast::{
 };
 
 use crate::database::Schema;
+use crate::error::Error;
 use crate::evaluator::EvalContext;
 use crate::evaluator::eval_expr;
 use crate::functions::contains_aggregate;
@@ -22,32 +23,37 @@ use crate::value::values_partial_cmp;
 pub(crate) fn execute_query<'a>(
     schema: &'a Schema,
     query: &Query,
-) -> Result<crate::engine::QueryResult, String> {
+) -> Result<crate::engine::QueryResult, Error> {
     let now = Local::now();
     let select: &Select = match &*query.body {
         SetExpr::Select(select) => select,
-        _ => return Err("Only plain SELECT queries are supported".to_string()),
+        _ => return Err("Only plain SELECT queries are supported".to_string().into()),
     };
 
     let has_from = !select.from.is_empty();
 
     let mut schema_refs: Vec<ColumnRef> = vec![];
-    // A single table without joins is borrowed straight from the schema; any
-    // join or multi-table FROM materializes a combined owned copy.
+    // A single plain table is borrowed straight from the schema (zero-copy);
+    // any join or multi-table FROM materializes an owned copy.
     let mut rows: Cow<'a, [Vec<Value>]> = Cow::Owned(vec![]);
 
     for (index, table_with_joins) in select.from.iter().enumerate() {
         let base = load_relation(schema, &table_with_joins.relation)?;
-        if index == 0 && table_with_joins.joins.is_empty() {
-            schema_refs = base.schema;
-            rows = Cow::Borrowed(base.rows);
+
+        if table_with_joins.joins.is_empty() {
+            if index == 0 {
+                schema_refs = base.schema;
+                rows = Cow::Borrowed(base.rows);
+            } else {
+                schema_refs.extend(base.schema.clone());
+                rows = Cow::Owned(cross_combine(&rows, base.rows));
+            }
             continue;
         }
 
-        let mut current: Vec<Vec<Value>> = match rows {
-            Cow::Borrowed(borrowed) => borrowed.to_vec(),
-            Cow::Owned(owned) => owned,
-        };
+        // This relation carries joins, so the accumulated rows are materialized
+        // and each join is folded in.
+        let mut current = rows.into_owned();
         if index == 0 {
             schema_refs = base.schema;
             current = base.rows.to_vec();
@@ -162,7 +168,7 @@ pub(crate) fn execute_query<'a>(
     if let Some(order) = &query.order_by {
         let exprs = match &order.kind {
             OrderByKind::Expressions(exprs) => exprs,
-            OrderByKind::All(_) => return Err("ORDER BY ALL is not supported".to_string()),
+            OrderByKind::All(_) => return Err("ORDER BY ALL is not supported".to_string().into()),
         };
         keyed.sort_by(|a, b| compare_keys(&a.0, &b.0, exprs));
     }
@@ -217,24 +223,24 @@ fn order_by_has_aggregate(query: &Query) -> bool {
     })
 }
 
-fn group_by_expressions(group_by: &GroupByExpr) -> Result<Vec<&Expr>, String> {
+fn group_by_expressions(group_by: &GroupByExpr) -> Result<Vec<&Expr>, Error> {
     match group_by {
         GroupByExpr::Expressions(exprs, _) => Ok(exprs.iter().collect()),
-        GroupByExpr::All(_) => Err("GROUP BY ALL is not supported".to_string()),
+        GroupByExpr::All(_) => Err("GROUP BY ALL is not supported".to_string().into()),
     }
 }
 
-fn is_distinct(select: &Select) -> Result<bool, String> {
+fn is_distinct(select: &Select) -> Result<bool, Error> {
     match &select.distinct {
         Some(Distinct::Distinct) => Ok(true),
-        Some(Distinct::On(_)) => Err("DISTINCT ON is not supported".to_string()),
+        Some(Distinct::On(_)) => Err("DISTINCT ON is not supported".to_string().into()),
         Some(Distinct::All) | None => Ok(false),
     }
 }
 
 fn parse_limit(
     limit_clause: &Option<LimitClause>,
-) -> Result<(Option<usize>, Option<usize>), String> {
+) -> Result<(Option<usize>, Option<usize>), Error> {
     match limit_clause {
         None => Ok((None, None)),
         Some(LimitClause::LimitOffset { limit, offset, .. }) => {
@@ -256,7 +262,7 @@ fn parse_limit(
     }
 }
 
-fn eval_const_int(expr: &Expr) -> Result<Option<usize>, String> {
+fn eval_const_int(expr: &Expr) -> Result<Option<usize>, Error> {
     let value = eval_expr(&EvalContext::scalar(), expr, &[])?;
     match value {
         Value::Int(number) => Ok(Some(number.max(0) as usize)),
@@ -291,7 +297,7 @@ fn compute_order_keys(
     query: &Query,
     ctx: &EvalContext,
     row: &[Value],
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, Error> {
     let mut keys = vec![];
     if let Some(order) = &query.order_by
         && let OrderByKind::Expressions(exprs) = &order.kind
@@ -329,7 +335,7 @@ fn build_groups(
     group_exprs: &[&Expr],
     active: &[usize],
     now: chrono::DateTime<Local>,
-) -> Result<Vec<Vec<usize>>, String> {
+) -> Result<Vec<Vec<usize>>, Error> {
     if group_exprs.is_empty() {
         return Ok(vec![active.to_vec()]);
     }
@@ -368,7 +374,7 @@ enum ProjectionItem {
 fn build_projection_plan(
     schema: &[ColumnRef],
     projection: &[SelectItem],
-) -> Result<Vec<ProjectionItem>, String> {
+) -> Result<Vec<ProjectionItem>, Error> {
     let mut plan: Vec<ProjectionItem> = vec![];
     for item in projection {
         match item {
@@ -385,7 +391,7 @@ fn build_projection_plan(
                     sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
                         object_name_to_parts(name).join(".")
                     }
-                    _ => return Err("Unsupported qualified wildcard".to_string()),
+                    _ => return Err("Unsupported qualified wildcard".to_string().into()),
                 };
                 let mut matched = false;
                 for (index, column) in schema.iter().enumerate() {
@@ -398,7 +404,7 @@ fn build_projection_plan(
                     }
                 }
                 if !matched {
-                    return Err(format!("Table `{qualifier}` not found"));
+                    return Err(format!("Table `{qualifier}` not found").into());
                 }
             }
             SelectItem::UnnamedExpr(expr) => plan.push(ProjectionItem::Expression {
@@ -410,18 +416,14 @@ fn build_projection_plan(
                 title: alias.to_string(),
             }),
             SelectItem::ExprWithAliases { .. } => {
-                return Err("Multiple aliases are not supported".to_string());
+                return Err("Multiple aliases are not supported".to_string().into());
             }
         }
     }
     Ok(plan)
 }
 
-fn project(
-    ctx: &EvalContext,
-    plan: &[ProjectionItem],
-    row: &[Value],
-) -> Result<Vec<Value>, String> {
+fn project(ctx: &EvalContext, plan: &[ProjectionItem], row: &[Value]) -> Result<Vec<Value>, Error> {
     let mut out: Vec<Value> = Vec::with_capacity(plan.len());
     for item in plan {
         match item {
@@ -468,14 +470,18 @@ fn expr_title(expr: &Expr) -> String {
     }
 }
 
-fn load_relation<'a>(schema: &'a Schema, factor: &TableFactor) -> Result<Relation<'a>, String> {
+fn load_relation<'a>(schema: &'a Schema, factor: &TableFactor) -> Result<Relation<'a>, Error> {
     match factor {
         TableFactor::Table { name, alias, .. } => {
             let parts = object_name_to_parts(name);
             let (database, table_name) = match parts.as_slice() {
                 [table_name] => (None, table_name.as_str()),
                 [database, table_name] => (Some(database.as_str()), table_name.as_str()),
-                _ => return Err("Table reference must be `table` or `database.table`".to_string()),
+                _ => {
+                    return Err("Table reference must be `table` or `database.table`"
+                        .to_string()
+                        .into());
+                }
             };
             let (_, table) = schema.resolve_table(database, table_name)?;
             let table_name = table.name.clone();
@@ -497,7 +503,9 @@ fn load_relation<'a>(schema: &'a Schema, factor: &TableFactor) -> Result<Relatio
                 rows: &table.rows,
             })
         }
-        _ => Err("Only plain table references are supported in FROM".to_string()),
+        _ => Err("Only plain table references are supported in FROM"
+            .to_string()
+            .into()),
     }
 }
 
@@ -519,7 +527,7 @@ fn apply_join(
     right: &Relation<'_>,
     operator: &JoinOperator,
     now: chrono::DateTime<Local>,
-) -> Result<(Vec<ColumnRef>, Vec<Vec<Value>>), String> {
+) -> Result<(Vec<ColumnRef>, Vec<Vec<Value>>), Error> {
     let mut schema = left_schema.to_vec();
     schema.extend(right.schema.clone());
     let left_len = left_schema.len();
@@ -740,7 +748,7 @@ fn using_column_pairs(
     operator: &JoinOperator,
     left_schema: &[ColumnRef],
     right_schema: &[ColumnRef],
-) -> Result<Option<Vec<(usize, usize)>>, String> {
+) -> Result<Option<Vec<(usize, usize)>>, Error> {
     let columns = match operator {
         JoinOperator::Join(JoinConstraint::Using(cols))
         | JoinOperator::Inner(JoinConstraint::Using(cols))
@@ -778,7 +786,7 @@ fn join_keep(
     lookup: &HashMap<String, usize>,
     now: chrono::DateTime<Local>,
     combined: &[Value],
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     let constraint = match operator {
         JoinOperator::Join(constraint)
         | JoinOperator::Inner(constraint)
@@ -788,7 +796,7 @@ fn join_keep(
         | JoinOperator::RightOuter(constraint)
         | JoinOperator::FullOuter(constraint)
         | JoinOperator::CrossJoin(constraint) => constraint,
-        _ => return Err("Unsupported join type".to_string()),
+        _ => return Err("Unsupported join type".to_string().into()),
     };
 
     match constraint {
@@ -801,11 +809,11 @@ fn join_keep(
             unreachable!("USING joins are handled by column pairs")
         }
         JoinConstraint::None => Ok(true),
-        JoinConstraint::Natural => Err("NATURAL JOIN is not supported".to_string()),
+        JoinConstraint::Natural => Err("NATURAL JOIN is not supported".to_string().into()),
     }
 }
 
-fn build_lookup(schema: &[ColumnRef]) -> Result<HashMap<String, usize>, String> {
+fn build_lookup(schema: &[ColumnRef]) -> Result<HashMap<String, usize>, Error> {
     let mut map: HashMap<String, Vec<usize>> = HashMap::new();
 
     for (index, column) in schema.iter().enumerate() {

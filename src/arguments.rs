@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::error::Error;
 use crate::printer::OutputFormat;
 
 #[derive(Debug, PartialEq)]
@@ -20,7 +21,7 @@ pub struct Arguments {
 }
 
 impl Arguments {
-    fn new() -> Arguments {
+    pub(crate) fn new() -> Arguments {
         Arguments {
             files: vec![],
             analysis: false,
@@ -95,7 +96,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
             }
             "--query" | "-q" => match take_value(args, &mut arg_index, arg, "the query") {
                 Ok(value) => optional_query = Some(value.to_string()),
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             "--analysis" | "-a" => {
                 arguments.analysis = true;
@@ -115,16 +116,13 @@ pub fn parse_arguments(args: &[String]) -> Command {
                     }
                     Err(_) => return Command::Error("Invalid page size".to_string()),
                 },
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             "--output" | "-o" => match take_value(args, &mut arg_index, arg, "the output format") {
                 Ok(output) => {
-                    arguments.output_format = match output.to_lowercase().as_str() {
-                        "csv" => OutputFormat::Csv,
-                        "json" => OutputFormat::Json,
-                        "yaml" => OutputFormat::Yaml,
-                        "render" | "table" => OutputFormat::Table,
-                        _ => {
+                    arguments.output_format = match OutputFormat::from_str(output) {
+                        Some(format) => format,
+                        None => {
                             return Command::Error(
                                 "Invalid output format, expected one of: render, json, csv, yaml"
                                     .to_string(),
@@ -132,11 +130,11 @@ pub fn parse_arguments(args: &[String]) -> Command {
                         }
                     };
                 }
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             "--save" | "-s" => match take_value(args, &mut arg_index, arg, "an output file path") {
                 Ok(path) => arguments.output_file = Some(path.to_string()),
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             "--server" | "-S" => {
                 arguments.server = true;
@@ -144,7 +142,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
             }
             "--export-root" => match take_value(args, &mut arg_index, arg, "an export directory") {
                 Ok(path) => arguments.export_root = Some(path.to_string()),
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             "--max-rows" => match take_value(args, &mut arg_index, arg, "the maximum rows") {
                 Ok(max_rows) => match max_rows.parse::<usize>() {
@@ -156,7 +154,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
                     }
                     Err(_) => return Command::Error("Invalid maximum rows".to_string()),
                 },
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             "--max-file-bytes" => {
                 match take_value(args, &mut arg_index, arg, "the maximum file size") {
@@ -171,7 +169,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
                         }
                         Err(_) => return Command::Error("Invalid maximum file size".to_string()),
                     },
-                    Err(message) => return Command::Error(message),
+                    Err(message) => return Command::Error(message.to_string()),
                 }
             }
             "--delimiter" => match take_value(args, &mut arg_index, arg, "the CSV delimiter") {
@@ -187,7 +185,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
                     }
                     arguments.csv_delimiter = delimiter as u8;
                 }
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             "--no-header" => {
                 arguments.csv_no_header = true;
@@ -195,7 +193,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
             }
             "--null-value" => match take_value(args, &mut arg_index, arg, "the CSV NULL value") {
                 Ok(value) => arguments.csv_null_value = Some(value.to_string()),
-                Err(message) => return Command::Error(message),
+                Err(message) => return Command::Error(message.to_string()),
             },
             _ => return Command::Error(format!("Unknown argument {arg}")),
         }
@@ -203,7 +201,7 @@ pub fn parse_arguments(args: &[String]) -> Command {
 
     match expand_file_patterns(&arguments.files) {
         Ok(files) => arguments.files = files,
-        Err(error) => return Command::Error(error),
+        Err(error) => return Command::Error(error.to_string()),
     }
 
     if arguments.files.is_empty() {
@@ -242,17 +240,17 @@ fn take_value<'a>(
     arg_index: &mut usize,
     arg: &str,
     what: &str,
-) -> Result<&'a str, String> {
+) -> Result<&'a str, Error> {
     *arg_index += 1;
     if *arg_index >= args.len() {
-        return Err(format!("Argument {arg} must be followed by {what}"));
+        return Err(format!("Argument {arg} must be followed by {what}").into());
     }
     let value = args[*arg_index].as_str();
     *arg_index += 1;
     Ok(value)
 }
 
-fn expand_file_patterns(files: &[String]) -> Result<Vec<String>, String> {
+fn expand_file_patterns(files: &[String]) -> Result<Vec<String>, Error> {
     let mut expanded = Vec::new();
     let mut seen = HashSet::new();
 
@@ -278,7 +276,7 @@ fn expand_file_patterns(files: &[String]) -> Result<Vec<String>, String> {
         }
 
         if !matched {
-            return Err(format!("File pattern `{file}` matched no files"));
+            return Err(format!("File pattern `{file}` matched no files").into());
         }
     }
 

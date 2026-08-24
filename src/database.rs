@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::error::Error;
 use crate::value::Value;
 
 #[derive(Debug, Clone)]
@@ -93,9 +94,9 @@ impl Schema {
         self.databases.iter().map(|db| db.name.as_str()).collect()
     }
 
-    pub fn set_current_database(&mut self, name: &str) -> Result<(), String> {
+    pub fn set_current_database(&mut self, name: &str) -> Result<(), Error> {
         if self.get_database(name).is_none() {
-            return Err(format!("Unknown database `{name}`"));
+            return Err(format!("Unknown database `{name}`").into());
         }
         self.current = Some(name.to_string());
         Ok(())
@@ -116,7 +117,7 @@ impl Schema {
         &self,
         database: Option<&str>,
         table: &str,
-    ) -> Result<(&Database, &Table), String> {
+    ) -> Result<(&Database, &Table), Error> {
         match database {
             Some(name) => {
                 let database = self
@@ -141,14 +142,15 @@ impl Schema {
                     }
                 }
                 match found.len() {
-                    0 => Err(format!("Table `{table}` not found")),
+                    0 => Err(format!("Table `{table}` not found").into()),
                     1 => {
                         let database = found[0];
                         Ok((database, database.get_table(table).expect("just found")))
                     }
                     _ => Err(format!(
                         "Table `{table}` is ambiguous, qualify it as `database.table`"
-                    )),
+                    )
+                    .into()),
                 }
             }
         }

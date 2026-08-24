@@ -2,11 +2,12 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Local};
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, DataType as SqlDataType, Expr, TrimWhereField, UnaryOperator,
-    Value as SqlValue, ValueWithSpan,
+    BinaryOperator, CaseWhen, CeilFloorKind, DataType as SqlDataType, DateTimeField, Expr,
+    TrimWhereField, UnaryOperator, Value as SqlValue, ValueWithSpan,
 };
 
-use crate::functions::eval_function;
+use crate::error::Error;
+use crate::functions::{eval_function, floor_ceil};
 use crate::value::Value;
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
@@ -47,7 +48,7 @@ impl<'a> EvalContext<'a> {
     }
 }
 
-pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Value, String> {
+pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Value, Error> {
     match expr {
         Expr::Value(ValueWithSpan { value, .. }) => eval_sql_value(value),
         Expr::Identifier(ident) => resolve_column(ctx, &ident.value, current),
@@ -55,7 +56,7 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
             let mut name_parts: Vec<String> =
                 parts.iter().map(|p| p.value.to_lowercase()).collect();
             if name_parts.len() < 2 {
-                return Err("Invalid compound identifier".to_string());
+                return Err("Invalid compound identifier".to_string().into());
             }
             let column = name_parts.pop().unwrap();
             let qualifier = name_parts.join(".");
@@ -97,44 +98,14 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
             pattern,
             escape_char,
             ..
-        } => {
-            let value = eval_expr(ctx, expr, current)?;
-            let pattern = eval_expr(ctx, pattern, current)?;
-            if value.is_null() || pattern.is_null() {
-                return Ok(Value::Null);
-            }
-            let escape = match escape_char {
-                Some(v) => match eval_sql_value(&v.value) {
-                    Ok(Value::Text(s)) => s.chars().next(),
-                    _ => None,
-                },
-                None => None,
-            };
-            let matched = like_values(&value, &pattern, false, escape)?;
-            Ok(Value::Bool(if *negated { !matched } else { matched }))
-        }
+        } => eval_like(ctx, *negated, expr, pattern, escape_char, false, current),
         Expr::ILike {
             negated,
             expr,
             pattern,
             escape_char,
             ..
-        } => {
-            let value = eval_expr(ctx, expr, current)?;
-            let pattern = eval_expr(ctx, pattern, current)?;
-            if value.is_null() || pattern.is_null() {
-                return Ok(Value::Null);
-            }
-            let escape = match escape_char {
-                Some(v) => match eval_sql_value(&v.value) {
-                    Ok(Value::Text(s)) => s.chars().next(),
-                    _ => None,
-                },
-                None => None,
-            };
-            let matched = like_values(&value, &pattern, true, escape)?;
-            Ok(Value::Bool(if *negated { !matched } else { matched }))
-        }
+        } => eval_like(ctx, *negated, expr, pattern, escape_char, true, current),
         Expr::Case {
             operand,
             conditions,
@@ -148,6 +119,8 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
             cast_value(value, data_type)
         }
         Expr::Function(func) => eval_function(ctx, func, current),
+        Expr::Floor { expr, field } => eval_floor_ceil(ctx, "floor", expr, field, current),
+        Expr::Ceil { expr, field } => eval_floor_ceil(ctx, "ceil", expr, field, current),
         Expr::Substring {
             expr,
             substring_from,
@@ -201,9 +174,9 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
             Ok(Value::Text(trim_string(&value, side, what.as_deref())))
         }
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-            Err("Subqueries are not supported".to_string())
+            Err("Subqueries are not supported".to_string().into())
         }
-        other => Err(format!("Unsupported expression: {}", expr_display(other))),
+        other => Err(format!("Unsupported expression: {}", expr_display(other)).into()),
     }
 }
 
@@ -211,7 +184,58 @@ fn expr_display(expr: &Expr) -> String {
     expr.to_string()
 }
 
-fn eval_sql_value(value: &SqlValue) -> Result<Value, String> {
+/// Evaluate the `Expr::Floor`/`Expr::Ceil` AST nodes that sqlparser produces
+/// for `FLOOR(...)` and `CEIL(...)`. Only the plain single-argument form is
+/// supported; the `TO <field>` and scale forms are rejected.
+fn eval_floor_ceil(
+    ctx: &EvalContext,
+    name: &str,
+    expr: &Expr,
+    field: &CeilFloorKind,
+    current: &[Value],
+) -> Result<Value, Error> {
+    match field {
+        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) => {
+            let value = eval_expr(ctx, expr, current)?;
+            floor_ceil(name, &value)
+        }
+        CeilFloorKind::DateTimeField(_) => {
+            Err(format!("{} ... TO is not supported", name.to_uppercase()).into())
+        }
+        CeilFloorKind::Scale(_) => {
+            Err(format!("{} with a scale is not supported", name.to_uppercase()).into())
+        }
+    }
+}
+
+/// Evaluate a `LIKE`/`ILIKE` expression. The two operators differ only in
+/// case sensitivity, so they share a single implementation.
+fn eval_like(
+    ctx: &EvalContext,
+    negated: bool,
+    expr: &Expr,
+    pattern: &Expr,
+    escape_char: &Option<ValueWithSpan>,
+    case_insensitive: bool,
+    current: &[Value],
+) -> Result<Value, Error> {
+    let value = eval_expr(ctx, expr, current)?;
+    let pattern = eval_expr(ctx, pattern, current)?;
+    if value.is_null() || pattern.is_null() {
+        return Ok(Value::Null);
+    }
+    let escape = match escape_char {
+        Some(v) => match eval_sql_value(&v.value) {
+            Ok(Value::Text(s)) => s.chars().next(),
+            _ => None,
+        },
+        None => None,
+    };
+    let matched = like_values(&value, &pattern, case_insensitive, escape)?;
+    Ok(Value::Bool(if negated { !matched } else { matched }))
+}
+
+fn eval_sql_value(value: &SqlValue) -> Result<Value, Error> {
     match value {
         SqlValue::Number(number, _) => {
             if let Ok(parsed) = number.parse::<i64>() {
@@ -219,37 +243,37 @@ fn eval_sql_value(value: &SqlValue) -> Result<Value, String> {
             } else if let Ok(parsed) = number.parse::<f64>() {
                 Ok(Value::Float(parsed))
             } else {
-                Err(format!("Invalid number literal `{number}`"))
+                Err(format!("Invalid number literal `{number}`").into())
             }
         }
         SqlValue::SingleQuotedString(s) => Ok(Value::Text(s.clone())),
         SqlValue::DoubleQuotedString(s) => Ok(Value::Text(s.clone())),
         SqlValue::Boolean(value) => Ok(Value::Bool(*value)),
         SqlValue::Null => Ok(Value::Null),
-        other => Err(format!("Unsupported literal: {other}")),
+        other => Err(format!("Unsupported literal: {other}").into()),
     }
 }
 
-fn resolve_column(ctx: &EvalContext, name: &str, current: &[Value]) -> Result<Value, String> {
+fn resolve_column(ctx: &EvalContext, name: &str, current: &[Value]) -> Result<Value, Error> {
     if let Some(index) = ctx.columns.get(name) {
         if *index == usize::MAX {
-            return Err(format!(
-                "Column `{name}` is ambiguous; qualify it with a table name"
-            ));
+            return Err(
+                format!("Column `{name}` is ambiguous; qualify it with a table name").into(),
+            );
         }
         return Ok(current.get(*index).cloned().unwrap_or(Value::Null));
     }
     let lowered = name.to_lowercase();
     match ctx.columns.get(&lowered) {
-        Some(index) if *index == usize::MAX => Err(format!(
-            "Column `{lowered}` is ambiguous; qualify it with a table name"
-        )),
+        Some(index) if *index == usize::MAX => {
+            Err(format!("Column `{lowered}` is ambiguous; qualify it with a table name").into())
+        }
         Some(index) => Ok(current.get(*index).cloned().unwrap_or(Value::Null)),
-        None => Err(format!("Column `{lowered}` not found")),
+        None => Err(format!("Column `{lowered}` not found").into()),
     }
 }
 
-fn eval_binary(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, String> {
+fn eval_binary(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Error> {
     match op {
         BinaryOperator::Plus
         | BinaryOperator::Minus
@@ -272,11 +296,11 @@ fn eval_binary(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Str
         | BinaryOperator::LtEq
         | BinaryOperator::Gt
         | BinaryOperator::GtEq => eval_compare(op, lhs, rhs),
-        other => Err(format!("Unsupported operator: {other}")),
+        other => Err(format!("Unsupported operator: {other}").into()),
     }
 }
 
-fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, String> {
+fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Error> {
     if lhs.is_null() || rhs.is_null() {
         return Ok(Value::Null);
     }
@@ -287,7 +311,7 @@ fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value,
                 .as_f64()
                 .ok_or_else(|| format!("Cannot divide by `{}`", rhs))?;
             if b == 0.0 {
-                return Err("Division by zero".to_string());
+                return Err("Division by zero".to_string().into());
             }
             let a = lhs
                 .as_f64()
@@ -299,7 +323,7 @@ fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value,
                 .as_i64()
                 .ok_or_else(|| format!("Cannot modulo by `{}`", rhs))?;
             if b == 0 {
-                return Err("Modulo by zero".to_string());
+                return Err("Modulo by zero".to_string().into());
             }
             let a = lhs
                 .as_i64()
@@ -337,7 +361,7 @@ fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value,
     }
 }
 
-fn eval_compare(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, String> {
+fn eval_compare(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value, Error> {
     if lhs.is_null() || rhs.is_null() {
         return Ok(Value::Null);
     }
@@ -371,7 +395,7 @@ fn eval_logic(
     op: &BinaryOperator,
     right: &Expr,
     current: &[Value],
-) -> Result<Value, String> {
+) -> Result<Value, Error> {
     let a = tri_bool(&eval_expr(ctx, left, current)?);
     let short_circuited = match op {
         BinaryOperator::And => a == Some(false),
@@ -405,19 +429,20 @@ fn tri_bool(value: &Value) -> Option<bool> {
     }
 }
 
-fn eval_unary(op: &UnaryOperator, value: Value) -> Result<Value, String> {
+fn eval_unary(op: &UnaryOperator, value: Value) -> Result<Value, Error> {
     match op {
         UnaryOperator::Plus => Ok(value),
         UnaryOperator::Minus => {
             if value.is_null() {
                 return Ok(Value::Null);
             }
-            if let Some(parsed) = value.as_i64() {
-                Ok(Value::Int(-parsed))
-            } else if let Some(parsed) = value.as_f64() {
-                Ok(Value::Float(-parsed))
-            } else {
-                Err(format!("Cannot negate `{value}`"))
+            match value {
+                Value::Int(parsed) => parsed
+                    .checked_neg()
+                    .map(Value::Int)
+                    .ok_or_else(|| format!("Integer overflow in unary `-` for `{parsed}`").into()),
+                Value::Float(parsed) => Ok(Value::Float(-parsed)),
+                other => Err(format!("Cannot negate `{other}`").into()),
             }
         }
         UnaryOperator::Not => {
@@ -426,7 +451,7 @@ fn eval_unary(op: &UnaryOperator, value: Value) -> Result<Value, String> {
             }
             Ok(Value::Bool(!value.truthy()))
         }
-        other => Err(format!("Unsupported unary operator: {other}")),
+        other => Err(format!("Unsupported unary operator: {other}").into()),
     }
 }
 
@@ -436,7 +461,7 @@ fn eval_in_list(
     list: &[Expr],
     negated: bool,
     current: &[Value],
-) -> Result<Value, String> {
+) -> Result<Value, Error> {
     let value = eval_expr(ctx, expr, current)?;
     if value.is_null() {
         return Ok(Value::Null);
@@ -468,7 +493,7 @@ fn eval_between(
     high: &Expr,
     negated: bool,
     current: &[Value],
-) -> Result<Value, String> {
+) -> Result<Value, Error> {
     let value = eval_expr(ctx, expr, current)?;
     let low = eval_expr(ctx, low, current)?;
     let high = eval_expr(ctx, high, current)?;
@@ -490,7 +515,7 @@ fn eval_case(
     conditions: &[CaseWhen],
     else_result: &Option<Box<Expr>>,
     current: &[Value],
-) -> Result<Value, String> {
+) -> Result<Value, Error> {
     let operand_value = match operand {
         Some(operand) => Some(eval_expr(ctx, operand, current)?),
         None => None,
@@ -543,7 +568,7 @@ fn like_values(
     pattern: &Value,
     case_insensitive: bool,
     escape: Option<char>,
-) -> Result<bool, String> {
+) -> Result<bool, Error> {
     if value.is_null() || pattern.is_null() {
         return Ok(false);
     }
@@ -632,7 +657,7 @@ pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Opt
     prev[n]
 }
 
-fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
+fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, Error> {
     match data_type {
         SqlDataType::Int(_)
         | SqlDataType::Integer(_)
@@ -660,7 +685,7 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
             {
                 return Ok(Value::Int(parsed));
             }
-            Err(format!("Cannot cast `{}` to integer", value))
+            Err(format!("Cannot cast `{}` to integer", value).into())
         }
         SqlDataType::Float(_)
         | SqlDataType::Real
@@ -678,7 +703,7 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
             {
                 return Ok(Value::Float(parsed));
             }
-            Err(format!("Cannot cast `{}` to float", value))
+            Err(format!("Cannot cast `{}` to float", value).into())
         }
         SqlDataType::Boolean | SqlDataType::Bool => {
             if let Some(parsed) = value.as_bool() {
@@ -693,7 +718,7 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
                     return Ok(Value::Bool(false));
                 }
             }
-            Err(format!("Cannot cast `{}` to boolean", value))
+            Err(format!("Cannot cast `{}` to boolean", value).into())
         }
         SqlDataType::Text
         | SqlDataType::String(_)
@@ -704,7 +729,7 @@ fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, String> {
         | SqlDataType::TinyText
         | SqlDataType::MediumText
         | SqlDataType::LongText => Ok(Value::Text(value.to_display_string())),
-        _ => Err(format!("Unsupported cast target type `{}`", data_type)),
+        _ => Err(format!("Unsupported cast target type `{}`", data_type).into()),
     }
 }
 
@@ -726,7 +751,7 @@ mod tests {
         eval_expr(&EvalContext::scalar(), &parse_expr(expr), &[]).expect("eval scalar")
     }
 
-    fn scalar_result(expr: &str) -> Result<Value, String> {
+    fn scalar_result(expr: &str) -> Result<Value, Error> {
         eval_expr(&EvalContext::scalar(), &parse_expr(expr), &[])
     }
 
@@ -815,6 +840,7 @@ mod tests {
     fn unary_operators() {
         assert_eq!(scalar("-5"), Value::Int(-5));
         assert_eq!(scalar("+5"), Value::Int(5));
+        assert_eq!(scalar("-3.7"), Value::Float(-3.7));
         assert_eq!(scalar("NOT TRUE"), Value::Bool(false));
     }
 

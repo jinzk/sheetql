@@ -239,7 +239,8 @@ DESCRIBE sales
 | `LEAST`                       | 2+     | 返回参数中的最小值                                               |
 | `NOW` / `CURRENT_TIMESTAMP` | 0      | 当前本地日期和时间                                               |
 | `DATE`                        | 0 或 1 | 当前日期，或提取值的日期部分                                     |
-| `IFNULL` / `ISNULL`         | 2      | 第一个值非`NULL` 时返回它，否则返回第二个                      |
+| `IFNULL`                     | 2      | 第一个值非`NULL` 时返回它，否则返回第二个                      |
+| `ISNULL`                     | 1      | 参数是否为`NULL`                                               |
 | `COALESCE`                    | 2+     | 返回第一个非`NULL` 值                                          |
 
 CSV 和电子表格中的 JSON 单元格默认按文本读取。以下函数会显式解析 JSON，

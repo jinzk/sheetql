@@ -8,6 +8,7 @@ use calamine::{Data as Cell, ExcelDateTime, Reader, Xls, Xlsx};
 use crate::database::Database;
 use crate::database::Schema;
 use crate::database::Table;
+use crate::error::Error;
 use crate::naming::csv_table_name;
 use crate::naming::database_name;
 use crate::naming::spreadsheet_table_name;
@@ -27,7 +28,7 @@ pub fn load_schema(
     files: &[String],
     max_rows: Option<usize>,
     csv_options: &CsvOptions,
-) -> Result<Schema, String> {
+) -> Result<Schema, Error> {
     let mut schema = Schema::new();
     for file in files {
         let database = load_database_with_options(file, max_rows, csv_options)?;
@@ -61,7 +62,7 @@ pub fn load_database_with_options(
     path: &str,
     max_rows: Option<usize>,
     csv_options: &CsvOptions,
-) -> Result<Database, String> {
+) -> Result<Database, Error> {
     let extension = Path::new(path)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -75,7 +76,8 @@ pub fn load_database_with_options(
         _ => {
             return Err(format!(
                 "Unsupported file format `.{extension}`, expected one of: xls, xlsx, xlsm, csv"
-            ));
+            )
+            .into());
         }
     }
     Ok(database)
@@ -86,7 +88,7 @@ fn load_spreadsheet(
     path: &str,
     extension: &str,
     max_rows: Option<usize>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let file = File::open(path).map_err(|error| format!("Cannot open file `{path}`: {error}"))?;
     let reader = BufReader::new(file);
 
@@ -106,13 +108,13 @@ fn load_workbook<R: Reader<BufReader<File>>>(
     path: &str,
     workbook: &mut R,
     max_rows: Option<usize>,
-) -> Result<(), String>
+) -> Result<(), Error>
 where
     R::Error: std::fmt::Display,
 {
     let sheet_names = workbook.sheet_names().to_vec();
     if sheet_names.is_empty() {
-        return Err(format!("Workbook `{path}` has no sheets"));
+        return Err(format!("Workbook `{path}` has no sheets").into());
     }
 
     for sheet_name in sheet_names {
@@ -159,7 +161,7 @@ fn load_csv(
     path: &str,
     max_rows: Option<usize>,
     options: &CsvOptions,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(options.delimiter)
         .has_headers(false)
@@ -203,7 +205,8 @@ fn load_csv(
                         "CSV row {line} has {} fields but the header has {} columns",
                         record.len(),
                         columns.len()
-                    ));
+                    )
+                    .into());
                 }
                 let values = build_row_values_with_null(
                     record.iter().collect(),
@@ -238,7 +241,7 @@ fn enforce_row_limit(
     sheet: &str,
     row_count: usize,
     max_rows: Option<usize>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     if let Some(max_rows) = max_rows
         && row_count > max_rows
     {
@@ -247,9 +250,7 @@ fn enforce_row_limit(
         } else {
             format!("sheet `{sheet}` in `{path}`")
         };
-        return Err(format!(
-            "Input {source} exceeds the maximum of {max_rows} data rows"
-        ));
+        return Err(format!("Input {source} exceeds the maximum of {max_rows} data rows").into());
     }
     Ok(())
 }

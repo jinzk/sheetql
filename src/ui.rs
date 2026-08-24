@@ -18,6 +18,7 @@ use ratatui::{Frame, Terminal};
 use crate::completion;
 use crate::database::Schema;
 use crate::engine;
+use crate::error::Error;
 use crate::highlight::highlight;
 use crate::printer::{OutputFormat, render};
 
@@ -26,7 +27,7 @@ type Backend = CrosstermBackend<Stdout>;
 /// A single executed query together with its rendered result.
 struct Cell {
     query: String,
-    result: Result<String, String>,
+    result: Result<String, Error>,
 }
 
 /// Interactive terminal state: history cells plus the current input line.
@@ -455,7 +456,7 @@ impl App<'_> {
                 }
                 Err(error) => {
                     lines.push(Line::from(Span::styled(
-                        error.clone(),
+                        error.to_string(),
                         Style::default().fg(Color::Red),
                     )));
                 }

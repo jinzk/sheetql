@@ -11,6 +11,20 @@ pub enum OutputFormat {
     Yaml,
 }
 
+impl OutputFormat {
+    /// Parse an output format name. `render` and `table` are synonyms, and the
+    /// input is matched case-insensitively. Returns `None` for unknown names.
+    pub fn from_str(format: &str) -> Option<OutputFormat> {
+        match format.to_lowercase().as_str() {
+            "csv" => Some(OutputFormat::Csv),
+            "json" => Some(OutputFormat::Json),
+            "yaml" => Some(OutputFormat::Yaml),
+            "render" | "table" => Some(OutputFormat::Table),
+            _ => None,
+        }
+    }
+}
+
 pub fn render(format: OutputFormat, columns: &[String], rows: &[Vec<Value>]) -> String {
     match format {
         OutputFormat::Table => render_table(columns, rows),
@@ -306,5 +320,18 @@ mod tests {
         let rows = vec![vec![Value::Text("v".to_string())]];
         let out = render(OutputFormat::Yaml, &columns, &rows);
         assert!(out.contains("k: v"), "got: {out}");
+    }
+
+    #[test]
+    fn output_format_parses_aliases_case_insensitively() {
+        assert_eq!(OutputFormat::from_str("csv"), Some(OutputFormat::Csv));
+        assert_eq!(OutputFormat::from_str("CSV"), Some(OutputFormat::Csv));
+        assert_eq!(OutputFormat::from_str("json"), Some(OutputFormat::Json));
+        assert_eq!(OutputFormat::from_str("yaml"), Some(OutputFormat::Yaml));
+        assert_eq!(OutputFormat::from_str("render"), Some(OutputFormat::Table));
+        assert_eq!(OutputFormat::from_str("table"), Some(OutputFormat::Table));
+        assert_eq!(OutputFormat::from_str("Table"), Some(OutputFormat::Table));
+        assert_eq!(OutputFormat::from_str("xml"), None);
+        assert_eq!(OutputFormat::from_str(""), None);
     }
 }

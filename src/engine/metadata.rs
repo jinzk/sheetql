@@ -1,12 +1,13 @@
 use crate::database::Schema;
 use crate::database::Table;
+use crate::error::Error;
 use crate::evaluator::like_match;
 use crate::value::Value;
 
 pub(crate) fn run_show_databases(
     schema: &Schema,
     like: Option<&str>,
-) -> Result<crate::engine::QueryResult, String> {
+) -> Result<crate::engine::QueryResult, Error> {
     let columns = vec!["Database".to_string()];
     let rows = schema
         .database_names()
@@ -24,7 +25,7 @@ pub(crate) fn run_show_databases(
 pub(crate) fn run_use(
     schema: &mut Schema,
     name: &str,
-) -> Result<crate::engine::QueryResult, String> {
+) -> Result<crate::engine::QueryResult, Error> {
     schema.set_current_database(name)?;
     Ok(crate::engine::QueryResult {
         columns: vec!["Status".to_string()],
@@ -37,7 +38,7 @@ pub(crate) fn run_show_tables(
     schema: &Schema,
     database_name: Option<&str>,
     like: Option<&str>,
-) -> Result<crate::engine::QueryResult, String> {
+) -> Result<crate::engine::QueryResult, Error> {
     let name = match database_name {
         Some(name) => name.to_string(),
         None => schema
@@ -65,18 +66,22 @@ pub(crate) fn run_show_tables(
 pub(crate) fn run_describe_table(
     schema: &Schema,
     reference: &str,
-) -> Result<crate::engine::QueryResult, String> {
+) -> Result<crate::engine::QueryResult, Error> {
     let parts: Vec<&str> = reference.split('.').collect();
     let (database, table_name) = match parts.as_slice() {
         [table_name] => (None, *table_name),
         [database, table_name] => (Some(*database), *table_name),
-        _ => return Err("Table reference must be `table` or `database.table`".to_string()),
+        _ => {
+            return Err("Table reference must be `table` or `database.table`"
+                .to_string()
+                .into());
+        }
     };
     let (_, table) = schema.resolve_table(database, table_name)?;
     describe_table(table)
 }
 
-fn describe_table(table: &Table) -> Result<crate::engine::QueryResult, String> {
+fn describe_table(table: &Table) -> Result<crate::engine::QueryResult, Error> {
     let columns = vec!["Column".to_string(), "Type".to_string()];
 
     // Scan the rows once for all columns instead of once per column.
@@ -121,53 +126,4 @@ fn describe_table(table: &Table) -> Result<crate::engine::QueryResult, String> {
         rows,
         stats: Default::default(),
     })
-}
-
-/// Split the tail of a `SHOW ... [FROM <database>] [LIKE 'pattern']` clause
-/// into an optional database name and an optional LIKE pattern.
-pub(crate) fn parse_show_clauses(rest: &str) -> Result<(Option<String>, Option<String>), String> {
-    let mut database = None;
-    let mut pattern = None;
-    let mut expecting_name = false;
-    let mut tokens = rest.split_whitespace().peekable();
-
-    while let Some(token) = tokens.next() {
-        let keyword = token.to_ascii_lowercase();
-        match keyword.as_str() {
-            "from" | "in" => {
-                expecting_name = true;
-            }
-            "like" => {
-                let value = tokens
-                    .next()
-                    .ok_or_else(|| "SHOW ... LIKE requires a pattern".to_string())?;
-                pattern = Some(unquote_pattern(value));
-                if expecting_name {
-                    return Err("SHOW ... FROM requires a database name".to_string());
-                }
-            }
-            other if expecting_name => {
-                database = Some(other.to_string());
-                expecting_name = false;
-            }
-            other => return Err(format!("Invalid SHOW syntax near `{other}`")),
-        }
-    }
-
-    if expecting_name {
-        return Err("SHOW ... FROM requires a database name".to_string());
-    }
-    Ok((database, pattern))
-}
-
-fn unquote_pattern(token: &str) -> String {
-    let bytes = token.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0] as char;
-        let last = bytes[bytes.len() - 1] as char;
-        if (first == '\'' && last == '\'') || (first == '"' && last == '"') {
-            return token[1..token.len() - 1].to_string();
-        }
-    }
-    token.to_string()
 }
