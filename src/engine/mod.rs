@@ -1,5 +1,7 @@
 mod metadata;
+mod output;
 mod select;
+mod temporary;
 
 use sqlparser::ast::{
     ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions, Statement,
@@ -10,13 +12,12 @@ use std::time::Instant;
 
 use crate::database::Schema;
 use crate::error::Error;
-use crate::printer::OutputFormat;
-use crate::printer::render;
 use crate::value::Value;
-use crate::database::Table;
 
 use crate::engine::metadata::{run_describe_table, run_show_databases, run_show_tables, run_use};
+use crate::engine::output::{strip_into_outfile, write_outfile};
 use crate::engine::select::{execute_query, object_name_to_parts};
+use crate::engine::temporary::run_create_table;
 
 #[derive(Debug, Clone, Default)]
 pub struct QueryStats {
@@ -100,34 +101,6 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
     finalize_result(result, started)
 }
 
-fn run_create_table(
-    schema: &mut Schema,
-    create: &sqlparser::ast::CreateTable,
-) -> Result<QueryResult, Error> {
-    if !create.temporary {
-        return Err("Only CREATE TEMPORARY TABLE ... AS SELECT is supported".into());
-    }
-    let name = object_name_to_parts(&create.name);
-    let table_name = match name.as_slice() {
-        [name] => name.clone(),
-        _ => return Err("Temporary table name must be unqualified".into()),
-    };
-    if !create.columns.is_empty() || create.query.is_none() {
-        return Err("Temporary tables require `AS SELECT ...` and no column definitions".into());
-    }
-    let result = execute_query(schema, create.query.as_ref().expect("checked"))?;
-    schema.add_temporary_table(Table {
-        name: table_name.clone(),
-        columns: result.columns,
-        rows: result.rows,
-    });
-    Ok(QueryResult {
-        columns: vec!["Status".to_string()],
-        rows: vec![vec![Value::Text(format!("Temporary table `{table_name}` created"))]],
-        stats: Default::default(),
-    })
-}
-
 /// Extract the `LIKE 'pattern'` filter from a SHOW statement's options. Only
 /// LIKE filters are supported; WHERE/ILIKE filters are rejected.
 fn show_like_pattern(show_options: &ShowStatementOptions) -> Result<Option<String>, Error> {
@@ -176,113 +149,6 @@ fn finalize_result(
         result.stats.output_rows = result.rows.len();
         result
     })
-}
-
-/// Split a trailing `INTO OUTFILE 'path'` clause (case-insensitive) off a SQL
-/// statement. `sqlparser` does not parse MySQL's `INTO OUTFILE` syntax, so we
-/// detect and remove it before handing the rest to the parser, and surface the
-/// path so the caller can write the result set to that file.
-fn strip_into_outfile(sql: &str) -> (String, Option<String>) {
-    let marker = "INTO OUTFILE";
-    let Some(pos) = find_outfile_pos(sql, marker) else {
-        return (sql.to_string(), None);
-    };
-
-    let tail = &sql[pos + marker.len()..];
-    let mut iter = tail.char_indices().peekable();
-    while let Some(&(_, c)) = iter.peek() {
-        if c.is_whitespace() {
-            iter.next();
-        } else {
-            break;
-        }
-    }
-
-    let quote = match iter.peek() {
-        Some(&(_, '\'')) => '\'',
-        Some(&(_, '"')) => '"',
-        _ => return (sql.to_string(), None),
-    };
-    iter.next();
-
-    let mut path = String::new();
-    let mut end_byte = 0;
-    let mut closed = false;
-    while let Some((byte, c)) = iter.next() {
-        if c == quote {
-            if let Some(&(_, next)) = iter.peek()
-                && next == quote
-            {
-                path.push(quote);
-                iter.next();
-                continue;
-            }
-            end_byte = byte + c.len_utf8();
-            closed = true;
-            break;
-        }
-        path.push(c);
-    }
-    if !closed {
-        return (sql.to_string(), None);
-    }
-
-    let mut rest = String::with_capacity(pos + tail.len() - end_byte);
-    rest.push_str(sql[..pos].trim_end());
-    rest.push_str(tail[end_byte..].trim_start());
-    (rest.trim().to_string(), Some(path))
-}
-
-/// Find the byte position of `marker` outside string literals and line
-/// comments, so a stray `INTO OUTFILE` inside a quoted string is ignored.
-fn find_outfile_pos(sql: &str, marker: &str) -> Option<usize> {
-    let upper = sql.to_ascii_uppercase();
-    let mut iter = sql.char_indices().peekable();
-    while let Some((i, c)) = iter.next() {
-        match c {
-            '\'' | '"' | '`' => {
-                let quote = c;
-                while let Some((_, next)) = iter.next() {
-                    if next == quote {
-                        if let Some(&(_, peeked)) = iter.peek()
-                            && peeked == quote
-                        {
-                            iter.next();
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            '-' if iter.peek().is_some_and(|&(_, next)| next == '-') => {
-                for (_, ch) in iter.by_ref() {
-                    if ch == '\n' {
-                        break;
-                    }
-                }
-            }
-            _ => {
-                if upper[i..].starts_with(marker) {
-                    let prev = sql[..i].chars().next_back();
-                    if !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') {
-                        return Some(i);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Write a query result to a file as CSV (with header). Refuses to overwrite an
-/// existing file to avoid clobbering a data source.
-fn write_outfile(path: &str, result: &QueryResult) -> Result<(), Error> {
-    if std::path::Path::new(path).exists() {
-        return Err(format!("Output file `{path}` already exists").into());
-    }
-    let content = render(OutputFormat::Csv, &result.columns, &result.rows);
-    std::fs::write(path, content).map_err(|error| format!("Cannot write to `{path}`: {error}"))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -396,7 +262,10 @@ mod tests {
     #[test]
     fn temporary_table_keeps_select_result_for_following_queries() {
         let mut schema = make_schema();
-        let created = run(&mut schema, "CREATE TEMPORARY TABLE adults AS SELECT name, age FROM people WHERE age >= 30");
+        let created = run(
+            &mut schema,
+            "CREATE TEMPORARY TABLE adults AS SELECT name, age FROM people WHERE age >= 30",
+        );
         assert_eq!(created.rows.len(), 1);
 
         let result = run(
@@ -404,6 +273,46 @@ mod tests {
             "SELECT COUNT(*) AS count FROM adults WHERE age < 40",
         );
         assert_eq!(result.rows, vec![vec![Value::Int(2)]]);
+    }
+
+    #[test]
+    fn temporary_table_is_visible_to_metadata_and_can_be_replaced() {
+        let mut schema = make_schema();
+        run(
+            &mut schema,
+            "CREATE TEMP TABLE selected AS SELECT name FROM people WHERE city = 'NY'",
+        );
+        let tables = run(&mut schema, "SHOW TABLES");
+        assert!(tables.rows.contains(&vec![Value::Text("selected".into())]));
+
+        run(
+            &mut schema,
+            "CREATE TEMPORARY TABLE selected AS SELECT city FROM people WHERE city = 'LA'",
+        );
+        let result = run(&mut schema, "SELECT * FROM selected");
+        assert_eq!(result.columns, vec!["city"]);
+        assert_eq!(result.rows.len(), 2);
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|row| row == &vec![Value::Text("LA".into())])
+        );
+    }
+
+    #[test]
+    fn temporary_table_rejects_unsupported_forms() {
+        let mut schema = make_schema();
+        for sql in [
+            "CREATE TABLE regular AS SELECT * FROM people",
+            "CREATE TEMPORARY TABLE empty (name TEXT)",
+            "CREATE TEMPORARY TABLE qualified.name AS SELECT * FROM people",
+        ] {
+            assert!(
+                run_query(&mut schema, sql).is_err(),
+                "query should fail: {sql}"
+            );
+        }
     }
 
     #[test]

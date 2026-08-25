@@ -62,7 +62,7 @@ pub struct Schema {
     current: Option<String>,
     /// Tables created during the current process/session. These are not files
     /// and disappear when the schema is dropped.
-    pub temporary: Database,
+    temporary: Database,
 }
 
 impl Schema {
@@ -133,7 +133,7 @@ impl Schema {
                 Ok((database, table))
             }
             None => {
-                if let Some(table) = self.temporary.get_table(table) {
+                if let Some(table) = self.get_temporary_table(table) {
                     return Ok((&self.temporary, table));
                 }
                 if let Some(current) = &self.current
@@ -170,6 +170,14 @@ impl Schema {
         } else {
             self.temporary.add_table(table);
         }
+    }
+
+    pub fn get_temporary_table(&self, name: &str) -> Option<&Table> {
+        self.temporary.get_table(name)
+    }
+
+    pub fn temporary_table_names(&self) -> Vec<&str> {
+        self.temporary.table_names()
     }
 }
 

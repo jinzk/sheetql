@@ -441,3 +441,66 @@ fn piped_input_uses_non_interactive_mode() {
     assert!(stdout.contains("3"), "stdout was: {stdout}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn query_mode_writes_machine_readable_results_to_stdout() {
+    let dir = temp_dir("query_output");
+    let csv = sample_csv(&dir);
+
+    let csv_output = Command::new(env!("CARGO_BIN_EXE_sheetql"))
+        .args([
+            "-f",
+            csv.to_str().unwrap(),
+            "-q",
+            "SELECT name, city FROM people ORDER BY id",
+            "-o",
+            "csv",
+        ])
+        .output()
+        .expect("run csv query");
+    assert!(csv_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&csv_output.stdout),
+        "name,city\nalice,LA\nbob,NY\ncarol,NULL\n"
+    );
+    assert!(csv_output.stderr.is_empty());
+
+    let json_output = Command::new(env!("CARGO_BIN_EXE_sheetql"))
+        .args([
+            "-f",
+            csv.to_str().unwrap(),
+            "-q",
+            "SELECT COUNT(*) AS n FROM people",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("run json query");
+    assert!(json_output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(json, serde_json::json!([{ "n": 3 }]));
+    assert!(json_output.stderr.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn query_mode_writes_errors_to_stderr_without_polluting_stdout() {
+    let dir = temp_dir("query_error_streams");
+    let csv = sample_csv(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_sheetql"))
+        .args([
+            "-f",
+            csv.to_str().unwrap(),
+            "-q",
+            "SELECT missing FROM people",
+            "-o",
+            "json",
+        ])
+        .output()
+        .expect("run invalid query");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not found"));
+    std::fs::remove_dir_all(&dir).ok();
+}

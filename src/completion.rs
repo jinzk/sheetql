@@ -122,7 +122,9 @@ const EXPRESSION_KEYWORDS: &[&str] = &[
 ];
 
 /// Statement keywords suggested at the start of a query.
-const STATEMENT_KEYWORDS: &[&str] = &["SELECT", "CREATE", "SHOW", "USE", "DESCRIBE", "EXIT", "QUIT"];
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "SELECT", "CREATE", "SHOW", "USE", "DESCRIBE", "EXIT", "QUIT",
+];
 
 /// Caches the validated candidate list across keystrokes. The cache key is the
 /// full text before the cursor; prefix filtering is applied on every lookup.
@@ -370,6 +372,11 @@ fn table_candidates(schema: &Schema) -> Vec<Completion> {
                     out.push(Completion::named(Kind::Table, &value));
                 }
             }
+        }
+    }
+    for table_name in schema.temporary_table_names() {
+        if seen.insert(table_name.to_lowercase()) {
+            out.push(Completion::named(Kind::Table, table_name));
         }
     }
     out

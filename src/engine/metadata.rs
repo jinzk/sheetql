@@ -57,9 +57,13 @@ pub(crate) fn run_show_tables(
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
     if database.name == schema.current_database().unwrap_or_default() {
-        rows.extend(schema.temporary.table_names().into_iter().filter(|name| {
-            like.is_none_or(|pattern| like_match(name, pattern, false, None))
-        }).map(|name| vec![Value::Text(name.to_string())]));
+        rows.extend(
+            schema
+                .temporary_table_names()
+                .into_iter()
+                .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false, None)))
+                .map(|name| vec![Value::Text(name.to_string())]),
+        );
     }
     Ok(crate::engine::QueryResult {
         columns,
