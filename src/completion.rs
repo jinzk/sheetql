@@ -122,7 +122,7 @@ const EXPRESSION_KEYWORDS: &[&str] = &[
 ];
 
 /// Statement keywords suggested at the start of a query.
-const STATEMENT_KEYWORDS: &[&str] = &["SELECT", "SHOW", "USE", "DESCRIBE", "EXIT", "QUIT"];
+const STATEMENT_KEYWORDS: &[&str] = &["SELECT", "CREATE", "SHOW", "USE", "DESCRIBE", "EXIT", "QUIT"];
 
 /// Caches the validated candidate list across keystrokes. The cache key is the
 /// full text before the cursor; prefix filtering is applied on every lookup.

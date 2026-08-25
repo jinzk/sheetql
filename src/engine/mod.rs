@@ -13,6 +13,7 @@ use crate::error::Error;
 use crate::printer::OutputFormat;
 use crate::printer::render;
 use crate::value::Value;
+use crate::database::Table;
 
 use crate::engine::metadata::{run_describe_table, run_show_databases, run_show_tables, run_use};
 use crate::engine::select::{execute_query, object_name_to_parts};
@@ -47,6 +48,7 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
 
     let result = match &statements[0] {
         Statement::Query(query) => execute_query(schema, query),
+        Statement::CreateTable(create) => run_create_table(schema, create),
         Statement::ShowColumns { show_options, .. } => run_show_columns(schema, show_options),
         Statement::ShowDatabases { show_options, .. }
         | Statement::ShowSchemas { show_options, .. } => {
@@ -96,6 +98,34 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
     }
 
     finalize_result(result, started)
+}
+
+fn run_create_table(
+    schema: &mut Schema,
+    create: &sqlparser::ast::CreateTable,
+) -> Result<QueryResult, Error> {
+    if !create.temporary {
+        return Err("Only CREATE TEMPORARY TABLE ... AS SELECT is supported".into());
+    }
+    let name = object_name_to_parts(&create.name);
+    let table_name = match name.as_slice() {
+        [name] => name.clone(),
+        _ => return Err("Temporary table name must be unqualified".into()),
+    };
+    if !create.columns.is_empty() || create.query.is_none() {
+        return Err("Temporary tables require `AS SELECT ...` and no column definitions".into());
+    }
+    let result = execute_query(schema, create.query.as_ref().expect("checked"))?;
+    schema.add_temporary_table(Table {
+        name: table_name.clone(),
+        columns: result.columns,
+        rows: result.rows,
+    });
+    Ok(QueryResult {
+        columns: vec!["Status".to_string()],
+        rows: vec![vec![Value::Text(format!("Temporary table `{table_name}` created"))]],
+        stats: Default::default(),
+    })
 }
 
 /// Extract the `LIKE 'pattern'` filter from a SHOW statement's options. Only
@@ -361,6 +391,19 @@ mod tests {
         let result = run(&mut schema, "SELECT value FROM extra");
         assert_eq!(result.rows, vec![vec![Value::Int(7)]]);
         assert!(run_query(&mut schema, "USE nope").is_err());
+    }
+
+    #[test]
+    fn temporary_table_keeps_select_result_for_following_queries() {
+        let mut schema = make_schema();
+        let created = run(&mut schema, "CREATE TEMPORARY TABLE adults AS SELECT name, age FROM people WHERE age >= 30");
+        assert_eq!(created.rows.len(), 1);
+
+        let result = run(
+            &mut schema,
+            "SELECT COUNT(*) AS count FROM adults WHERE age < 40",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int(2)]]);
     }
 
     #[test]

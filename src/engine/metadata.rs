@@ -50,12 +50,17 @@ pub(crate) fn run_show_tables(
         .get_database(&name)
         .ok_or_else(|| format!("Unknown database `{name}`"))?;
     let columns = vec!["Tables".to_string()];
-    let rows = database
+    let mut rows: Vec<Vec<Value>> = database
         .table_names()
         .into_iter()
         .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false, None)))
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
+    if database.name == schema.current_database().unwrap_or_default() {
+        rows.extend(schema.temporary.table_names().into_iter().filter(|name| {
+            like.is_none_or(|pattern| like_match(name, pattern, false, None))
+        }).map(|name| vec![Value::Text(name.to_string())]));
+    }
     Ok(crate::engine::QueryResult {
         columns,
         rows,

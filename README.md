@@ -71,6 +71,15 @@ Run a single query:
 sheetql -f data/sales.csv -q "SELECT * FROM sales"
 ```
 
+The `-q` result is written to stdout, so it can be piped to another command. Use `-o csv` or `-o json` for machine-readable output; errors are written to stderr.
+
+```sh
+sheetql -f data/sales.csv -q "SELECT name, age FROM sales" -o csv | some-command
+sheetql -f data/sales.csv -q "SELECT * FROM sales" -o json | jq '.[].name'
+```
+
+The default table format is intended for terminal display rather than reliable parsing. `-s <path>` writes the result to a CSV file instead of stdout.
+
 Run an interactive REPL (type `exit` to quit):
 
 ```sh
@@ -198,8 +207,9 @@ Edge cases:
 - `ORDER BY` with `ASC` / `DESC`
 - `LIMIT` / `OFFSET` and `SELECT DISTINCT`
 - Metadata commands: `SHOW DATABASES` (alias `SHOW SCHEMAS`), `SHOW TABLES [FROM <database>]`, `SHOW COLUMNS FROM <table>`, `DESCRIBE <table>`, `USE <database>`; `SHOW DATABASES` / `SHOW TABLES` support `LIKE '<pattern>'` with `%` / `_` wildcards
+- `CREATE TEMPORARY TABLE <name> AS SELECT ...` stores a query result in the current interactive session for later queries; recreating the same name replaces it, and the table disappears when the process exits.
 
-Not yet supported: subqueries, `UNION` / set operations, window functions, `INSERT` / `UPDATE` / `DELETE` (Sheetql is read-only).
+Not yet supported: subqueries, `UNION` / set operations, window functions, regular `CREATE TABLE`, `INSERT` / `UPDATE` / `DELETE` (Sheetql is read-only).
 
 ### Interactive REPL
 

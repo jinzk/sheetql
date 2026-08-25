@@ -60,6 +60,9 @@ impl Database {
 pub struct Schema {
     pub databases: Vec<Database>,
     current: Option<String>,
+    /// Tables created during the current process/session. These are not files
+    /// and disappear when the schema is dropped.
+    pub temporary: Database,
 }
 
 impl Schema {
@@ -67,6 +70,7 @@ impl Schema {
         Self {
             databases: vec![],
             current: None,
+            temporary: Database::named("__temporary__"),
         }
     }
 
@@ -129,6 +133,9 @@ impl Schema {
                 Ok((database, table))
             }
             None => {
+                if let Some(table) = self.temporary.get_table(table) {
+                    return Ok((&self.temporary, table));
+                }
                 if let Some(current) = &self.current
                     && let Some(database) = self.get_database(current)
                     && let Some(table) = database.get_table(table)
@@ -153,6 +160,15 @@ impl Schema {
                     .into()),
                 }
             }
+        }
+    }
+
+    pub fn add_temporary_table(&mut self, table: Table) {
+        let name = table.name.clone();
+        if let Some(index) = self.temporary.by_name.get(&name).copied() {
+            self.temporary.tables[index] = table;
+        } else {
+            self.temporary.add_table(table);
         }
     }
 }

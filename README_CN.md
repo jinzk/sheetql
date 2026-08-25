@@ -71,6 +71,15 @@ SheetQL 是一种运行在 xls、xlsx 和 csv 文件上的类 SQL 查询语言
 sheetql -f data/sales.csv -q "SELECT * FROM sales"
 ```
 
+`-q` 模式的结果会写入 stdout，因此可以通过管道传给下一个命令。机器处理时建议使用 `-o csv` 或 `-o json`；错误信息会写入 stderr。
+
+```sh
+sheetql -f data/sales.csv -q "SELECT name, age FROM sales" -o csv | some-command
+sheetql -f data/sales.csv -q "SELECT * FROM sales" -o json | jq '.[].name'
+```
+
+默认的表格格式主要用于终端显示，不建议作为稳定的机器输入。使用 `-s <path>` 时，结果会写入 CSV 文件而不是 stdout。
+
 运行交互式 REPL（输入 `exit` 退出）:
 
 ```sh
@@ -198,8 +207,9 @@ DESCRIBE sales
 - `ORDER BY` 支持 `ASC` / `DESC`
 - `LIMIT` / `OFFSET` 与 `SELECT DISTINCT`
 - 元数据命令：`SHOW DATABASES`（别名 `SHOW SCHEMAS`）、`SHOW TABLES [FROM <database>]`、`SHOW COLUMNS FROM <table>`、`DESCRIBE <table>`、`USE <database>`；`SHOW DATABASES` / `SHOW TABLES` 支持 `LIKE '<pattern>'`，通配符为 `%` / `_`
+- `CREATE TEMPORARY TABLE <name> AS SELECT ...`：将查询结果暂存为当前交互会话中的临时表，后续查询可直接使用；同名临时表会替换旧结果，退出进程后自动消失。
 
-暂不支持：子查询、`UNION` / 集合运算、窗口函数、`INSERT` / `UPDATE` / `DELETE`（Sheetql 为只读工具）。
+暂不支持：子查询、`UNION` / 集合运算、窗口函数、普通 `CREATE TABLE`、`INSERT` / `UPDATE` / `DELETE`（Sheetql 为只读工具）。
 
 ### 交互式 REPL
 
