@@ -79,6 +79,29 @@ fn find_outfile_pos(sql: &str, marker: &str) -> Option<usize> {
                     }
                 }
             }
+            '/' if iter
+                .peek()
+                .is_some_and(|&(_, next)| next == '*' || next == '/') =>
+            {
+                // Skip both line and block comments; text inside them must
+                // never trigger the OUTFILE scan.
+                if iter.peek().is_some_and(|&(_, next)| next == '/') {
+                    iter.next();
+                    for (_, ch) in iter.by_ref() {
+                        if ch == '\n' {
+                            break;
+                        }
+                    }
+                } else {
+                    iter.next();
+                    while let Some((_, ch)) = iter.next() {
+                        if ch == '*' && iter.peek().is_some_and(|&(_, next)| next == '/') {
+                            iter.next();
+                            break;
+                        }
+                    }
+                }
+            }
             _ => {
                 if upper[i..].starts_with(marker) {
                     let prev = sql[..i].chars().next_back();

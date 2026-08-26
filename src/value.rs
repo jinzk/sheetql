@@ -113,7 +113,9 @@ impl fmt::Display for Value {
     }
 }
 
-impl Eq for Value {}
+// Note: `Value` intentionally does not implement `Eq`. Its `PartialEq`
+// treats NaN as unequal to itself and `-0.0` equal to `0.0`, which cannot
+// satisfy the `Eq`/`Hash` contract. Use [`GroupKey`] for hashable keys.
 
 impl Hash for Value {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -229,11 +231,10 @@ fn temporal_value(value: &Value) -> Option<(TemporalKind, String)> {
     }
 
     let time = trimmed.split_once(char::is_whitespace)?.1.trim();
-    let datetime = NaiveDateTime::parse_from_str(
-        &format!("{} {time}", date.format("%Y-%m-%d")),
-        "%Y-%m-%d %H:%M:%S",
-    )
-    .ok()?;
+    let rendered = format!("{} {time}", date.format("%Y-%m-%d"));
+    let datetime = NaiveDateTime::parse_from_str(&rendered, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(&rendered, "%Y-%m-%d %H:%M:%S"))
+        .ok()?;
     Some((
         TemporalKind::DateTime,
         datetime.format("%Y-%m-%d %H:%M:%S").to_string(),

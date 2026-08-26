@@ -78,9 +78,16 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
         Expr::IsNull(inner) => Ok(Value::Bool(eval_expr(ctx, inner, current)?.is_null())),
         Expr::IsNotNull(inner) => Ok(Value::Bool(!eval_expr(ctx, inner, current)?.is_null())),
         Expr::IsTrue(inner) => Ok(Value::Bool(eval_expr(ctx, inner, current)?.truthy())),
-        Expr::IsFalse(inner) => Ok(Value::Bool(!eval_expr(ctx, inner, current)?.truthy())),
         Expr::IsNotTrue(inner) => Ok(Value::Bool(!eval_expr(ctx, inner, current)?.truthy())),
-        Expr::IsNotFalse(inner) => Ok(Value::Bool(eval_expr(ctx, inner, current)?.truthy())),
+        // SQL three-valued logic: NULL is neither TRUE nor FALSE.
+        Expr::IsFalse(inner) => {
+            let value = eval_expr(ctx, inner, current)?;
+            Ok(Value::Bool(!value.is_null() && !value.truthy()))
+        }
+        Expr::IsNotFalse(inner) => {
+            let value = eval_expr(ctx, inner, current)?;
+            Ok(Value::Bool(value.is_null() || value.truthy()))
+        }
         Expr::InList {
             expr,
             list,
@@ -128,29 +135,23 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
             ..
         } => {
             let text = eval_expr(ctx, expr, current)?.to_display_string();
-            let chars: Vec<char> = text.chars().collect();
             let from = match substring_from {
                 Some(from) => eval_expr(ctx, from, current)?
                     .as_i64()
                     .ok_or("SUBSTRING start must be a number")?,
                 None => 1,
             };
-            let start_index = if from >= 0 { (from - 1) as usize } else { 0 };
-            let end_index = match substring_for {
-                Some(length) => {
-                    let length = eval_expr(ctx, length, current)?
+            let length = match substring_for {
+                Some(length) => Some(
+                    eval_expr(ctx, length, current)?
                         .as_i64()
-                        .ok_or("SUBSTRING length must be a number")?;
-                    start_index.saturating_add(length.max(0) as usize)
-                }
-                None => chars.len(),
+                        .ok_or("SUBSTRING length must be a number")?,
+                ),
+                None => None,
             };
-            let result: String = chars
-                .get(start_index..end_index.min(chars.len()))
-                .unwrap_or(&[])
-                .iter()
-                .collect();
-            Ok(Value::Text(result))
+            Ok(Value::Text(crate::functions::substring(
+                &text, from, length,
+            )))
         }
         Expr::Trim {
             trim_where,
@@ -328,7 +329,10 @@ fn eval_arithmetic(op: &BinaryOperator, lhs: Value, rhs: Value) -> Result<Value,
             let a = lhs
                 .as_i64()
                 .ok_or_else(|| format!("Cannot modulo `{}`", lhs))?;
-            Ok(Value::Int(a % b))
+            let value = a
+                .checked_rem(b)
+                .ok_or_else(|| format!("Integer overflow in `%` for `{a}` and `{b}`"))?;
+            Ok(Value::Int(value))
         }
         _ => {
             if matches!(lhs, Value::Int(_)) && matches!(rhs, Value::Int(_)) {
@@ -614,22 +618,17 @@ pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Opt
 
     let n = tokens.len();
 
-    // Fast path: a pattern of only literals is a plain substring search.
+    // Fast path: a pattern with no wildcards is a plain equality check
+    // (LIKE is anchored on both ends).
     if n > 0
         && tokens
             .iter()
             .all(|token| matches!(token, Token::Literal(_)))
     {
-        let literal: Vec<char> = tokens
-            .iter()
-            .map(|token| match token {
-                Token::Literal(c) => *c,
-                _ => unreachable!(),
-            })
-            .collect();
-        return text
-            .windows(literal.len())
-            .any(|window| window == literal.as_slice());
+        return text.iter().eq(tokens.iter().map(|token| match token {
+            Token::Literal(c) => c,
+            _ => unreachable!("checked above"),
+        }));
     }
 
     // Rolling two-row DP: O(n) memory instead of O(text_len * n).
@@ -770,6 +769,75 @@ mod tests {
         assert_eq!(scalar("1 + NULL"), Value::Null);
         assert!(scalar_result("1 / 0").is_err());
         assert!(scalar_result("1 % 0").is_err());
+    }
+
+    #[test]
+    fn modulo_overflow_is_an_error_not_a_panic() {
+        // i64::MIN % -1 traps in debug builds; it must surface as an error.
+        let error = scalar_result("-9223372036854775808 % -1").unwrap_err();
+        assert!(error.contains("overflow"), "got: {error}");
+    }
+
+    #[test]
+    fn is_false_semantics_follow_three_valued_logic() {
+        assert_eq!(
+            eval_expr(&EvalContext::scalar(), &parse_expr("NULL IS FALSE"), &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_expr(
+                &EvalContext::scalar(),
+                &parse_expr("NULL IS NOT FALSE"),
+                &[]
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(&EvalContext::scalar(), &parse_expr("FALSE IS FALSE"), &[]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_expr(&EvalContext::scalar(), &parse_expr("TRUE IS FALSE"), &[]).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_expr(&EvalContext::scalar(), &parse_expr("NULL IS TRUE"), &[]).unwrap(),
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn like_without_wildcards_is_an_exact_match() {
+        assert!(!like_match("Bobby", "Bob", false, None));
+        assert!(like_match("Bob", "Bob", false, None));
+        assert!(!like_match("abc", "ab", false, None));
+        assert!(!like_match("ab", "abc", false, None));
+        assert!(like_match("", "", false, None));
+        // Wildcard patterns are unaffected.
+        assert!(like_match("Bobby", "Bob%", false, None));
+        assert!(like_match("abc", "%ab%", false, None));
+    }
+
+    #[test]
+    fn substring_negative_start_counts_from_the_end() {
+        assert_eq!(
+            scalar("SUBSTRING('SheetQL', -2)"),
+            Value::Text("QL".to_string())
+        );
+        assert_eq!(
+            scalar("SUBSTRING('SheetQL', -3, 2)"),
+            Value::Text("tQ".to_string())
+        );
+        // Position 0 yields an empty string (MySQL behavior).
+        assert_eq!(
+            scalar("SUBSTRING('SheetQL', 0)"),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            scalar("SUBSTRING('SheetQL', 3)"),
+            Value::Text("eetQL".to_string())
+        );
     }
 
     #[test]

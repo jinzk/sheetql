@@ -61,7 +61,9 @@ fn extract_date(input: &str) -> String {
     }
     let month = month.parse::<u32>().unwrap_or(0);
     let day = day.parse::<u32>().unwrap_or(0);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Reject impossible dates like 2026-02-31 instead of normalizing them
+    // into values that later date comparisons cannot parse.
+    if chrono::NaiveDate::from_ymd_opt(year.parse::<i32>().unwrap_or(0), month, day).is_none() {
         return trimmed.to_string();
     }
     format!("{}-{:02}-{:02}", year, month, day)

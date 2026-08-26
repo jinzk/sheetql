@@ -197,17 +197,25 @@ fn handle_export(schema: &mut Schema, request: &JsonValue, export_root: Option<&
 }
 
 /// Run a query, optionally scoped to `db` for this request only. The process
-/// wide `USE` state is restored afterwards.
+/// wide `USE` state is restored afterwards. `INTO OUTFILE` clauses are
+/// rejected: file writes must go through the sandboxed `export` op.
 fn run_query_with_db(
     schema: &mut Schema,
     sql: &str,
     db: Option<&str>,
 ) -> Result<QueryResult, Error> {
+    let (sql, outfile) = engine::split_outfile(sql);
+    if outfile.is_some() {
+        return Err("INTO OUTFILE is not supported over the server protocol; \
+                    use the `export` op instead"
+            .to_string()
+            .into());
+    }
     let previous = schema.current_database().map(str::to_string);
     if let Some(db) = db {
         schema.set_current_database(db)?;
     }
-    let result = engine::run_query(schema, sql);
+    let result = engine::run_query(schema, &sql);
     match previous {
         Some(previous) => {
             let _ = schema.set_current_database(&previous);
@@ -349,6 +357,28 @@ mod tests {
         });
         schema.add_database(database);
         schema
+    }
+
+    #[test]
+    fn query_rejects_into_outfile_writes() {
+        let mut schema = schema();
+        let path = std::env::temp_dir().join(format!("sheetql_srv_out_{}.csv", std::process::id()));
+        let path = path.to_string_lossy().into_owned();
+        let response = respond(
+            &mut schema,
+            &json!({ "op": "query", "sql": format!("SELECT 1 AS x INTO OUTFILE '{path}'") }),
+        );
+        assert_eq!(response["ok"], false);
+        assert!(
+            response["error"].as_str().unwrap().contains("INTO OUTFILE"),
+            "got: {response}"
+        );
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "no file may be written"
+        );
+        // The export op remains available for controlled writes.
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

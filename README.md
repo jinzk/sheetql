@@ -203,8 +203,8 @@ Edge cases:
 - `SELECT` projections, `*`, `table.*` and column aliases (`AS`)
 - `FROM` with multiple tables and `JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN`, including comma-separated tables, with `ON` and `USING`
 - `WHERE` with comparisons, `AND` / `OR` / `NOT`, `LIKE` / `ILIKE`, `IN`, `BETWEEN`, `IS NULL`, `IS TRUE` / `IS FALSE`, `CASE`, `CAST`. `LIKE` / `ILIKE` support `%` (any sequence) and `_` (single char) wildcards plus an optional `ESCAPE '<char>'` clause; a `NULL` operand yields `NULL` (not `false`). `AND` / `OR` short-circuit: the right operand is not evaluated when the left determines the result. `IN` / `NOT IN` with a `NULL` in the list returns `NULL` (not `false`) when the value does not match.
-- `GROUP BY` with aggregate functions, and `HAVING`
-- `ORDER BY` with `ASC` / `DESC`
+- `GROUP BY` with aggregate functions, and `HAVING`; both accept output column aliases (`HAVING cnt > 1`) and 1-based ordinals (`GROUP BY 1`)
+- `ORDER BY` with `ASC` / `DESC`, output column aliases (including inside larger expressions) and 1-based ordinals (`ORDER BY 2 DESC`)
 - `LIMIT` / `OFFSET` and `SELECT DISTINCT`
 - Metadata commands: `SHOW DATABASES` (alias `SHOW SCHEMAS`), `SHOW TABLES [FROM <database>]`, `SHOW COLUMNS FROM <table>`, `DESCRIBE <table>`, `USE <database>`; `SHOW DATABASES` / `SHOW TABLES` support `LIKE '<pattern>'` with `%` / `_` wildcards
 - `CREATE TEMPORARY TABLE <name> AS SELECT ...` stores a query result in the current interactive session for later queries; recreating the same name replaces it, and the table disappears when the process exits.
@@ -231,7 +231,7 @@ Type `exit` or `quit` (case-insensitive) to leave the REPL.
 | `UPPER` / `UCASE`           | 1         | Convert to uppercase                                                                  |
 | `TRIM`                        | 1         | Trim leading and trailing whitespace                                                  |
 | `CONCAT`                      | 2+        | Concatenate values                                                                    |
-| `SUBSTRING` / `SUBSTR`      | 2 or 3    | Extract a substring (`text, start[, length]`, 1-based)                              |
+| `SUBSTRING` / `SUBSTR`      | 2 or 3    | Extract a substring (`text, start[, length]`, 1-based; a start of `0` is empty and negative starts count from the end) |
 | `REPLACE`                     | 3         | Replace occurrences of a substring                                                    |
 | `LEFT`                        | 2         | First`n` characters of a text value                                                 |
 | `RIGHT`                       | 2         | Last`n` characters of a text value                                                  |
@@ -414,7 +414,7 @@ Requests and responses:
 
 | Request | Description |
 | --- | --- |
-| `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | Run a query. `db` optionally scopes the query to one database (the process-wide `USE` state is unchanged). `format` controls the `text` field: `json` (default), `csv`, `yaml`, `table`. |
+| `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | Run a query. `db` optionally scopes the query to one database (the process-wide `USE` state is unchanged). `format` controls the `text` field: `json` (default), `csv`, `yaml`, `table`. `INTO OUTFILE` is rejected; file writes must use the `export` op. |
 | `{ "op": "list" }` | List every database, its tables, and their columns. |
 | `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | Run a query and write the result as CSV. `overwrite` defaults to `false`; set to `true` to replace an existing file. |
 | `{ "op": "exit" }` | Acknowledge with `{ "ok": true }` and terminate. The server also exits cleanly on stdin EOF. |

@@ -29,13 +29,19 @@ pub(crate) fn eval(name: &str, values: &[Value]) -> Result<Option<Value>, Error>
                 return Err(format!("Function `{name}` expects 1 or 2 arguments").into());
             }
             let number = values[0].as_f64().ok_or("ROUND expects a numeric value")?;
-            let decimals = if values.len() == 2 {
-                values[1].as_i64().unwrap_or(0) as i32
-            } else {
-                0
+            let decimals = match values.get(1) {
+                Some(value) => value
+                    .as_i64()
+                    .ok_or_else(|| format!("ROUND decimals must be a number, got `{value}`"))?,
+                None => 0,
             };
+            // Extreme decimal counts make the power factor overflow/underflow
+            // into inf/0 and produce NaN; clamp to a sane range instead.
+            let decimals = i32::try_from(decimals).unwrap_or(if decimals > 0 { 30 } else { -30 });
+            let decimals = decimals.clamp(-30, 30);
             let factor = 10f64.powi(decimals);
-            Value::Float((number * factor).round() / factor)
+            let rounded = (number * factor).round() / factor;
+            Value::Float(if rounded.is_finite() { rounded } else { number })
         }
         "ceil" | "ceiling" => {
             require_arity(name, values, 1)?;
@@ -43,10 +49,19 @@ pub(crate) fn eval(name: &str, values: &[Value]) -> Result<Option<Value>, Error>
         }
         "mod" => {
             require_arity(name, values, 2)?;
-            Value::Int(
-                values[0].as_i64().ok_or("MOD expects numeric values")?
-                    % values[1].as_i64().ok_or("MOD expects numeric values")?,
-            )
+            let a = values[0]
+                .as_i64()
+                .ok_or_else(|| format!("MOD expects numeric values, got `{}`", values[0]))?;
+            let b = values[1]
+                .as_i64()
+                .ok_or_else(|| format!("MOD expects numeric values, got `{}`", values[1]))?;
+            if b == 0 {
+                return Err("Modulo by zero".to_string().into());
+            }
+            let result = a
+                .checked_rem(b)
+                .ok_or_else(|| format!("Integer overflow in MOD for `{a}` and `{b}`"))?;
+            Value::Int(result)
         }
         "power" | "pow" => {
             require_arity(name, values, 2)?;
@@ -102,4 +117,32 @@ pub(crate) fn floor_ceil(name: &str, value: &Value) -> Result<Value, Error> {
     } else {
         number.ceil()
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(name: &str, values: &[Value]) -> Result<Option<Value>, crate::error::Error> {
+        eval(name, values)
+    }
+
+    #[test]
+    fn mod_rejects_zero_and_overflow() {
+        assert!(call("mod", &[Value::Int(10), Value::Int(0)]).is_err());
+        let error = call("mod", &[Value::Int(i64::MIN), Value::Int(-1)]).unwrap_err();
+        assert!(error.contains("overflow"), "got: {error}");
+        assert_eq!(
+            call("mod", &[Value::Int(10), Value::Int(3)]).unwrap(),
+            Some(Value::Int(1))
+        );
+    }
+
+    #[test]
+    fn round_requires_numeric_decimals_and_stays_finite() {
+        assert!(call("round", &[Value::Float(1.5), Value::Text("x".into())]).is_err());
+        // Extreme decimal counts must not produce NaN.
+        let huge = call("round", &[Value::Float(2.5), Value::Int(9_000_000_000)]).unwrap();
+        assert_eq!(huge, Some(Value::Float(2.5)));
+    }
 }

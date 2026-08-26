@@ -1,5 +1,6 @@
 mod metadata;
 mod output;
+pub(crate) mod rewrite;
 mod select;
 mod temporary;
 
@@ -18,6 +19,12 @@ use crate::engine::metadata::{run_describe_table, run_show_databases, run_show_t
 use crate::engine::output::{strip_into_outfile, write_outfile};
 use crate::engine::select::{execute_query, object_name_to_parts};
 use crate::engine::temporary::run_create_table;
+
+/// Split an `INTO OUTFILE 'path'` clause off a query before parsing.
+/// Exposed so the server can reject file-writing clauses up front.
+pub(crate) fn split_outfile(sql: &str) -> (String, Option<String>) {
+    strip_into_outfile(sql)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct QueryStats {
@@ -92,8 +99,8 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
             ))]],
             stats: QueryStats {
                 elapsed_ms: started.elapsed().as_millis(),
-                output_rows: 1,
-                ..Default::default()
+                input_rows: result.stats.input_rows,
+                output_rows: result.rows.len(),
             },
         });
     }
@@ -1216,5 +1223,195 @@ mod tests {
         });
         let error = run_query(&mut schema, "SELECT SUM(v) FROM t").unwrap_err();
         assert!(error.contains("overflow"), "got: {error}");
+    }
+
+    #[test]
+    fn group_by_and_order_by_accept_ordinals() {
+        let mut schema = make_schema();
+        // GROUP BY 1 groups by the first output column (city).
+        let result = run(
+            &mut schema,
+            "SELECT city, COUNT(*) AS cnt FROM people GROUP BY 1 ORDER BY 1",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("LA".into()), Value::Int(2)],
+                vec![Value::Text("NY".into()), Value::Int(2)],
+                vec![Value::Text("SF".into()), Value::Int(1)],
+            ]
+        );
+
+        // ORDER BY 2 sorts by the second output column.
+        let result = run(
+            &mut schema,
+            "SELECT city, id FROM people ORDER BY 2 DESC LIMIT 1",
+        );
+        assert_eq!(result.rows[0][1], Value::Int(5));
+
+        // Out-of-range ordinals are rejected instead of silently ignored.
+        let error = run_query(&mut schema, "SELECT city FROM people ORDER BY 9").unwrap_err();
+        assert!(error.contains("not in the select list"), "got: {error}");
+        let error = run_query(&mut schema, "SELECT city FROM people GROUP BY 4").unwrap_err();
+        assert!(error.contains("not in the select list"), "got: {error}");
+    }
+
+    #[test]
+    fn having_and_order_by_support_column_aliases() {
+        let mut schema = make_schema();
+
+        // HAVING can reference the alias of an aggregate.
+        let result = run(
+            &mut schema,
+            "SELECT city, COUNT(*) AS cnt FROM people GROUP BY city HAVING cnt > 1",
+        );
+        assert_eq!(result.rows.len(), 2);
+
+        // ORDER BY can use aliases inside larger expressions. SUM(age) by
+        // city: NY=70, LA=53, SF=35.
+        let result = run(
+            &mut schema,
+            "SELECT city, SUM(age) AS total FROM people GROUP BY city ORDER BY total - 1000 DESC",
+        );
+        assert_eq!(result.rows[0][0], Value::Text("NY".into()));
+        assert_eq!(result.rows[2][0], Value::Text("SF".into()));
+
+        // Non-aggregate queries work too.
+        let result = run(
+            &mut schema,
+            "SELECT name, age + 1 AS next_age FROM people ORDER BY next_age DESC",
+        );
+        assert_eq!(result.rows[0][0], Value::Text("Dan".into()));
+    }
+
+    #[test]
+    fn equi_join_never_matches_null_keys() {
+        let mut schema = make_schema();
+        schema.add_database(crate::database::Database::named("nulls"));
+        schema.set_current_database("nulls").unwrap();
+        let database = schema
+            .databases
+            .iter_mut()
+            .find(|db| db.name == "nulls")
+            .unwrap();
+        database.add_table(Table {
+            name: "left_table".to_string(),
+            columns: vec!["key".to_string(), "label".to_string()],
+            rows: vec![
+                vec![Value::Null, Value::Text("left-null".into())],
+                vec![Value::Int(1), Value::Text("left-one".into())],
+            ],
+        });
+        database.add_table(Table {
+            name: "right_table".to_string(),
+            columns: vec!["key".to_string(), "label".to_string()],
+            rows: vec![
+                vec![Value::Null, Value::Text("right-null".into())],
+                vec![Value::Int(1), Value::Text("right-one".into())],
+            ],
+        });
+
+        // The hash path must not pair the two NULL keys together.
+        let error_free = run(
+            &mut schema,
+            "SELECT l.label, r.label FROM left_table l JOIN right_table r ON l.key = r.key",
+        );
+        assert_eq!(error_free.rows.len(), 1);
+        assert_eq!(
+            error_free.rows[0],
+            vec![
+                Value::Text("left-one".into()),
+                Value::Text("right-one".into())
+            ]
+        );
+
+        // With an outer join the unmatched NULL-keyed left row survives with
+        // a NULL right side (anti-join pattern), but is never paired with the
+        // NULL-keyed right row.
+        let outer = run(
+            &mut schema,
+            "SELECT l.label, r.label FROM left_table l LEFT JOIN right_table r ON l.key = r.key \
+             ORDER BY l.label",
+        );
+        assert_eq!(outer.rows.len(), 2);
+        let null_row = outer
+            .rows
+            .iter()
+            .find(|row| row[0] == Value::Text("left-null".into()))
+            .expect("unmatched left row should survive the outer join");
+        assert_eq!(null_row[1], Value::Null);
+
+        // The nested-loop path agrees with the hash path.
+        let result = run(
+            &mut schema,
+            "SELECT l.label FROM left_table l JOIN right_table r \
+             ON l.key = r.key AND l.label < 'z'",
+        );
+        assert_eq!(result.rows.len(), 1);
+    }
+
+    #[test]
+    fn limit_and_offset_reject_invalid_values() {
+        let mut schema = make_schema();
+        for sql in [
+            "SELECT name FROM people LIMIT 'x'",
+            "SELECT name FROM people LIMIT 1.5",
+            "SELECT name FROM people LIMIT -1",
+            "SELECT name FROM people LIMIT 1 OFFSET -2",
+        ] {
+            let error = run_query(&mut schema, sql).unwrap_err();
+            assert!(
+                error.contains("LIMIT") || error.contains("OFFSET"),
+                "query `{sql}` should fail with a LIMIT/OFFSET error, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_into_outfile_ignores_block_comments() {
+        let (rest, path) = strip_into_outfile("SELECT 1 /* INTO OUTFILE 'acc.csv' */ FROM people");
+        assert_eq!(rest, "SELECT 1 /* INTO OUTFILE 'acc.csv' */ FROM people");
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn coalesce_short_circuits_argument_evaluation() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT COALESCE(NULL, 7, 1/0) AS v");
+        assert_eq!(result.rows[0][0], Value::Int(7));
+        let result = run(&mut schema, "SELECT IFNULL(5, 1/0) AS v");
+        assert_eq!(result.rows[0][0], Value::Int(5));
+    }
+
+    #[test]
+    fn group_by_prefers_source_columns_over_same_named_aliases() {
+        let mut schema = make_schema();
+        schema.add_database(crate::database::Database::named("case_db"));
+        schema.set_current_database("case_db").unwrap();
+        let database = schema
+            .databases
+            .iter_mut()
+            .find(|db| db.name == "case_db")
+            .unwrap();
+        database.add_table(Table {
+            name: "mixed".to_string(),
+            columns: vec!["k".to_string()],
+            rows: vec![vec![Value::Text("a".into())], vec![Value::Text("A".into())]],
+        });
+
+        // MySQL semantics: GROUP BY resolves `k` to the source column first,
+        // so "a" and "A" form two distinct groups even though the alias would
+        // collapse them.
+        let result = run(&mut schema, "SELECT UPPER(k) AS k FROM mixed GROUP BY k");
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn aggregates_reject_extra_arguments() {
+        let mut schema = make_schema();
+        let error = run_query(&mut schema, "SELECT SUM(age, id) FROM people").unwrap_err();
+        assert!(error.contains("1 argument(s), got 2"), "got: {error}");
+        let error = run_query(&mut schema, "SELECT COUNT(age, id) FROM people").unwrap_err();
+        assert!(error.contains("1 argument(s), got 2"), "got: {error}");
     }
 }

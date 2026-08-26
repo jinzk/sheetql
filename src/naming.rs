@@ -1,3 +1,20 @@
+/// Generate a name based on `base` that `taken` accepts, producing
+/// `base`, `base_1`, `base_2`, ... on collisions. Shared by table loading,
+/// database registration and column deduplication.
+pub fn unique_name(base: String, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(&base) {
+        return base;
+    }
+    let mut counter = 1;
+    loop {
+        let candidate = format!("{base}_{counter}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
 /// Sanitize a name into a valid, lowercase SQL identifier.
 ///
 /// Rules:

@@ -16,41 +16,78 @@ use crate::value::Value;
 pub use aggregate::{AGGREGATE_FUNCTIONS, contains_aggregate};
 
 pub(crate) use math::floor_ceil;
+pub(crate) use string::substring;
 
-/// The arguments of a function call, preserving the distinction between
-/// `COUNT(*)`, plain arguments and `DISTINCT` arguments.
-pub enum FnArgs {
+/// The arguments of a function call, borrowing from the parsed statement.
+/// `Star` covers `COUNT(*)` and any argument list containing `*`;
+/// `Distinct` preserves the distinction from `COUNT(DISTINCT x)`.
+#[derive(Debug, Clone, Copy)]
+pub enum FnArgs<'a> {
     Star,
-    All(Vec<Expr>),
-    Distinct(Vec<Expr>),
+    All(&'a [FunctionArg]),
+    Distinct(&'a [FunctionArg]),
 }
 
-pub fn parse_function_args(args: &FunctionArguments) -> Result<FnArgs, Error> {
-    match args {
-        FunctionArguments::None => Ok(FnArgs::All(vec![])),
-        FunctionArguments::List(list) => {
-            let mut exprs = vec![];
-            for arg in &list.args {
-                match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                        exprs.push(expr.clone());
-                    }
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => return Ok(FnArgs::Star),
-                    FunctionArg::Named {
-                        arg: FunctionArgExpr::Expr(expr),
-                        ..
-                    } => exprs.push(expr.clone()),
-                    _ => return Err("Unsupported function argument".to_string().into()),
-                }
-            }
-            match list.duplicate_treatment {
-                Some(sqlparser::ast::DuplicateTreatment::Distinct) => Ok(FnArgs::Distinct(exprs)),
-                _ => Ok(FnArgs::All(exprs)),
-            }
+pub fn parse_function_args(args: &FunctionArguments) -> Result<FnArgs<'_>, Error> {
+    let list = match args {
+        FunctionArguments::None => return Ok(FnArgs::All(&[])),
+        FunctionArguments::Subquery(_) => {
+            return Err("Subquery function arguments are not supported"
+                .to_string()
+                .into());
         }
-        FunctionArguments::Subquery(_) => Err("Subquery function arguments are not supported"
-            .to_string()
-            .into()),
+        FunctionArguments::List(list) => list,
+    };
+    // A wildcard anywhere collapses the whole call (`COUNT(a, *)` behaves
+    // like `COUNT(*)`).
+    if list.args.iter().any(function_arg_is_wildcard) {
+        return Ok(FnArgs::Star);
+    }
+    match list.duplicate_treatment {
+        Some(sqlparser::ast::DuplicateTreatment::Distinct) => Ok(FnArgs::Distinct(&list.args)),
+        _ => Ok(FnArgs::All(&list.args)),
+    }
+}
+
+fn function_arg_is_wildcard(arg: &FunctionArg) -> bool {
+    matches!(
+        arg,
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+            | FunctionArg::Named {
+                arg: FunctionArgExpr::Wildcard,
+                ..
+            }
+    )
+}
+
+/// Extract the expression behind a function argument, rejecting wildcard and
+/// other unsupported argument forms.
+pub(crate) fn function_arg_expr(arg: &FunctionArg) -> Result<&Expr, Error> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Ok(expr),
+        FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(expr),
+            ..
+        } => Ok(expr),
+        _ => Err("Unsupported function argument".to_string().into()),
+    }
+}
+
+impl<'a> FnArgs<'a> {
+    /// The single argument expression of a non-`*` call.
+    pub fn first_expr(&self) -> Option<&'a Expr> {
+        let args = match self {
+            FnArgs::Star => return None,
+            FnArgs::All(args) | FnArgs::Distinct(args) => args,
+        };
+        args.first().and_then(|arg| function_arg_expr(arg).ok())
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            FnArgs::Star => 0,
+            FnArgs::All(args) | FnArgs::Distinct(args) => args.len(),
+        }
     }
 }
 
@@ -67,6 +104,12 @@ pub fn eval_function(
 
     if AGGREGATE_FUNCTIONS.contains(&name.as_str()) {
         return aggregate::eval(ctx, &name, &args);
+    }
+
+    // NULL-coalescing functions short-circuit, so their arguments are
+    // evaluated lazily instead of up front (`COALESCE(NULL, 1/0)` is 1).
+    if let Some(value) = null::eval_lazy(ctx, &name, &args, current)? {
+        return Ok(value);
     }
 
     let values = eval_scalar_args(ctx, &args, current)?;
@@ -100,24 +143,26 @@ fn eval_scalar_args(
     args: &FnArgs,
     current: &[Value],
 ) -> Result<Vec<Value>, Error> {
-    let exprs = match args {
+    let args = match args {
         FnArgs::Star => return Err("Wildcard is not allowed here".to_string().into()),
-        FnArgs::All(exprs) | FnArgs::Distinct(exprs) => exprs,
+        FnArgs::All(args) | FnArgs::Distinct(args) => *args,
     };
-    let mut values = vec![];
-    for expr in exprs {
-        values.push(eval_expr(ctx, expr, current)?);
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval_expr(ctx, function_arg_expr(arg)?, current)?);
     }
     Ok(values)
 }
 
 pub(crate) fn require_arity(name: &str, values: &[Value], expected: usize) -> Result<(), Error> {
-    if values.len() != expected {
-        return Err(format!(
-            "Function `{name}` expects {expected} argument(s), got {}",
-            values.len()
-        )
-        .into());
+    require_arity_len(name, values.len(), expected)
+}
+
+pub(crate) fn require_arity_len(name: &str, found: usize, expected: usize) -> Result<(), Error> {
+    if found != expected {
+        return Err(
+            format!("Function `{name}` expects {expected} argument(s), got {found}").into(),
+        );
     }
     Ok(())
 }

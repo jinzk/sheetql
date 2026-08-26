@@ -183,6 +183,12 @@ pub fn parse_arguments(args: &[String]) -> Command {
                             "CSV delimiter must be one ASCII character".to_string(),
                         );
                     }
+                    // These bytes would make the CSV parser itself panic.
+                    if matches!(delimiter, '"' | '\r' | '\n' | '\0') {
+                        return Command::Error(
+                            "CSV delimiter cannot be a quote, NUL, CR or LF character".to_string(),
+                        );
+                    }
                     arguments.csv_delimiter = delimiter as u8;
                 }
                 Err(message) => return Command::Error(message.to_string()),
@@ -502,6 +508,18 @@ mod tests {
             parse_arguments(&args(&["-f", "data.csv", "--delimiter", "||"])),
             Command::Error(message) if message.contains("one ASCII character")
         ));
+    }
+
+    #[test]
+    fn csv_delimiter_rejects_bytes_the_parser_cannot_handle() {
+        for delimiter in ["\"", "\r", "\n"] {
+            match parse_arguments(&args(&["-f", "data.csv", "--delimiter", delimiter])) {
+                Command::Error(message) => {
+                    assert!(message.contains("delimiter"), "got: {message}")
+                }
+                other => panic!("expected Error for delimiter {delimiter:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

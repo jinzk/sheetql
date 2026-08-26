@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::database::Schema;
 use crate::database::Table;
 use crate::error::Error;
@@ -57,10 +59,18 @@ pub(crate) fn run_show_tables(
         .map(|name| vec![Value::Text(name.to_string())])
         .collect();
     if database.name == schema.current_database().unwrap_or_default() {
+        // Temporary tables shadow regular tables on resolution, so a name
+        // that already exists above must not be listed twice.
+        let existing: HashSet<String> = rows
+            .iter()
+            .filter_map(|row| row[0].as_text())
+            .map(str::to_string)
+            .collect();
         rows.extend(
             schema
                 .temporary_table_names()
                 .into_iter()
+                .filter(|name| !existing.contains(*name))
                 .filter(|name| like.is_none_or(|pattern| like_match(name, pattern, false, None)))
                 .map(|name| vec![Value::Text(name.to_string())]),
         );

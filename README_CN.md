@@ -203,8 +203,8 @@ DESCRIBE sales
 - `SELECT` 投影、`*`、`table.*` 与列别名（`AS`）
 - `FROM` 支持多表与 `JOIN` / `LEFT JOIN` / `RIGHT JOIN` / `FULL OUTER JOIN` / `CROSS JOIN`，含逗号分隔的表，以及 `ON` 与 `USING`
 - `WHERE` 支持比较、`AND` / `OR` / `NOT`、`LIKE` / `ILIKE`、`IN`、`BETWEEN`、`IS NULL`、`IS TRUE` / `IS FALSE`、`CASE`、`CAST`。`LIKE` / `ILIKE` 支持 `%`（任意字符序列）与 `_`（单个字符）通配符，并可选用 `ESCAPE '<char>'` 子句转义；当任一操作数为 `NULL` 时结果为 `NULL`（而非 `false`）。`AND` / `OR` 短路求值：左侧已确定结果时不计算右侧。`IN` / `NOT IN` 列表中含 `NULL` 且值不匹配时返回 `NULL`（而非 `false`）。
-- `GROUP BY` 配合聚合函数，以及 `HAVING`
-- `ORDER BY` 支持 `ASC` / `DESC`
+- `GROUP BY` 配合聚合函数，以及 `HAVING`；两者均支持引用输出列别名（`HAVING cnt > 1`）和从 1 开始的序数（`GROUP BY 1`）
+- `ORDER BY` 支持 `ASC` / `DESC`、输出列别名（包括在更大表达式中使用）以及从 1 开始的序数（`ORDER BY 2 DESC`）
 - `LIMIT` / `OFFSET` 与 `SELECT DISTINCT`
 - 元数据命令：`SHOW DATABASES`（别名 `SHOW SCHEMAS`）、`SHOW TABLES [FROM <database>]`、`SHOW COLUMNS FROM <table>`、`DESCRIBE <table>`、`USE <database>`；`SHOW DATABASES` / `SHOW TABLES` 支持 `LIKE '<pattern>'`，通配符为 `%` / `_`
 - `CREATE TEMPORARY TABLE <name> AS SELECT ...`：将查询结果暂存为当前交互会话中的临时表，后续查询可直接使用；同名临时表会替换旧结果，退出进程后自动消失。
@@ -231,7 +231,7 @@ DESCRIBE sales
 | `UPPER` / `UCASE`           | 1      | 转为大写                                                         |
 | `TRIM`                        | 1      | 去除首尾空白                                                     |
 | `CONCAT`                      | 2+     | 拼接值                                                           |
-| `SUBSTRING` / `SUBSTR`      | 2 或 3 | 提取子串（`文本, 起始[, 长度]`，从 1 开始）                    |
+| `SUBSTRING` / `SUBSTR`      | 2 或 3 | 提取子串（`文本, 起始[, 长度]`，从 1 开始；起始为 `0` 得到空串，负数表示从末尾倒数）                    |
 | `REPLACE`                     | 3      | 替换子串出现                                                     |
 | `LEFT`                        | 2      | 返回文本前`n` 个字符                                           |
 | `RIGHT`                       | 2      | 返回文本后`n` 个字符                                           |
@@ -411,7 +411,7 @@ sheetql -f data/sales.csv --server --export-root ./exports
 
 | 请求 | 说明 |
 | --- | --- |
-| `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | 运行查询。`db` 可选，仅将本次查询限定在该数据库内（进程级 `USE` 状态不变）。`format` 控制 `text` 字段：`json`（默认）、`csv`、`yaml`、`table`。 |
+| `{ "op": "query", "sql": "...", "db": "…", "format": "json" }` | 运行查询。`db` 可选，仅将本次查询限定在该数据库内（进程级 `USE` 状态不变）。`format` 控制 `text` 字段：`json`（默认）、`csv`、`yaml`、`table`。不支持 `INTO OUTFILE`；写文件请使用 `export` 操作。 |
 | `{ "op": "list" }` | 列出所有数据库、其中的表及各表列名。 |
 | `{ "op": "export", "sql": "...", "path": "out.csv", "overwrite": true }` | 运行查询并将结果写成 CSV。`overwrite` 默认 `false`；设为 `true` 才会替换已存在的文件。 |
 | `{ "op": "exit" }` | 先返回 `{ "ok": true }` 再退出。stdin 关闭（EOF）时服务器也会干净退出。 |

@@ -21,7 +21,10 @@ pub(crate) fn run_create_table(
     if !create.columns.is_empty() || create.query.is_none() {
         return Err("Temporary tables require `AS SELECT ...` and no column definitions".into());
     }
-    let query: &Query = create.query.as_deref().expect("checked");
+    let query: &Query = create
+        .query
+        .as_deref()
+        .ok_or("Temporary tables require `AS SELECT ...`")?;
     let result = execute_query(schema, query)?;
     schema.add_temporary_table(Table {
         name: table_name.clone(),

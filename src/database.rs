@@ -34,14 +34,8 @@ impl Database {
 
     pub fn add_table(&mut self, mut table: Table) {
         let base_name = table.name.clone();
-        let mut final_name = base_name.clone();
-        let mut counter = 1;
-        while self.by_name.contains_key(&final_name) {
-            final_name = format!("{}_{}", base_name, counter);
-            counter += 1;
-        }
-        table.name = final_name.clone();
-        self.by_name.insert(final_name, self.tables.len());
+        table.name = crate::naming::unique_name(base_name, |name| self.by_name.contains_key(name));
+        self.by_name.insert(table.name.clone(), self.tables.len());
         self.tables.push(table);
     }
 
@@ -76,17 +70,9 @@ impl Schema {
 
     pub fn add_database(&mut self, mut database: Database) {
         let base_name = database.name.clone();
-        let mut final_name = base_name.clone();
-        let mut counter = 1;
-        while self
-            .databases
-            .iter()
-            .any(|existing| existing.name == final_name)
-        {
-            final_name = format!("{}_{}", base_name, counter);
-            counter += 1;
-        }
-        database.name = final_name;
+        database.name = crate::naming::unique_name(base_name, |name| {
+            self.databases.iter().any(|existing| existing.name == name)
+        });
         self.databases.push(database);
     }
 
@@ -152,7 +138,10 @@ impl Schema {
                     0 => Err(format!("Table `{table}` not found").into()),
                     1 => {
                         let database = found[0];
-                        Ok((database, database.get_table(table).expect("just found")))
+                        let table = database
+                            .get_table(table)
+                            .ok_or_else(|| format!("Table `{table}` not found"))?;
+                        Ok((database, table))
                     }
                     _ => Err(format!(
                         "Table `{table}` is ambiguous, qualify it as `database.table`"

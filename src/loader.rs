@@ -223,7 +223,7 @@ fn load_csv(
     }
 
     if header.is_none() {
-        return Ok(());
+        return Err(format!("CSV file `{path}` is empty").into());
     }
 
     let name = csv_table_name(path);
@@ -282,28 +282,32 @@ fn parse_cell(cell: &str) -> Value {
         return Value::Null;
     }
 
-    if has_leading_zero(cell) {
+    // Numeric and boolean inference ignores surrounding whitespace, but a
+    // value kept as text preserves the original spelling.
+    let trimmed = cell.trim();
+
+    if has_leading_zero(trimmed) {
         return Value::Text(cell.to_string());
     }
 
-    if let Ok(value) = cell.parse::<i64>() {
+    if let Ok(value) = trimmed.parse::<i64>() {
         return Value::Int(value);
     }
 
     // Keep whole numbers that don't fit in i64 as text instead of silently
     // losing precision when parsed as f64.
-    if is_whole_number(cell) {
+    if is_whole_number(trimmed) {
         return Value::Text(cell.to_string());
     }
 
-    if let Ok(value) = cell.parse::<f64>() {
+    if let Ok(value) = trimmed.parse::<f64>() {
         if value.is_finite() {
             return Value::Float(value);
         }
         return Value::Text(cell.to_string());
     }
 
-    let lower = cell.to_lowercase();
+    let lower = trimmed.to_lowercase();
     if lower == "true" {
         return Value::Bool(true);
     }
@@ -334,12 +338,7 @@ fn build_columns(headers: Vec<String>) -> Vec<String> {
             name = format!("col{}", index + 1);
         }
 
-        let base_name = name.clone();
-        let mut counter = 1;
-        while used.contains(&name) {
-            name = format!("{}_{}", base_name, counter);
-            counter += 1;
-        }
+        name = crate::naming::unique_name(name, |candidate| used.contains(candidate));
 
         used.insert(name.clone());
         columns.push(name);
@@ -356,6 +355,10 @@ fn cell_value(cell: &Cell) -> Value {
         Cell::String(value) => Value::Text(value.clone()),
         Cell::Bool(value) => Value::Bool(*value),
         Cell::DateTime(value) => {
+            if value.is_duration() {
+                // Duration cells render as elapsed time, not as a date.
+                return Value::Text(format_excel_timedelta(value));
+            }
             let formatted = format_excel_datetime(value);
             if formatted.len() > 10 {
                 Value::DateTime(formatted)
@@ -369,11 +372,25 @@ fn cell_value(cell: &Cell) -> Value {
 
 fn format_excel_datetime(value: &ExcelDateTime) -> String {
     let (year, month, day, hour, minute, second, milli) = value.to_ymd_hms_milli();
+    let date = format!("{year}/{month}/{day}");
     if hour == 0 && minute == 0 && second == 0 && milli == 0 {
-        format!("{year}/{month}/{day}")
+        date
+    } else if milli == 0 {
+        format!("{date} {hour}:{minute:02}:{second:02}")
     } else {
-        format!("{year}/{month}/{day} {hour}:{minute}:{second}")
+        format!("{date} {hour}:{minute:02}:{second:02}.{milli:03}")
     }
+}
+
+fn format_excel_timedelta(value: &ExcelDateTime) -> String {
+    // Excel durations are stored as a fraction of a day.
+    let total_seconds = (value.as_f64() * 86_400.0).round() as i64;
+    let sign = if total_seconds < 0 { "-" } else { "" };
+    let total_seconds = total_seconds.abs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 #[cfg(test)]
@@ -394,6 +411,64 @@ mod tests {
         assert_eq!(parse_cell("0"), Value::Int(0));
         assert_eq!(parse_cell("-007"), Value::Text("-007".to_string()));
         assert_eq!(parse_cell("a1b2"), Value::Text("a1b2".to_string()));
+    }
+
+    #[test]
+    fn parse_cell_infers_numbers_from_padded_cells() {
+        // Whitespace around a number must not turn the column into text.
+        assert_eq!(parse_cell(" 42"), Value::Int(42));
+        assert_eq!(parse_cell("42 "), Value::Int(42));
+        assert_eq!(parse_cell(" 2.5 "), Value::Float(2.5));
+        assert_eq!(parse_cell(" true "), Value::Bool(true));
+        assert_eq!(parse_cell("\t7\n"), Value::Int(7));
+    }
+
+    #[test]
+    fn load_csv_rejects_completely_empty_files() {
+        let path =
+            std::env::temp_dir().join(format!("sheetql_empty_csv_{}.csv", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        let mut database = crate::database::Database::new();
+        let error = load_csv(
+            &mut database,
+            &path.to_string_lossy(),
+            None,
+            &CsvOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("empty"), "got: {error}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn duration_cells_render_as_elapsed_time() {
+        // Half a day = 12 hours.
+        let serial =
+            calamine::ExcelDateTime::new(0.5, calamine::ExcelDateTimeType::TimeDelta, false);
+        let cell = calamine::Data::DateTime(serial);
+        assert_eq!(cell_value(&cell), Value::Text("12:00:00".to_string()));
+    }
+
+    #[test]
+    fn datetime_cells_keep_fractional_seconds() {
+        let serial = calamine::ExcelDateTime::new(
+            46149.4375125,
+            calamine::ExcelDateTimeType::DateTime,
+            false,
+        );
+        let cell = calamine::Data::DateTime(serial);
+        let value = cell_value(&cell);
+        let Value::DateTime(text) = value else {
+            panic!("expected datetime, got {value:?}");
+        };
+        // Milliseconds are rendered instead of being truncated away.
+        assert_eq!(text, "2026/5/7 10:30:01.080");
+        // Fractional datetimes still compare against plain text datetimes.
+        let parsed = crate::value::values_partial_cmp(
+            &Value::DateTime(text),
+            &Value::DateTime("2026/5/8 10:30:01".into()),
+        );
+        assert_eq!(parsed, Some(std::cmp::Ordering::Less));
     }
 
     #[test]

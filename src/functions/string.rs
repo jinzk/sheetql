@@ -3,6 +3,31 @@ use crate::value::Value;
 
 use super::require_arity;
 
+/// Shared `SUBSTRING` implementation with MySQL semantics: positions are
+/// 1-based, a start of 0 yields an empty string, and negative starts count
+/// back from the end of the text. Used both by the plain function call and by
+/// the `Expr::Substring` AST node handled in `crate::evaluator`.
+pub(crate) fn substring(text: &str, from: i64, length: Option<i64>) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let char_count = chars.len() as i64;
+    let start_index = if from >= 1 {
+        // Positions beyond the text simply produce an empty result.
+        (from - 1).min(char_count) as usize
+    } else {
+        // from == 0 or negative: count back from the end.
+        char_count.saturating_add(from).max(0) as usize
+    };
+    let end_index = match length {
+        Some(count) => start_index.saturating_add(count.max(0) as usize),
+        None => chars.len(),
+    };
+    chars
+        .get(start_index..end_index.min(chars.len()))
+        .unwrap_or(&[])
+        .iter()
+        .collect()
+}
+
 /// String and formatting functions. Returns `Ok(None)` when `name` does not
 /// belong to this module so the caller can try the next category.
 pub(crate) fn eval(name: &str, values: &[Value]) -> Result<Option<Value>, Error> {
@@ -47,25 +72,19 @@ pub(crate) fn eval(name: &str, values: &[Value]) -> Result<Option<Value>, Error>
             if values.len() != 2 && values.len() != 3 {
                 return Err(format!("Function `{name}` expects 2 or 3 arguments").into());
             }
-            let text: Vec<char> = values[0].to_display_string().chars().collect();
             let start = values[1]
                 .as_i64()
                 .ok_or("SUBSTRING start must be a number")?;
-            let start_index = if start >= 0 { (start - 1) as usize } else { 0 };
-            let end_index = if values.len() == 3 {
-                let length = values[2]
-                    .as_i64()
-                    .ok_or("SUBSTRING length must be a number")?;
-                start_index.saturating_add(length.max(0) as usize)
+            let length = if values.len() == 3 {
+                Some(
+                    values[2]
+                        .as_i64()
+                        .ok_or("SUBSTRING length must be a number")?,
+                )
             } else {
-                text.len()
+                None
             };
-            let result: String = text
-                .get(start_index..end_index.min(text.len()))
-                .unwrap_or(&[])
-                .iter()
-                .collect();
-            Value::Text(result)
+            Value::Text(substring(&values[0].to_display_string(), start, length))
         }
         "replace" => {
             require_arity(name, values, 3)?;

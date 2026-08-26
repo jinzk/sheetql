@@ -6,10 +6,11 @@ use std::collections::HashSet;
 use chrono::Local;
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Offset,
-    OrderByKind, Query, Select, SelectItem, SetExpr, TableFactor,
+    OrderByKind, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
 };
 
 use crate::database::Schema;
+use crate::engine::rewrite::{AliasPrecedence, ExprRewriter, alias_map, ordinal_literal};
 use crate::error::Error;
 use crate::evaluator::EvalContext;
 use crate::evaluator::eval_expr;
@@ -30,14 +31,134 @@ pub(crate) fn execute_query<'a>(
         _ => return Err("Only plain SELECT queries are supported".to_string().into()),
     };
 
-    let has_from = !select.from.is_empty();
+    let (schema_refs, mut rows): (Vec<ColumnRef>, Cow<'a, [Vec<Value>]>) =
+        collect_relations(schema, &select.from, now)?;
+    if select.from.is_empty() {
+        rows = Cow::Owned(vec![vec![]]);
+    }
+    let rows_view: &[Vec<Value>] = &rows;
 
+    let lookup = build_lookup(&schema_refs)?;
+
+    // WHERE only normalizes identifier case; aliases are not visible there.
+    let selection = select
+        .selection
+        .as_ref()
+        .map(|selection| ExprRewriter::lowercase().rewritten(selection));
+
+    // WHERE keeps a set of row indices instead of copying the rows themselves.
+    let active: Vec<usize> = if let Some(selection) = &selection {
+        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
+        let mut filtered: Vec<usize> = vec![];
+        for (index, row) in rows_view.iter().enumerate() {
+            let value = eval_expr(&ctx, selection, row)?;
+            if value.truthy() {
+                filtered.push(index);
+            }
+        }
+        filtered
+    } else {
+        (0..rows_view.len()).collect()
+    };
+
+    // The projection plan holds case-normalized expressions; titles keep the
+    // original spelling for display.
+    let plan = build_projection_plan(&schema_refs, &select.projection)?;
+    let output_titles = titles(&plan);
+    let aliases = alias_map(&plan);
+
+    // HAVING and GROUP BY accept output aliases (`HAVING cnt > 1`) and
+    // ordinals (`GROUP BY 1`), matching MySQL behavior. Source columns take
+    // precedence over same-named aliases in these clauses.
+    let having = select.having.as_ref().map(|having| {
+        ExprRewriter::with_aliases(&aliases, AliasPrecedence::SourceFirst, Some(&lookup))
+            .rewritten(having)
+    });
+    let group_exprs = group_by_expressions(&select.group_by, &aliases, &lookup)?;
+    let group_sources: Vec<GroupSource> = group_exprs
+        .iter()
+        .map(|expr| resolve_group_source(expr, &plan))
+        .collect::<Result<_, _>>()?;
+
+    let order_terms = order_terms(query, &plan, &aliases)?;
+    let is_aggregate = !group_exprs.is_empty()
+        || select.projection.iter().any(projection_has_aggregate)
+        || select.having.is_some()
+        || order_by_has_aggregate(query);
+
+    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = vec![];
+
+    if is_aggregate {
+        let groups = build_groups(&lookup, rows_view, &group_sources, &active, now)?;
+
+        for group in &groups {
+            let ctx = EvalContext::new(&lookup, rows_view, group, now);
+            let representative = representative_row(rows_view, group);
+
+            if let Some(having) = &having {
+                let value = eval_expr(&ctx, having, representative)?;
+                if !value.truthy() {
+                    continue;
+                }
+            }
+
+            let out = project(&ctx, &plan, representative)?;
+            let keys = order_keys(&order_terms, &ctx, &out, representative)?;
+            keyed.push((keys, out));
+        }
+    } else {
+        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
+        for &row_index in &active {
+            let row = &rows_view[row_index];
+            let out = project(&ctx, &plan, row)?;
+            let keys = order_keys(&order_terms, &ctx, &out, row)?;
+            keyed.push((keys, out));
+        }
+    }
+
+    if is_distinct(select)? {
+        let mut seen: HashSet<Vec<GroupKey>> = HashSet::new();
+        keyed.retain(|(_, out)| seen.insert(out.iter().map(group_key).collect()));
+    }
+
+    sort_keyed(&mut keyed, &order_terms);
+
+    let mut final_rows: Vec<Vec<Value>> = keyed.into_iter().map(|(_, out)| out).collect();
+
+    let (limit, offset) = parse_limit(&query.limit_clause)?;
+    if let Some(offset) = offset {
+        final_rows = final_rows.into_iter().skip(offset).collect();
+    }
+    if let Some(limit) = limit {
+        final_rows.truncate(limit);
+    }
+
+    Ok(crate::engine::QueryResult {
+        columns: output_titles,
+        rows: final_rows,
+        stats: crate::engine::QueryStats {
+            input_rows: rows_view.len(),
+            ..Default::default()
+        },
+    })
+}
+
+/// Load every relation in the FROM clause, folding in joins. A single plain
+/// table is borrowed straight from the schema (zero-copy); any join or
+/// multi-table FROM materializes an owned copy.
+/// Materialized FROM-clause state: the flattened column references and the
+/// combined row set (borrowed when a single plain table is selected).
+type Relations<'a> = (Vec<ColumnRef>, Cow<'a, [Vec<Value>]>);
+
+fn collect_relations<'a>(
+    schema: &'a Schema,
+    from: &[TableWithJoins],
+    now: chrono::DateTime<Local>,
+) -> Result<Relations<'a>, Error> {
     let mut schema_refs: Vec<ColumnRef> = vec![];
-    // A single plain table is borrowed straight from the schema (zero-copy);
-    // any join or multi-table FROM materializes an owned copy.
     let mut rows: Cow<'a, [Vec<Value>]> = Cow::Owned(vec![]);
 
-    for (index, table_with_joins) in select.from.iter().enumerate() {
+    for (index, table_with_joins) in from.iter().enumerate() {
         let base = load_relation(schema, &table_with_joins.relation)?;
 
         if table_with_joins.joins.is_empty() {
@@ -51,8 +172,8 @@ pub(crate) fn execute_query<'a>(
             continue;
         }
 
-        // This relation carries joins, so the accumulated rows are materialized
-        // and each join is folded in.
+        // This relation carries joins, so the accumulated rows are
+        // materialized and each join is folded in.
         let mut current = rows.into_owned();
         if index == 0 {
             schema_refs = base.schema;
@@ -71,126 +192,7 @@ pub(crate) fn execute_query<'a>(
         rows = Cow::Owned(current);
     }
 
-    if !has_from {
-        rows = Cow::Owned(vec![vec![]]);
-    }
-
-    let rows_view: &[Vec<Value>] = &rows;
-
-    let lookup = build_lookup(&schema_refs)?;
-
-    // WHERE keeps a set of row indices instead of copying the rows themselves.
-    let active: Vec<usize> = if let Some(selection) = &select.selection {
-        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
-        let mut filtered: Vec<usize> = vec![];
-        for (index, row) in rows_view.iter().enumerate() {
-            let value = eval_expr(&ctx, selection, row)?;
-            if value.truthy() {
-                filtered.push(index);
-            }
-        }
-        filtered
-    } else {
-        (0..rows_view.len()).collect()
-    };
-
-    let plan = build_projection_plan(&schema_refs, &select.projection)?;
-
-    let group_exprs = group_by_expressions(&select.group_by)?;
-    let is_aggregate = !group_exprs.is_empty()
-        || select.projection.iter().any(projection_has_aggregate)
-        || select.having.is_some()
-        || order_by_has_aggregate(query);
-
-    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = vec![];
-    let output_titles = titles(&plan);
-
-    let mut order_columns: HashMap<String, usize> = HashMap::new();
-    for (name, index) in &lookup {
-        if *index != usize::MAX {
-            order_columns.insert(name.clone(), output_titles.len() + index);
-        }
-    }
-    for (index, title) in output_titles.iter().enumerate() {
-        order_columns.insert(title.clone(), index);
-    }
-
-    if is_aggregate {
-        let groups = build_groups(&lookup, rows_view, &group_exprs, &active, now)?;
-
-        for group in &groups {
-            let ctx = EvalContext::new(&lookup, rows_view, group, now);
-            let representative = representative_row(rows_view, group);
-
-            if let Some(having) = &select.having {
-                let value = eval_expr(&ctx, having, representative)?;
-                if !value.truthy() {
-                    continue;
-                }
-            }
-
-            let out = project(&ctx, &plan, representative)?;
-
-            let mut combined = out;
-            combined.extend_from_slice(representative);
-
-            let order_ctx = EvalContext::new(&order_columns, rows_view, group, now);
-            let keys = compute_order_keys(query, &order_ctx, &combined)?;
-            let _original = combined.split_off(output_titles.len());
-            keyed.push((keys, combined));
-        }
-    } else {
-        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
-        let order_ctx = EvalContext::new(&order_columns, rows_view, &[], now);
-        // Only assemble the combined row when an ORDER BY expression actually
-        // references a projection title; otherwise evaluate directly on the
-        // row using the original (unshifted) column lookup.
-        let needs_projection = order_by_references_titles(query, &output_titles);
-        for &row_index in &active {
-            let row = &rows_view[row_index];
-            let out = project(&ctx, &plan, row)?;
-            let keys = if needs_projection {
-                let mut combined = out.clone();
-                combined.extend_from_slice(row);
-                compute_order_keys(query, &order_ctx, &combined)?
-            } else {
-                compute_order_keys(query, &ctx, row)?
-            };
-            keyed.push((keys, out));
-        }
-    }
-
-    if is_distinct(select)? {
-        let mut seen: HashSet<Vec<GroupKey>> = HashSet::new();
-        keyed.retain(|(_, out)| seen.insert(out.iter().map(group_key).collect()));
-    }
-
-    if let Some(order) = &query.order_by {
-        let exprs = match &order.kind {
-            OrderByKind::Expressions(exprs) => exprs,
-            OrderByKind::All(_) => return Err("ORDER BY ALL is not supported".to_string().into()),
-        };
-        keyed.sort_by(|a, b| compare_keys(&a.0, &b.0, exprs));
-    }
-
-    let mut final_rows: Vec<Vec<Value>> = keyed.into_iter().map(|(_, out)| out).collect();
-
-    let (limit, offset) = parse_limit(&query.limit_clause)?;
-    if let Some(offset) = offset {
-        final_rows = final_rows.into_iter().skip(offset).collect();
-    }
-    if let Some(limit) = limit {
-        final_rows.truncate(limit);
-    }
-
-    Ok(crate::engine::QueryResult {
-        columns: titles(&plan),
-        rows: final_rows,
-        stats: crate::engine::QueryStats {
-            input_rows: rows_view.len(),
-            ..Default::default()
-        },
-    })
+    Ok((schema_refs, rows))
 }
 
 fn titles(plan: &[ProjectionItem]) -> Vec<String> {
@@ -223,11 +225,128 @@ fn order_by_has_aggregate(query: &Query) -> bool {
     })
 }
 
-fn group_by_expressions(group_by: &GroupByExpr) -> Result<Vec<&Expr>, Error> {
+/// Parse GROUP BY into rewritten (alias-aware) expressions.
+fn group_by_expressions(
+    group_by: &GroupByExpr,
+    aliases: &HashMap<String, &Expr>,
+    lookup: &HashMap<String, usize>,
+) -> Result<Vec<Expr>, Error> {
     match group_by {
-        GroupByExpr::Expressions(exprs, _) => Ok(exprs.iter().collect()),
+        GroupByExpr::Expressions(exprs, _) => Ok(exprs
+            .iter()
+            .map(|expr| {
+                ExprRewriter::with_aliases(aliases, AliasPrecedence::SourceFirst, Some(lookup))
+                    .rewritten(expr)
+            })
+            .collect()),
         GroupByExpr::All(_) => Err("GROUP BY ALL is not supported".to_string().into()),
     }
+}
+
+/// A single GROUP BY term resolved against the projection plan: either an
+/// expression over the source row, or a projected output column referenced by
+/// its 1-based position (`GROUP BY 2`).
+enum GroupSource<'g> {
+    Expr(&'g Expr),
+    Column(usize),
+}
+
+fn resolve_group_source<'g>(
+    expr: &'g Expr,
+    plan: &'g [ProjectionItem],
+) -> Result<GroupSource<'g>, Error> {
+    if let Some(ordinal) = ordinal_literal(expr) {
+        let item = plan
+            .get(ordinal - 1)
+            .ok_or_else(|| format!("GROUP BY position {ordinal} is not in the select list"))?;
+        return Ok(match item {
+            ProjectionItem::Expression { expr, .. } => GroupSource::Expr(expr.as_ref()),
+            ProjectionItem::Column { index, .. } => GroupSource::Column(*index),
+        });
+    }
+    Ok(GroupSource::Expr(expr))
+}
+
+/// One ORDER BY term, fully resolved before execution: either an output
+/// position or an alias-substituted expression, plus its sort direction.
+struct OrderTerm {
+    source: OrderSource,
+    ascending: bool,
+}
+
+enum OrderSource {
+    Ordinal(usize),
+    Expr(Box<Expr>),
+}
+
+fn order_terms(
+    query: &Query,
+    plan: &[ProjectionItem],
+    aliases: &HashMap<String, &Expr>,
+) -> Result<Vec<OrderTerm>, Error> {
+    let Some(order) = &query.order_by else {
+        return Ok(vec![]);
+    };
+    let OrderByKind::Expressions(exprs) = &order.kind else {
+        return Err("ORDER BY ALL is not supported".to_string().into());
+    };
+    // Aliases take precedence in ORDER BY (MySQL behavior).
+    let rewriter = ExprRewriter::with_aliases(aliases, AliasPrecedence::AliasFirst, None);
+    let mut terms = Vec::with_capacity(exprs.len());
+    for order_expr in exprs {
+        let source = if let Some(ordinal) = ordinal_literal(&order_expr.expr) {
+            if ordinal > plan.len() {
+                return Err(
+                    format!("ORDER BY position {ordinal} is not in the select list").into(),
+                );
+            }
+            OrderSource::Ordinal(ordinal)
+        } else {
+            OrderSource::Expr(Box::new(rewriter.rewritten(&order_expr.expr)))
+        };
+        terms.push(OrderTerm {
+            source,
+            ascending: order_expr.options.asc.unwrap_or(true),
+        });
+    }
+    Ok(terms)
+}
+
+/// Compute the sort keys for one output row. Ordinals read straight from the
+/// projected values; expressions evaluate against the source row through the
+/// given context (which carries `group_rows` in aggregate queries).
+fn order_keys(
+    terms: &[OrderTerm],
+    ctx: &EvalContext,
+    out: &[Value],
+    source_row: &[Value],
+) -> Result<Vec<Value>, Error> {
+    let mut keys = Vec::with_capacity(terms.len());
+    for term in terms {
+        match &term.source {
+            OrderSource::Ordinal(position) => {
+                keys.push(out[position - 1].clone());
+            }
+            OrderSource::Expr(expr) => keys.push(eval_expr(ctx, expr, source_row)?),
+        }
+    }
+    Ok(keys)
+}
+
+fn sort_keyed(keyed: &mut [(Vec<Value>, Vec<Value>)], terms: &[OrderTerm]) {
+    keyed.sort_by(|a, b| {
+        for (index, term) in terms.iter().enumerate() {
+            let mut ordering =
+                values_partial_cmp(&a.0[index], &b.0[index]).unwrap_or(Ordering::Equal);
+            if !term.ascending {
+                ordering = ordering.reverse();
+            }
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    });
 }
 
 fn is_distinct(select: &Select) -> Result<bool, Error> {
@@ -245,81 +364,32 @@ fn parse_limit(
         None => Ok((None, None)),
         Some(LimitClause::LimitOffset { limit, offset, .. }) => {
             let limit_value = match limit {
-                Some(expr) => eval_const_int(expr)?,
+                Some(expr) => Some(eval_const_int(expr, "LIMIT")?),
                 None => None,
             };
             let offset_value = match offset {
-                Some(Offset { value, .. }) => eval_const_int(value)?,
+                Some(Offset { value, .. }) => Some(eval_const_int(value, "OFFSET")?),
                 None => None,
             };
             Ok((limit_value, offset_value))
         }
         Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-            let offset_value = eval_const_int(offset)?;
-            let limit_value = eval_const_int(limit)?;
-            Ok((limit_value, offset_value))
+            let offset_value = eval_const_int(offset, "OFFSET")?;
+            let limit_value = eval_const_int(limit, "LIMIT")?;
+            Ok((Some(limit_value), Some(offset_value)))
         }
     }
 }
 
-fn eval_const_int(expr: &Expr) -> Result<Option<usize>, Error> {
+/// Evaluate a LIMIT/OFFSET bound. Anything other than a non-negative integer
+/// constant is an error rather than being silently ignored or clamped.
+fn eval_const_int(expr: &Expr, clause: &str) -> Result<usize, Error> {
     let value = eval_expr(&EvalContext::scalar(), expr, &[])?;
     match value {
-        Value::Int(number) => Ok(Some(number.max(0) as usize)),
-        _ => Ok(None),
+        Value::Int(number) if number >= 0 => Ok(number as usize),
+        Value::Int(number) => Err(format!("{clause} must be non-negative, got `{number}`").into()),
+        other => Err(format!("{clause} expects an integer constant, got `{other}`").into()),
     }
-}
-
-fn order_by_references_titles(query: &Query, titles: &[String]) -> bool {
-    let Some(order) = &query.order_by else {
-        return false;
-    };
-    let OrderByKind::Expressions(exprs) = &order.kind else {
-        return false;
-    };
-    exprs.iter().any(|order_expr| match &order_expr.expr {
-        Expr::Identifier(ident) => titles
-            .iter()
-            .any(|title| title.eq_ignore_ascii_case(&ident.value)),
-        Expr::CompoundIdentifier(parts) => {
-            let name = parts
-                .iter()
-                .map(|ident| ident.value.clone())
-                .collect::<Vec<_>>()
-                .join(".");
-            titles.iter().any(|title| title.eq_ignore_ascii_case(&name))
-        }
-        _ => false,
-    })
-}
-
-fn compute_order_keys(
-    query: &Query,
-    ctx: &EvalContext,
-    row: &[Value],
-) -> Result<Vec<Value>, Error> {
-    let mut keys = vec![];
-    if let Some(order) = &query.order_by
-        && let OrderByKind::Expressions(exprs) = &order.kind
-    {
-        for order_expr in exprs {
-            keys.push(eval_expr(ctx, &order_expr.expr, row)?);
-        }
-    }
-    Ok(keys)
-}
-
-fn compare_keys(a: &[Value], b: &[Value], exprs: &[sqlparser::ast::OrderByExpr]) -> Ordering {
-    for (index, order_expr) in exprs.iter().enumerate() {
-        let mut ordering = values_partial_cmp(&a[index], &b[index]).unwrap_or(Ordering::Equal);
-        if !order_expr.options.asc.unwrap_or(true) {
-            ordering = ordering.reverse();
-        }
-        if ordering != Ordering::Equal {
-            return ordering;
-        }
-    }
-    Ordering::Equal
 }
 
 fn representative_row<'a>(rows: &'a [Vec<Value>], group: &[usize]) -> &'a [Value] {
@@ -332,11 +402,11 @@ fn representative_row<'a>(rows: &'a [Vec<Value>], group: &[usize]) -> &'a [Value
 fn build_groups(
     lookup: &HashMap<String, usize>,
     rows: &[Vec<Value>],
-    group_exprs: &[&Expr],
+    sources: &[GroupSource],
     active: &[usize],
     now: chrono::DateTime<Local>,
 ) -> Result<Vec<Vec<usize>>, Error> {
-    if group_exprs.is_empty() {
+    if sources.is_empty() {
         return Ok(vec![active.to_vec()]);
     }
 
@@ -346,9 +416,14 @@ fn build_groups(
 
     for &row_index in active {
         let row = &rows[row_index];
-        let mut key: Vec<GroupKey> = vec![];
-        for expr in group_exprs {
-            let value = eval_expr(&ctx, expr, row)?;
+        let mut key: Vec<GroupKey> = Vec::with_capacity(sources.len());
+        for source in sources {
+            let value = match source {
+                GroupSource::Expr(expr) => eval_expr(&ctx, expr, row)?,
+                GroupSource::Column(column_index) => {
+                    row.get(*column_index).cloned().unwrap_or(Value::Null)
+                }
+            };
             key.push(group_key(&value));
         }
         let group_index = match index.get(&key) {
@@ -366,7 +441,8 @@ fn build_groups(
     Ok(groups)
 }
 
-enum ProjectionItem {
+#[derive(Debug)]
+pub(crate) enum ProjectionItem {
     Column { index: usize, title: String },
     Expression { expr: Box<Expr>, title: String },
 }
@@ -407,12 +483,14 @@ fn build_projection_plan(
                     return Err(format!("Table `{qualifier}` not found").into());
                 }
             }
+            // Titles keep the user's spelling; stored expressions are
+            // case-normalized so per-row column resolution hits directly.
             SelectItem::UnnamedExpr(expr) => plan.push(ProjectionItem::Expression {
-                expr: Box::new(expr.clone()),
+                expr: Box::new(ExprRewriter::lowercase().rewritten(expr)),
                 title: expr_title(expr),
             }),
             SelectItem::ExprWithAlias { expr, alias } => plan.push(ProjectionItem::Expression {
-                expr: Box::new(expr.clone()),
+                expr: Box::new(ExprRewriter::lowercase().rewritten(expr)),
                 title: alias.to_string(),
             }),
             SelectItem::ExprWithAliases { .. } => {
@@ -553,14 +631,18 @@ fn apply_join(
             &mut matched_right,
         );
     } else {
+        // Nested-loop fallback: reuse one scratch buffer to build candidate
+        // combined rows so only genuinely matching pairs get cloned.
+        let mut scratch: Vec<Value> = Vec::with_capacity(left_len + right_len);
         for (left_index, left_row) in left_rows.iter().enumerate() {
             for (right_index, right_row) in right.rows.iter().enumerate() {
-                let mut row = left_row.clone();
-                row.extend_from_slice(right_row);
-                if join_keep(operator, &lookup, now, &row)? {
+                scratch.clear();
+                scratch.extend_from_slice(left_row);
+                scratch.extend_from_slice(right_row);
+                if join_keep(operator, &lookup, now, &scratch)? {
                     matched_left[left_index] = true;
                     matched_right[right_index] = true;
-                    output.push(row);
+                    output.push(scratch.clone());
                 }
             }
         }
@@ -606,6 +688,15 @@ fn hash_using_join(
 ) {
     let mut index: HashMap<Vec<GroupKey>, Vec<usize>> = HashMap::new();
     for (right_index, row) in right_rows.iter().enumerate() {
+        // SQL equi-joins never match NULL keys, so they are excluded from the
+        // build side entirely (they would otherwise bucket together and
+        // compare equal under `values_eq`).
+        if pairs
+            .iter()
+            .any(|&(_, right_column)| row[right_column].is_null())
+        {
+            continue;
+        }
         let key = pairs
             .iter()
             .map(|&(_, right_column)| group_key(&row[right_column]))
@@ -614,6 +705,12 @@ fn hash_using_join(
     }
 
     for (left_index, left_row) in left_rows.iter().enumerate() {
+        if pairs
+            .iter()
+            .any(|&(left_column, _)| left_row[left_column].is_null())
+        {
+            continue;
+        }
         let key = pairs
             .iter()
             .map(|&(left_column, _)| group_key(&left_row[left_column]))
@@ -805,9 +902,9 @@ fn join_keep(
             let value = eval_expr(&ctx, expr, combined)?;
             Ok(value.truthy())
         }
-        JoinConstraint::Using(_) => {
-            unreachable!("USING joins are handled by column pairs")
-        }
+        JoinConstraint::Using(_) => Err("This join type cannot be combined with a USING clause"
+            .to_string()
+            .into()),
         JoinConstraint::None => Ok(true),
         JoinConstraint::Natural => Err("NATURAL JOIN is not supported".to_string().into()),
     }
