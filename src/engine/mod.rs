@@ -795,6 +795,42 @@ mod tests {
     }
 
     #[test]
+    fn multiple_aggregates_share_argument_summary() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT COUNT(age + 1), SUM(age + 1), AVG(age + 1), MIN(age + 1), MAX(age + 1) FROM people",
+        );
+        assert_eq!(
+            result.rows[0],
+            vec![
+                Value::Int(5),
+                Value::Int(163),
+                Value::Float(32.6),
+                Value::Int(26),
+                Value::Int(41),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_aggregate_state_isolated_per_group() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT city, SUM(age + 1) AS total FROM people GROUP BY city ORDER BY city",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("LA".into()), Value::Int(55)],
+                vec![Value::Text("NY".into()), Value::Int(72)],
+                vec![Value::Text("SF".into()), Value::Int(36)],
+            ]
+        );
+    }
+
+    #[test]
     fn sum_avg_distinct_ignore_duplicates() {
         let mut database = Database::named("test");
         database.add_table(Table {
@@ -831,6 +867,56 @@ mod tests {
             "SELECT name FROM people ORDER BY id LIMIT 2 OFFSET 2",
         );
         assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn simple_limit_skips_later_projection_errors() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT CASE WHEN id = 1 THEN 1 ELSE 1 / 0 END FROM people LIMIT 1",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+    }
+
+    #[test]
+    fn limit_zero_skips_filter_evaluation() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT 1 FROM people WHERE 1 / 0 = 1 LIMIT 0");
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn order_by_limit_keeps_smallest_rows() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT name, age FROM people ORDER BY age LIMIT 2",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("Bob".into()), Value::Int(25)],
+                vec![Value::Text("Eve".into()), Value::Int(28)],
+            ]
+        );
+    }
+
+    #[test]
+    fn order_by_limit_preserves_mixed_direction_and_offset() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT city, age FROM people ORDER BY city ASC, age DESC LIMIT 3 OFFSET 1",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("LA".into()), Value::Int(25)],
+                vec![Value::Text("NY".into()), Value::Int(40)],
+                vec![Value::Text("NY".into()), Value::Int(30)],
+            ]
+        );
     }
 
     #[test]

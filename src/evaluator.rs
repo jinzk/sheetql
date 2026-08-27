@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 use sqlparser::ast::{
@@ -8,7 +10,29 @@ use sqlparser::ast::{
 
 use crate::error::Error;
 use crate::functions::{eval_function, floor_ceil};
+use crate::value::GroupKey;
 use crate::value::Value;
+
+#[derive(Debug, Clone, Default)]
+pub struct AggregateSummary {
+    pub count: i64,
+    pub distinct_count: i64,
+    pub numeric_count: usize,
+    pub is_float: bool,
+    pub sum_int: Option<i64>,
+    pub sum_int_overflow: bool,
+    pub sum_float: f64,
+    pub distinct_numeric_count: usize,
+    pub distinct_is_float: bool,
+    pub distinct_sum_int: Option<i64>,
+    pub distinct_sum_int_overflow: bool,
+    pub distinct_sum_float: f64,
+    pub distinct: std::collections::HashSet<GroupKey>,
+    pub non_numeric: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ExprId(pub(crate) usize);
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
 
@@ -17,13 +41,39 @@ pub struct EvalContext<'a> {
     pub all_rows: &'a [Vec<Value>],
     pub group_rows: &'a [usize],
     pub now: DateTime<Local>,
+    pub(crate) expr_keys: &'a HashMap<String, ExprId>,
+    pub(crate) expressions: &'a [Expr],
+
+    /// Values of aggregate arguments already evaluated for this group.
+    /// Aggregate functions share a context, so SUM(x), AVG(x), and MAX(x)
+    /// do not repeatedly evaluate the same expression for every row.
+    pub(crate) group_state: Option<&'a RefCell<GroupState>>,
 }
 
 static EMPTY_COLUMNS: std::sync::OnceLock<HashMap<String, usize>> = std::sync::OnceLock::new();
 static EMPTY_ROWS: [Vec<Value>; 0] = [];
 static EMPTY_GROUP: [usize; 0] = [];
+static EMPTY_EXPR_KEYS: std::sync::OnceLock<HashMap<String, ExprId>> = std::sync::OnceLock::new();
+pub(crate) type ExprIds = HashMap<String, ExprId>;
+
+#[derive(Debug, Default)]
+pub(crate) struct GroupState {
+    pub(crate) argument_values: HashMap<ExprId, Arc<[Value]>>,
+    pub(crate) summaries: HashMap<ExprId, AggregateSummary>,
+}
 
 impl<'a> EvalContext<'a> {
+    pub(crate) fn expr_id(&self, expr: &Expr) -> ExprId {
+        self.expr_keys
+            .get(&expr.to_string())
+            .copied()
+            .expect("all aggregate expressions must be registered in the query plan")
+    }
+
+    pub(crate) fn planned_expr(&self, id: ExprId) -> &Expr {
+        &self.expressions[id.0]
+    }
+
     pub fn new(
         columns: &'a HashMap<String, usize>,
         all_rows: &'a [Vec<Value>],
@@ -35,7 +85,39 @@ impl<'a> EvalContext<'a> {
             all_rows,
             group_rows,
             now,
+            expr_keys: EMPTY_EXPR_KEYS.get_or_init(HashMap::new),
+            expressions: &[],
+            group_state: None,
         }
+    }
+
+    pub fn with_expr_ids(
+        columns: &'a HashMap<String, usize>,
+        all_rows: &'a [Vec<Value>],
+        group_rows: &'a [usize],
+        now: DateTime<Local>,
+        expr_ids: &'a ExprIds,
+        expressions: &'a [Expr],
+    ) -> Self {
+        let mut context = Self::new(columns, all_rows, group_rows, now);
+        context.expr_keys = expr_ids;
+        context.expressions = expressions;
+        context
+    }
+
+    pub fn with_group_state(
+        columns: &'a HashMap<String, usize>,
+        all_rows: &'a [Vec<Value>],
+        group_rows: &'a [usize],
+        now: DateTime<Local>,
+        expr_ids: &'a ExprIds,
+        expressions: &'a [Expr],
+        group_state: &'a RefCell<GroupState>,
+    ) -> Self {
+        let mut context =
+            Self::with_expr_ids(columns, all_rows, group_rows, now, expr_ids, expressions);
+        context.group_state = Some(group_state);
+        context
     }
 
     pub fn scalar() -> Self {
@@ -44,6 +126,9 @@ impl<'a> EvalContext<'a> {
             all_rows: &EMPTY_ROWS,
             group_rows: &EMPTY_GROUP,
             now: Local::now(),
+            expr_keys: EMPTY_EXPR_KEYS.get_or_init(HashMap::new),
+            expressions: &[],
+            group_state: None,
         }
     }
 }

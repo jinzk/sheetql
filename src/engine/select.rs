@@ -1,25 +1,33 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use chrono::Local;
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Offset,
     OrderByKind, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
 };
+use sqlparser::ast::{Visit, Visitor};
 
 use crate::database::Schema;
 use crate::engine::rewrite::{AliasPrecedence, ExprRewriter, alias_map, ordinal_literal};
 use crate::error::Error;
 use crate::evaluator::EvalContext;
 use crate::evaluator::eval_expr;
+use crate::evaluator::{ExprId, ExprIds, GroupState};
 use crate::functions::contains_aggregate;
 use crate::value::GroupKey;
 use crate::value::Value;
 use crate::value::group_key;
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
+
+type KeyedRows = Vec<(Vec<Value>, Vec<Value>)>;
 
 pub(crate) fn execute_query<'a>(
     schema: &'a Schema,
@@ -46,25 +54,9 @@ pub(crate) fn execute_query<'a>(
         .as_ref()
         .map(|selection| ExprRewriter::lowercase().rewritten(selection));
 
-    // WHERE keeps a set of row indices instead of copying the rows themselves.
-    let active: Vec<usize> = if let Some(selection) = &selection {
-        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
-        let mut filtered: Vec<usize> = vec![];
-        for (index, row) in rows_view.iter().enumerate() {
-            let value = eval_expr(&ctx, selection, row)?;
-            if value.truthy() {
-                filtered.push(index);
-            }
-        }
-        filtered
-    } else {
-        (0..rows_view.len()).collect()
-    };
-
     // The projection plan holds case-normalized expressions; titles keep the
     // original spelling for display.
     let plan = build_projection_plan(&schema_refs, &select.projection)?;
-    let output_titles = titles(&plan);
     let aliases = alias_map(&plan);
 
     // HAVING and GROUP BY accept output aliases (`HAVING cnt > 1`) and
@@ -81,56 +73,121 @@ pub(crate) fn execute_query<'a>(
         .collect::<Result<_, _>>()?;
 
     let order_terms = order_terms(query, &plan, &aliases)?;
+    let (limit, offset) = parse_limit(&query.limit_clause)?;
     let is_aggregate = !group_exprs.is_empty()
         || select.projection.iter().any(projection_has_aggregate)
         || select.having.is_some()
         || order_by_has_aggregate(query);
+    let is_distinct = is_distinct(select)?;
+    let execution_plan = ExecutionPlan::new(
+        limit,
+        offset,
+        is_aggregate,
+        is_distinct,
+        !order_terms.is_empty(),
+    );
+    let scan_target = execution_plan.scan_target();
+
+    let expr_plan = ExprPlan::build(
+        selection.as_ref(),
+        having.as_ref(),
+        &group_exprs,
+        &plan,
+        &order_terms,
+    );
+    let planned_projection = plan
+        .iter()
+        .map(|item| match item {
+            ProjectionItem::Column { index, title } => PlannedProjectionItem::Column {
+                index: *index,
+                title: title.clone(),
+            },
+            ProjectionItem::Expression { expr, title } => PlannedProjectionItem::Expression {
+                id: expr_plan.id_of(expr),
+                title: title.clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let planned_groups = group_sources
+        .iter()
+        .map(|source| match source {
+            GroupSource::Expr(expr) => PlannedGroupSource::Expr(expr_plan.id_of(expr)),
+            GroupSource::Column(index) => PlannedGroupSource::Column(*index),
+        })
+        .collect::<Vec<_>>();
+    let planned_order = order_terms
+        .iter()
+        .map(|term| PlannedOrderTerm {
+            source: match &term.source {
+                OrderSource::Ordinal(position) => PlannedOrderSource::Ordinal(*position),
+                OrderSource::Expr(expr) => PlannedOrderSource::Expr(expr_plan.id_of(expr)),
+            },
+            ascending: term.ascending,
+        })
+        .collect::<Vec<_>>();
+    let output_titles = planned_titles(&planned_projection);
+    // WHERE keeps a set of row indices instead of copying the rows themselves.
+    let active = collect_active_rows(selection.as_ref(), &lookup, rows_view, scan_target, now)?;
+
+    let use_top_n = execution_plan.top_n;
 
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = vec![];
+    let mut top_n = use_top_n.then(|| {
+        TopN::new(
+            limit.unwrap().saturating_add(offset.unwrap_or(0)),
+            &planned_order,
+        )
+    });
 
-    if is_aggregate {
-        let groups = build_groups(&lookup, rows_view, &group_sources, &active, now)?;
-
-        for group in &groups {
-            let ctx = EvalContext::new(&lookup, rows_view, group, now);
-            let representative = representative_row(rows_view, group);
-
-            if let Some(having) = &having {
-                let value = eval_expr(&ctx, having, representative)?;
-                if !value.truthy() {
-                    continue;
-                }
-            }
-
-            let out = project(&ctx, &plan, representative)?;
-            let keys = order_keys(&order_terms, &ctx, &out, representative)?;
-            keyed.push((keys, out));
-        }
+    if execution_plan.aggregate {
+        keyed = execute_aggregate_rows(
+            &lookup,
+            rows_view,
+            &planned_groups,
+            having.as_ref(),
+            &planned_projection,
+            &planned_order,
+            &active,
+            now,
+            &expr_plan,
+        )?;
     } else {
-        let ctx = EvalContext::new(&lookup, rows_view, &[], now);
-        for &row_index in &active {
-            let row = &rows_view[row_index];
-            let out = project(&ctx, &plan, row)?;
-            let keys = order_keys(&order_terms, &ctx, &out, row)?;
-            keyed.push((keys, out));
-        }
+        keyed = execute_regular_rows(
+            &lookup,
+            rows_view,
+            &planned_projection,
+            &planned_order,
+            &active,
+            &execution_plan,
+            top_n.as_mut(),
+            now,
+            &expr_plan,
+        )?;
     }
 
-    if is_distinct(select)? {
+    let top_n_used = top_n.is_some();
+    if let Some(top_n) = top_n {
+        keyed = top_n.into_sorted_vec();
+    }
+
+    if execution_plan.distinct {
         let mut seen: HashSet<Vec<GroupKey>> = HashSet::new();
         keyed.retain(|(_, out)| seen.insert(out.iter().map(group_key).collect()));
     }
 
-    sort_keyed(&mut keyed, &order_terms);
+    if !top_n_used {
+        sort_planned_keyed(&mut keyed, &planned_order);
+    }
 
     let mut final_rows: Vec<Vec<Value>> = keyed.into_iter().map(|(_, out)| out).collect();
 
-    let (limit, offset) = parse_limit(&query.limit_clause)?;
-    if let Some(offset) = offset {
-        final_rows = final_rows.into_iter().skip(offset).collect();
-    }
-    if let Some(limit) = limit {
-        final_rows.truncate(limit);
+    if !execution_plan.early_stop {
+        if execution_plan.offset > 0 {
+            final_rows = final_rows.into_iter().skip(execution_plan.offset).collect();
+        }
+        if let Some(limit) = execution_plan.limit {
+            final_rows.truncate(limit);
+        }
     }
 
     Ok(crate::engine::QueryResult {
@@ -141,6 +198,270 @@ pub(crate) fn execute_query<'a>(
             ..Default::default()
         },
     })
+}
+
+fn collect_active_rows(
+    selection: Option<&Expr>,
+    lookup: &HashMap<String, usize>,
+    rows: &[Vec<Value>],
+    scan_target: usize,
+    now: chrono::DateTime<Local>,
+) -> Result<Vec<usize>, Error> {
+    if scan_target == 0 {
+        return Ok(Vec::new());
+    }
+    if let Some(selection) = selection {
+        let ctx = EvalContext::new(lookup, rows, &[], now);
+        let mut active = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            if eval_expr(&ctx, selection, row)?.truthy() {
+                active.push(index);
+                if active.len() >= scan_target {
+                    break;
+                }
+            }
+        }
+        Ok(active)
+    } else {
+        Ok((0..scan_target.min(rows.len())).collect())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_aggregate_rows(
+    lookup: &HashMap<String, usize>,
+    rows: &[Vec<Value>],
+    group_sources: &[PlannedGroupSource],
+    having: Option<&Expr>,
+    projection: &[PlannedProjectionItem],
+    order_terms: &[PlannedOrderTerm],
+    active: &[usize],
+    now: chrono::DateTime<Local>,
+    expr_plan: &ExprPlan,
+) -> Result<KeyedRows, Error> {
+    let groups = build_groups(lookup, rows, group_sources, active, now, expr_plan)?;
+    let mut keyed = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let group_state = RefCell::new(GroupState::default());
+        let ctx = EvalContext::with_group_state(
+            lookup,
+            rows,
+            group,
+            now,
+            &expr_plan.ids,
+            &expr_plan.expressions,
+            &group_state,
+        );
+        let representative = representative_row(rows, group);
+        if let Some(expr) = having {
+            let id = expr_plan.id_of(expr);
+            if !eval_expr(&ctx, expr_plan.expression(id), representative)?.truthy() {
+                continue;
+            }
+        }
+        let output = project(&ctx, projection, representative, expr_plan)?;
+        let keys = order_keys(order_terms, &ctx, &output, representative, expr_plan)?;
+        keyed.push((keys, output));
+    }
+    Ok(keyed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_regular_rows(
+    lookup: &HashMap<String, usize>,
+    rows: &[Vec<Value>],
+    projection: &[PlannedProjectionItem],
+    order_terms: &[PlannedOrderTerm],
+    active: &[usize],
+    execution_plan: &ExecutionPlan,
+    top_n: Option<&mut TopN>,
+    now: chrono::DateTime<Local>,
+    expr_plan: &ExprPlan,
+) -> Result<KeyedRows, Error> {
+    let ctx = EvalContext::with_expr_ids(
+        lookup,
+        rows,
+        &[],
+        now,
+        &expr_plan.ids,
+        &expr_plan.expressions,
+    );
+    let start = if execution_plan.early_stop {
+        execution_plan.offset.min(active.len())
+    } else {
+        0
+    };
+    let end = if execution_plan.early_stop {
+        start
+            .saturating_add(execution_plan.limit.unwrap_or(usize::MAX))
+            .min(active.len())
+    } else {
+        active.len()
+    };
+    let mut keyed = Vec::new();
+    let mut top_n = top_n;
+    for &row_index in &active[start..end] {
+        let row = &rows[row_index];
+        let output = project(&ctx, projection, row, expr_plan)?;
+        let keys = order_keys(order_terms, &ctx, &output, row, expr_plan)?;
+        if let Some(heap) = top_n.as_deref_mut() {
+            heap.push(keys, output);
+        } else {
+            keyed.push((keys, output));
+        }
+    }
+    Ok(keyed)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExecutionPlan {
+    limit: Option<usize>,
+    offset: usize,
+    aggregate: bool,
+    distinct: bool,
+    early_stop: bool,
+    top_n: bool,
+}
+
+struct ExprPlan {
+    expressions: Vec<Expr>,
+    ids: ExprIds,
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn expr(sql: &str) -> Expr {
+        Parser::new(&MySqlDialect {})
+            .try_with_sql(sql)
+            .expect("valid expression")
+            .parse_expr()
+            .expect("valid expression")
+    }
+
+    #[test]
+    fn expression_plan_reuses_canonical_expression_ids() {
+        let first = ExprRewriter::lowercase().rewritten(&expr("age + 1"));
+        let second = ExprRewriter::lowercase().rewritten(&expr("AGE + 1"));
+        let mut plan = ExprPlan {
+            expressions: Vec::new(),
+            ids: HashMap::new(),
+        };
+        plan.register_tree(&first);
+        plan.register_tree(&second);
+        assert_eq!(plan.ids.len(), 3);
+        assert_eq!(plan.expressions.len(), plan.ids.len());
+        assert_eq!(plan.ids[&first.to_string()], plan.ids[&second.to_string()]);
+    }
+
+    #[test]
+    fn expression_plan_ids_are_dense_and_index_owned_expressions() {
+        let root = ExprRewriter::lowercase().rewritten(&expr("age + 1"));
+        let mut plan = ExprPlan {
+            expressions: Vec::new(),
+            ids: HashMap::new(),
+        };
+        plan.register_tree(&root);
+        let mut ids: Vec<usize> = plan.ids.values().map(|id| id.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..plan.expressions.len()).collect::<Vec<_>>());
+        for id in plan.ids.values() {
+            assert!(!plan.expression(*id).to_string().is_empty());
+        }
+    }
+}
+
+impl ExprPlan {
+    fn id_of(&self, expr: &Expr) -> ExprId {
+        self.ids
+            .get(&expr.to_string())
+            .copied()
+            .expect("expression must be registered before execution")
+    }
+
+    fn expression(&self, id: ExprId) -> &Expr {
+        &self.expressions[id.0]
+    }
+
+    fn build(
+        selection: Option<&Expr>,
+        having: Option<&Expr>,
+        groups: &[Expr],
+        projection: &[ProjectionItem],
+        order: &[OrderTerm],
+    ) -> Self {
+        let mut plan = Self {
+            expressions: Vec::new(),
+            ids: HashMap::new(),
+        };
+        let mut register = |expr: &Expr| plan.register_tree(expr);
+        selection.into_iter().for_each(&mut register);
+        having.into_iter().for_each(&mut register);
+        groups.iter().for_each(&mut register);
+        for item in projection {
+            if let ProjectionItem::Expression { expr, .. } = item {
+                register(expr);
+            }
+        }
+        for term in order {
+            if let OrderSource::Expr(expr) = &term.source {
+                register(expr);
+            }
+        }
+        plan
+    }
+
+    fn register_tree(&mut self, root: &Expr) {
+        struct Register<'a> {
+            plan: &'a mut ExprPlan,
+        }
+        impl Visitor for Register<'_> {
+            type Break = ();
+            fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+                let key = expr.to_string();
+                if !self.plan.ids.contains_key(&key) {
+                    let id = ExprId(self.plan.ids.len());
+                    self.plan.ids.insert(key, id);
+                    self.plan.expressions.push(expr.clone());
+                }
+                ControlFlow::Continue(())
+            }
+        }
+        let _ = root.visit(&mut Register { plan: self });
+    }
+}
+
+impl ExecutionPlan {
+    fn new(
+        limit: Option<usize>,
+        offset: Option<usize>,
+        aggregate: bool,
+        distinct: bool,
+        has_order: bool,
+    ) -> Self {
+        let offset = offset.unwrap_or(0);
+        let early_stop = !aggregate && !has_order && !distinct;
+        let top_n = !aggregate && has_order && !distinct && limit.is_some();
+        Self {
+            limit,
+            offset,
+            aggregate,
+            distinct,
+            early_stop,
+            top_n,
+        }
+    }
+
+    fn scan_target(self) -> usize {
+        if self.early_stop {
+            self.limit.unwrap_or(usize::MAX).saturating_add(self.offset)
+        } else {
+            usize::MAX
+        }
+    }
 }
 
 /// Load every relation in the FROM clause, folding in joins. A single plain
@@ -195,13 +516,33 @@ fn collect_relations<'a>(
     Ok((schema_refs, rows))
 }
 
-fn titles(plan: &[ProjectionItem]) -> Vec<String> {
+fn planned_titles(plan: &[PlannedProjectionItem]) -> Vec<String> {
     plan.iter()
         .map(|item| match item {
-            ProjectionItem::Column { title, .. } => title.clone(),
-            ProjectionItem::Expression { title, .. } => title.clone(),
+            PlannedProjectionItem::Column { title, .. }
+            | PlannedProjectionItem::Expression { title, .. } => title.clone(),
         })
         .collect()
+}
+
+enum PlannedProjectionItem {
+    Column { index: usize, title: String },
+    Expression { id: ExprId, title: String },
+}
+
+enum PlannedGroupSource {
+    Expr(ExprId),
+    Column(usize),
+}
+
+struct PlannedOrderTerm {
+    source: PlannedOrderSource,
+    ascending: bool,
+}
+
+enum PlannedOrderSource {
+    Ordinal(usize),
+    Expr(ExprId),
 }
 
 fn projection_has_aggregate(item: &SelectItem) -> bool {
@@ -316,37 +657,133 @@ fn order_terms(
 /// projected values; expressions evaluate against the source row through the
 /// given context (which carries `group_rows` in aggregate queries).
 fn order_keys(
-    terms: &[OrderTerm],
+    terms: &[PlannedOrderTerm],
     ctx: &EvalContext,
     out: &[Value],
     source_row: &[Value],
+    expr_plan: &ExprPlan,
 ) -> Result<Vec<Value>, Error> {
     let mut keys = Vec::with_capacity(terms.len());
     for term in terms {
         match &term.source {
-            OrderSource::Ordinal(position) => {
+            PlannedOrderSource::Ordinal(position) => {
                 keys.push(out[position - 1].clone());
             }
-            OrderSource::Expr(expr) => keys.push(eval_expr(ctx, expr, source_row)?),
+            PlannedOrderSource::Expr(id) => {
+                keys.push(eval_expr(ctx, expr_plan.expression(*id), source_row)?);
+            }
         }
     }
     Ok(keys)
 }
 
-fn sort_keyed(keyed: &mut [(Vec<Value>, Vec<Value>)], terms: &[OrderTerm]) {
-    keyed.sort_by(|a, b| {
-        for (index, term) in terms.iter().enumerate() {
-            let mut ordering =
-                values_partial_cmp(&a.0[index], &b.0[index]).unwrap_or(Ordering::Equal);
+fn sort_planned_keyed(keyed: &mut [(Vec<Value>, Vec<Value>)], terms: &[PlannedOrderTerm]) {
+    keyed.sort_by(|a, b| compare_planned_keys(&a.0, &b.0, terms));
+}
+
+fn compare_planned_keys(left: &[Value], right: &[Value], terms: &[PlannedOrderTerm]) -> Ordering {
+    left.iter()
+        .zip(right)
+        .zip(terms)
+        .map(|((a, b), term)| {
+            let mut ordering = values_partial_cmp(a, b).unwrap_or(Ordering::Equal);
             if !term.ascending {
                 ordering = ordering.reverse();
             }
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
+            ordering
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
+struct TopN {
+    heap: BinaryHeap<TopNEntry>,
+    capacity: usize,
+    ascending: Arc<[bool]>,
+}
+
+struct TopNEntry {
+    keys: Vec<Value>,
+    output: Vec<Value>,
+    ascending: Arc<[bool]>,
+}
+
+impl TopN {
+    fn new(capacity: usize, terms: &[PlannedOrderTerm]) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(capacity),
+            capacity,
+            ascending: terms.iter().map(|term| term.ascending).collect(),
         }
-        Ordering::Equal
-    });
+    }
+
+    fn push(&mut self, keys: Vec<Value>, output: Vec<Value>) {
+        if self.capacity == 0 {
+            return;
+        }
+        let entry = TopNEntry {
+            keys,
+            output,
+            ascending: Arc::clone(&self.ascending),
+        };
+        if self.heap.len() < self.capacity {
+            self.heap.push(entry);
+        } else if let Some(worst) = self.heap.peek()
+            && compare_order_keys(&entry.keys, &worst.keys, &entry.ascending) == Ordering::Less
+        {
+            self.heap.pop();
+            self.heap.push(entry);
+        }
+    }
+
+    fn into_sorted_vec(self) -> Vec<(Vec<Value>, Vec<Value>)> {
+        let ascending = self.ascending;
+        let mut entries = self.heap.into_vec();
+        entries.sort_by(|left, right| compare_order_keys(&left.keys, &right.keys, &ascending));
+        entries
+            .into_iter()
+            .map(|entry| (entry.keys, entry.output))
+            .collect()
+    }
+}
+
+impl Ord for TopNEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap keeps the worst candidate at the root under query order.
+        compare_order_keys(&self.keys, &other.keys, &self.ascending)
+    }
+}
+
+impl PartialOrd for TopNEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for TopNEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys
+            .iter()
+            .zip(&other.keys)
+            .all(|(a, b)| values_partial_cmp(a, b) == Some(Ordering::Equal))
+    }
+}
+
+impl Eq for TopNEntry {}
+
+fn compare_order_keys(left: &[Value], right: &[Value], ascending: &[bool]) -> Ordering {
+    left.iter()
+        .zip(right)
+        .zip(ascending)
+        .map(|((a, b), ascending)| {
+            let mut ordering = values_partial_cmp(a, b).unwrap_or(Ordering::Equal);
+            if !ascending {
+                ordering = ordering.reverse();
+            }
+            ordering
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
 fn is_distinct(select: &Select) -> Result<bool, Error> {
@@ -402,9 +839,10 @@ fn representative_row<'a>(rows: &'a [Vec<Value>], group: &[usize]) -> &'a [Value
 fn build_groups(
     lookup: &HashMap<String, usize>,
     rows: &[Vec<Value>],
-    sources: &[GroupSource],
+    sources: &[PlannedGroupSource],
     active: &[usize],
     now: chrono::DateTime<Local>,
+    expr_plan: &ExprPlan,
 ) -> Result<Vec<Vec<usize>>, Error> {
     if sources.is_empty() {
         return Ok(vec![active.to_vec()]);
@@ -419,8 +857,8 @@ fn build_groups(
         let mut key: Vec<GroupKey> = Vec::with_capacity(sources.len());
         for source in sources {
             let value = match source {
-                GroupSource::Expr(expr) => eval_expr(&ctx, expr, row)?,
-                GroupSource::Column(column_index) => {
+                PlannedGroupSource::Expr(id) => eval_expr(&ctx, expr_plan.expression(*id), row)?,
+                PlannedGroupSource::Column(column_index) => {
                     row.get(*column_index).cloned().unwrap_or(Value::Null)
                 }
             };
@@ -501,15 +939,20 @@ fn build_projection_plan(
     Ok(plan)
 }
 
-fn project(ctx: &EvalContext, plan: &[ProjectionItem], row: &[Value]) -> Result<Vec<Value>, Error> {
+fn project(
+    ctx: &EvalContext,
+    plan: &[PlannedProjectionItem],
+    row: &[Value],
+    expr_plan: &ExprPlan,
+) -> Result<Vec<Value>, Error> {
     let mut out: Vec<Value> = Vec::with_capacity(plan.len());
     for item in plan {
         match item {
-            ProjectionItem::Column { index, .. } => {
+            PlannedProjectionItem::Column { index, .. } => {
                 out.push(row.get(*index).cloned().unwrap_or(Value::Null));
             }
-            ProjectionItem::Expression { expr, .. } => {
-                out.push(eval_expr(ctx, expr, row)?);
+            PlannedProjectionItem::Expression { id, .. } => {
+                out.push(eval_expr(ctx, expr_plan.expression(*id), row)?);
             }
         }
     }
