@@ -1,16 +1,22 @@
 mod aggregate;
+mod execution;
+mod filter;
 mod join;
 mod metadata;
+mod ordering;
 mod output;
 mod plan;
+mod projection;
 pub(crate) mod rewrite;
+mod scope;
 mod select;
 mod set;
+mod subquery;
 mod temporary;
 mod window;
 
 use sqlparser::ast::{
-    ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions, Statement,
+    ObjectType, ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions, Statement,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -22,9 +28,11 @@ use crate::value::Value;
 
 use crate::engine::metadata::{run_describe_table, run_show_databases, run_show_tables, run_use};
 use crate::engine::output::{strip_into_outfile, write_outfile};
-use crate::engine::select::object_name_to_parts;
+use crate::engine::scope::object_name_to_parts;
 use crate::engine::set::execute_query;
-use crate::engine::temporary::{run_create_table, run_insert};
+use crate::engine::temporary::{
+    run_create_table, run_delete, run_drop_table, run_insert, run_truncate, run_update,
+};
 
 /// Split an `INTO OUTFILE 'path'` clause off a query before parsing.
 /// Exposed so the server can reject file-writing clauses up front.
@@ -37,6 +45,7 @@ pub struct QueryStats {
     pub elapsed_ms: u128,
     pub input_rows: usize,
     pub output_rows: usize,
+    pub affected_rows: usize,
     pub correlated_cache_hits: usize,
     pub correlated_cache_misses: usize,
 }
@@ -48,11 +57,20 @@ pub struct QueryResult {
     pub stats: QueryStats,
 }
 
+pub(crate) fn status_result(message: String, stats: QueryStats) -> QueryResult {
+    QueryResult {
+        columns: vec!["Status".into()],
+        rows: vec![vec![Value::Text(message)]],
+        stats,
+    }
+}
+
 /// Internal query data before top-level execution statistics are attached.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutionOutput {
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<Value>>,
+    pub(crate) input_rows: usize,
 }
 
 impl ExecutionOutput {
@@ -60,7 +78,10 @@ impl ExecutionOutput {
         QueryResult {
             columns: self.columns,
             rows: self.rows,
-            stats: QueryStats::default(),
+            stats: QueryStats {
+                input_rows: self.input_rows,
+                ..Default::default()
+            },
         }
     }
 }
@@ -83,6 +104,16 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
         Statement::Query(query) => execute_query(schema, query),
         Statement::CreateTable(create) => run_create_table(schema, create),
         Statement::Insert(insert) => run_insert(schema, insert),
+        Statement::Update(update) => run_update(schema, update),
+        Statement::Delete(delete) => run_delete(schema, delete),
+        Statement::Truncate(truncate) => run_truncate(schema, truncate),
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            temporary: true,
+            if_exists,
+            names,
+            ..
+        } if names.len() == 1 => run_drop_table(schema, &names[0], *if_exists),
         Statement::ShowColumns { show_options, .. } => run_show_columns(schema, show_options),
         Statement::ShowDatabases { show_options, .. }
         | Statement::ShowSchemas { show_options, .. } => {
@@ -127,6 +158,7 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
                 elapsed_ms: started.elapsed().as_millis(),
                 input_rows: result.stats.input_rows,
                 output_rows: result.rows.len(),
+                affected_rows: result.stats.affected_rows,
                 correlated_cache_hits: result.stats.correlated_cache_hits,
                 correlated_cache_misses: result.stats.correlated_cache_misses,
             },
@@ -1112,6 +1144,137 @@ mod tests {
             result.rows[0],
             vec![Value::Int(1), Value::Text("Alice".into())]
         );
+    }
+
+    #[test]
+    fn temporary_table_can_be_dropped_and_recreated() {
+        let mut schema = make_schema();
+        run(&mut schema, "CREATE TEMPORARY TABLE scratch (id INT)");
+        run(&mut schema, "INSERT INTO scratch VALUES (1)");
+        run(&mut schema, "DROP TEMPORARY TABLE scratch");
+        assert!(run_query(&mut schema, "SELECT * FROM scratch").is_err());
+        run(&mut schema, "CREATE TEMPORARY TABLE scratch (id INT)");
+        assert!(run(&mut schema, "SELECT * FROM scratch").rows.is_empty());
+    }
+
+    #[test]
+    fn drop_temporary_table_if_exists_is_idempotent() {
+        let mut schema = make_schema();
+        run(&mut schema, "DROP TEMPORARY TABLE IF EXISTS missing");
+        assert!(run_query(&mut schema, "DROP TEMPORARY TABLE missing").is_err());
+    }
+
+    #[test]
+    fn temporary_table_insert_coerces_declared_types() {
+        let mut schema = make_schema();
+        run(
+            &mut schema,
+            "CREATE TEMPORARY TABLE typed (id INT, active BOOLEAN)",
+        );
+        run(&mut schema, "INSERT INTO typed VALUES ('7', 'true')");
+        assert_eq!(
+            run(&mut schema, "SELECT * FROM typed").rows,
+            vec![vec![Value::Int(7), Value::Bool(true)]]
+        );
+    }
+
+    #[test]
+    fn temporary_table_insert_is_atomic_on_conversion_error() {
+        let mut schema = make_schema();
+        run(&mut schema, "CREATE TEMPORARY TABLE typed (id INT)");
+        assert!(run_query(&mut schema, "INSERT INTO typed VALUES (1), ('bad')").is_err());
+        assert!(run(&mut schema, "SELECT * FROM typed").rows.is_empty());
+    }
+
+    #[test]
+    fn temporary_table_update_is_atomic_and_uses_current_row_values() {
+        let mut schema = make_schema();
+        run(
+            &mut schema,
+            "CREATE TEMPORARY TABLE work (id INT, label TEXT)",
+        );
+        run(&mut schema, "INSERT INTO work VALUES (1, 'a'), (2, 'b')");
+        run(
+            &mut schema,
+            "UPDATE work SET id = id + 10, label = 'updated' WHERE id = 1",
+        );
+        assert_eq!(
+            run(&mut schema, "SELECT * FROM work ORDER BY id").rows,
+            vec![
+                vec![Value::Int(2), Value::Text("b".into())],
+                vec![Value::Int(11), Value::Text("updated".into())],
+            ]
+        );
+        assert!(run_query(&mut schema, "UPDATE work SET id = 'bad'").is_err());
+        assert_eq!(
+            run(&mut schema, "SELECT id FROM work ORDER BY id").rows[0][0],
+            Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn temporary_table_delete_filters_rows_and_can_delete_all() {
+        let mut schema = make_schema();
+        run(&mut schema, "CREATE TEMPORARY TABLE work (id INT)");
+        run(&mut schema, "INSERT INTO work VALUES (1), (2), (3)");
+        run(&mut schema, "DELETE FROM work WHERE id = 2");
+        assert_eq!(
+            run(&mut schema, "SELECT id FROM work ORDER BY id")
+                .rows
+                .len(),
+            2
+        );
+        run(&mut schema, "DELETE FROM work");
+        assert!(run(&mut schema, "SELECT * FROM work").rows.is_empty());
+    }
+
+    #[test]
+    fn temporary_table_truncate_keeps_schema_and_allows_reinsert() {
+        let mut schema = make_schema();
+        run(&mut schema, "CREATE TEMPORARY TABLE work (id INT)");
+        run(&mut schema, "INSERT INTO work VALUES (1), (2)");
+        run(&mut schema, "TRUNCATE TABLE work");
+        assert!(run(&mut schema, "SELECT * FROM work").rows.is_empty());
+        run(&mut schema, "INSERT INTO work VALUES (3)");
+        assert_eq!(
+            run(&mut schema, "SELECT id FROM work").rows[0][0],
+            Value::Int(3)
+        );
+    }
+
+    #[test]
+    fn temporary_table_supports_complete_analysis_workflow() {
+        let mut schema = make_schema();
+        run(
+            &mut schema,
+            "CREATE TEMPORARY TABLE work (id INT, label TEXT)",
+        );
+        run(&mut schema, "INSERT INTO work VALUES (1, 'a'), (2, 'b')");
+        run(&mut schema, "UPDATE work SET label = 'x' WHERE id = 1");
+        run(&mut schema, "DELETE FROM work WHERE id = 2");
+        assert_eq!(
+            run(&mut schema, "SELECT * FROM work").rows,
+            vec![vec![Value::Int(1), Value::Text("x".into())]]
+        );
+        run(&mut schema, "TRUNCATE TABLE work");
+        run(&mut schema, "DROP TEMPORARY TABLE work");
+        assert!(run_query(&mut schema, "SELECT * FROM work").is_err());
+    }
+
+    #[test]
+    fn temporary_dml_reports_input_and_affected_row_counts() {
+        let mut schema = make_schema();
+        let created = run(&mut schema, "CREATE TEMPORARY TABLE work (id INT)");
+        assert_eq!(created.stats.input_rows, 0);
+        let inserted = run(&mut schema, "INSERT INTO work VALUES (1), (2)");
+        assert_eq!(inserted.stats.input_rows, 2);
+        assert_eq!(inserted.stats.affected_rows, 2);
+        let updated = run(&mut schema, "UPDATE work SET id = id + 1 WHERE id = 1");
+        assert_eq!(updated.stats.input_rows, 2);
+        assert_eq!(updated.stats.affected_rows, 1);
+        let deleted = run(&mut schema, "DELETE FROM work WHERE id = 2");
+        assert_eq!(deleted.stats.input_rows, 2);
+        assert_eq!(deleted.stats.affected_rows, 2);
     }
 
     #[test]

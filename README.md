@@ -207,9 +207,9 @@ Edge cases:
 - `ORDER BY` with `ASC` / `DESC`, output column aliases (including inside larger expressions) and 1-based ordinals (`ORDER BY 2 DESC`)
 - `LIMIT` / `OFFSET` and `SELECT DISTINCT`
 - Metadata commands: `SHOW DATABASES` (alias `SHOW SCHEMAS`), `SHOW TABLES [FROM <database>]`, `SHOW COLUMNS FROM <table>`, `DESCRIBE <table>`, `USE <database>`; `SHOW DATABASES` / `SHOW TABLES` support `LIKE '<pattern>'` with `%` / `_` wildcards
-- `CREATE TEMPORARY TABLE <name> AS SELECT ...` stores a query result in the current interactive session for later queries; recreating the same name replaces it, and the table disappears when the process exits.
+- `CREATE TEMPORARY TABLE <name> AS SELECT ...` or `CREATE TEMPORARY TABLE <name> (<columns>)` creates an in-memory work table for the current session. Temporary tables support `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, and `DROP TEMPORARY TABLE`; they disappear when the process exits.
 
-Not yet supported: subqueries, `UNION` / set operations, window functions, regular `CREATE TABLE`, `INSERT` / `UPDATE` / `DELETE` (Sheetql is read-only).
+Not yet supported: regular `CREATE TABLE`, indexes, constraints, transactions, `ALTER TABLE`, multi-table `UPDATE`/`DELETE`, and persistent table storage.
 
 ### Interactive REPL
 

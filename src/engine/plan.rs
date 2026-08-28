@@ -5,10 +5,8 @@ use sqlparser::ast::{Expr, Visit, Visitor};
 
 use crate::evaluator::{ExprId, ExprIds};
 
-use super::select::{
-    OrderSource, OrderTerm, PlannedGroupSource, PlannedOrderTerm, PlannedProjectionItem,
-    ProjectionItem,
-};
+use super::projection::{PlannedProjectionItem, ProjectionItem};
+use super::select::{OrderSource, OrderTerm, PlannedGroupSource, PlannedOrderTerm};
 use super::window::WindowPlan;
 
 pub(crate) struct QueryPlan {

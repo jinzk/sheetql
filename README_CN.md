@@ -207,9 +207,9 @@ DESCRIBE sales
 - `ORDER BY` 支持 `ASC` / `DESC`、输出列别名（包括在更大表达式中使用）以及从 1 开始的序数（`ORDER BY 2 DESC`）
 - `LIMIT` / `OFFSET` 与 `SELECT DISTINCT`
 - 元数据命令：`SHOW DATABASES`（别名 `SHOW SCHEMAS`）、`SHOW TABLES [FROM <database>]`、`SHOW COLUMNS FROM <table>`、`DESCRIBE <table>`、`USE <database>`；`SHOW DATABASES` / `SHOW TABLES` 支持 `LIKE '<pattern>'`，通配符为 `%` / `_`
-- `CREATE TEMPORARY TABLE <name> AS SELECT ...`：将查询结果暂存为当前交互会话中的临时表，后续查询可直接使用；同名临时表会替换旧结果，退出进程后自动消失。
+- `CREATE TEMPORARY TABLE <name> AS SELECT ...` 或 `CREATE TEMPORARY TABLE <name> (<columns>)`：创建当前会话中的内存工作表。临时表支持 `SELECT`、`INSERT`、`UPDATE`、`DELETE`、`TRUNCATE TABLE` 和 `DROP TEMPORARY TABLE`，退出进程后自动消失。
 
-暂不支持：子查询、`UNION` / 集合运算、窗口函数、普通 `CREATE TABLE`、`INSERT` / `UPDATE` / `DELETE`（Sheetql 为只读工具）。
+暂不支持：普通 `CREATE TABLE`、索引、约束、事务、`ALTER TABLE`、多表 `UPDATE`/`DELETE` 和持久化表存储。
 
 ### 交互式 REPL
 

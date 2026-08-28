@@ -57,6 +57,7 @@ pub struct Schema {
     /// Tables created during the current process/session. These are not files
     /// and disappear when the schema is dropped.
     temporary: Database,
+    temporary_column_types: HashMap<String, Vec<String>>,
 }
 
 impl Schema {
@@ -65,6 +66,7 @@ impl Schema {
             databases: vec![],
             current: None,
             temporary: Database::named("__temporary__"),
+            temporary_column_types: HashMap::new(),
         }
     }
 
@@ -161,6 +163,14 @@ impl Schema {
         }
     }
 
+    pub(crate) fn set_temporary_column_types(&mut self, name: String, types: Vec<String>) {
+        self.temporary_column_types.insert(name, types);
+    }
+
+    pub(crate) fn temporary_column_types(&self, name: &str) -> Option<&[String]> {
+        self.temporary_column_types.get(name).map(Vec::as_slice)
+    }
+
     pub(crate) fn add_query_table(&mut self, table: Table) {
         self.temporary.add_table(table);
     }
@@ -175,6 +185,17 @@ impl Schema {
             .get(name)
             .copied()
             .and_then(|index| self.temporary.tables.get_mut(index))
+    }
+
+    pub(crate) fn remove_temporary_table(&mut self, name: &str) -> Option<Table> {
+        self.temporary_column_types.remove(name);
+        let index = self.temporary.by_name.remove(name)?;
+        let removed = self.temporary.tables.swap_remove(index);
+        if index < self.temporary.tables.len() {
+            let moved_name = self.temporary.tables[index].name.clone();
+            self.temporary.by_name.insert(moved_name, index);
+        }
+        Some(removed)
     }
 
     pub fn temporary_table_names(&self) -> Vec<&str> {

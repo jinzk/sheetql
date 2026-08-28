@@ -216,46 +216,61 @@ pub(crate) fn combine_set_results(
     right: QueryResult,
     op: &SetOperator,
 ) -> Result<QueryResult, Error> {
+    let input_rows = left.stats.input_rows + right.stats.input_rows;
+    let output = combine_set_outputs(
+        ExecutionOutput {
+            columns: left.columns,
+            rows: left.rows,
+            input_rows: left.stats.input_rows,
+        },
+        ExecutionOutput {
+            columns: right.columns,
+            rows: right.rows,
+            input_rows: right.stats.input_rows,
+        },
+        op,
+    )?;
+    let output_rows = output.rows.len();
+    let mut result = output.into_result();
+    result.stats.input_rows = input_rows;
+    result.stats.output_rows = output_rows;
+    Ok(result)
+}
+
+pub(crate) fn combine_set_outputs(
+    left: ExecutionOutput,
+    right: ExecutionOutput,
+    op: &SetOperator,
+) -> Result<ExecutionOutput, Error> {
     if left.columns.len() != right.columns.len() {
         return Err(
             "Set operation requires both queries to return the same number of columns".into(),
         );
     }
-
     let right_keys: HashSet<RowKey> = right.rows.iter().map(|row| row_key(row)).collect();
-    let mut rows = match op {
-        SetOperator::Union => left
-            .rows
-            .iter()
-            .chain(&right.rows)
-            .cloned()
-            .collect::<Vec<_>>(),
+    let mut rows: Vec<Vec<Value>> = match op {
+        SetOperator::Union => left.rows.iter().chain(&right.rows).cloned().collect(),
         SetOperator::Intersect => left
             .rows
             .iter()
             .filter(|row| right_keys.contains(&row_key(row)))
             .cloned()
-            .collect::<Vec<_>>(),
+            .collect(),
         SetOperator::Except => left
             .rows
             .iter()
             .filter(|row| !right_keys.contains(&row_key(row)))
             .cloned()
-            .collect::<Vec<_>>(),
+            .collect(),
         SetOperator::Minus => return Err("MINUS set operation is not supported".into()),
     };
-
     let mut seen = HashSet::new();
     rows.retain(|row| seen.insert(row_key(row)));
-    let output_rows = rows.len();
-    let mut result = ExecutionOutput {
+    Ok(ExecutionOutput {
         columns: left.columns,
         rows,
-    }
-    .into_result();
-    result.stats.input_rows = left.stats.input_rows + right.stats.input_rows;
-    result.stats.output_rows = output_rows;
-    Ok(result)
+        input_rows: 0,
+    })
 }
 
 #[cfg(test)]
@@ -272,6 +287,23 @@ mod tests {
             },
             rows,
         }
+    }
+
+    #[test]
+    fn internal_set_output_does_not_carry_query_stats() {
+        let left = ExecutionOutput {
+            columns: vec!["n".into()],
+            rows: vec![vec![Value::Int(1)]],
+            input_rows: 1,
+        };
+        let right = ExecutionOutput {
+            columns: vec!["n".into()],
+            rows: vec![vec![Value::Int(2)]],
+            input_rows: 1,
+        };
+        let output = combine_set_outputs(left, right, &SetOperator::Union).unwrap();
+        assert_eq!(output.rows.len(), 2);
+        assert_eq!(output.columns, vec!["n"]);
     }
 
     #[test]

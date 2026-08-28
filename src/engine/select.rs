@@ -9,15 +9,21 @@ use std::sync::Arc;
 
 use chrono::Local;
 use sqlparser::ast::{
-    BinaryOperator, Distinct, Expr, GroupByExpr, JoinConstraint, JoinOperator, LimitClause, Offset,
-    OrderByKind, Query, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
+    Distinct, Expr, GroupByExpr, LimitClause, Offset, OrderByKind, Query, Select, SelectItem,
+    SetExpr,
 };
 use sqlparser::ast::{Visit, Visitor};
 
 use crate::database::Schema;
-use crate::engine::join::join_key;
+use crate::engine::filter::pushdown_conjuncts;
+use crate::engine::join::{ColumnRef, collect_relations};
+use crate::engine::ordering::{order_keys, order_terms, sort_planned_keyed};
 use crate::engine::plan::{ExecutionPlan, ExprPlan, QueryPlan};
+pub(crate) use crate::engine::projection::{
+    PlannedProjectionItem, ProjectionItem, build_projection_plan, project,
+};
 use crate::engine::rewrite::{AliasPrecedence, ExprRewriter, alias_map, ordinal_literal};
+use crate::engine::scope::build_lookup;
 use crate::engine::window::{
     WindowPlan, WindowValues, collect_window_exprs, compute_window_values, contains_window,
 };
@@ -31,10 +37,9 @@ use crate::functions::contains_aggregate;
 use crate::value::GroupKey;
 use crate::value::Value;
 use crate::value::group_key;
-use crate::value::values_eq;
 use crate::value::values_partial_cmp;
 
-type KeyedRows = Vec<(Vec<Value>, Vec<Value>)>;
+pub(crate) type KeyedRows = Vec<(Vec<Value>, Vec<Value>)>;
 
 pub(crate) fn execute_select_query(
     schema: &Schema,
@@ -50,6 +55,18 @@ pub(crate) fn execute_select_query_with_runtime<'a>(
     outer_scope: Option<&'a OuterScope<'a>>,
     runtime: &'a QueryRuntime,
 ) -> Result<crate::engine::QueryResult, Error> {
+    Ok(
+        crate::engine::execution::execute_select_output(schema, query, outer_scope, runtime)?
+            .into_result(),
+    )
+}
+
+pub(crate) fn execute_select_output_impl<'a>(
+    schema: &'a Schema,
+    query: &Query,
+    outer_scope: Option<&'a OuterScope<'a>>,
+    runtime: &'a QueryRuntime,
+) -> Result<crate::engine::ExecutionOutput, Error> {
     let now = Local::now();
     let select: &Select = match &*query.body {
         SetExpr::Select(select) => select,
@@ -78,7 +95,7 @@ pub(crate) fn execute_select_query_with_runtime<'a>(
         }
     }
     let subqueries = prepare_subqueries(schema, query, &scope_lookup, runtime)?;
-    let subquery_executor = SchemaSubqueryExecutor { schema };
+    let subquery_executor = crate::engine::subquery::SchemaExecutor { schema };
 
     // The projection plan holds case-normalized expressions; titles keep the
     // original spelling for display.
@@ -234,7 +251,7 @@ pub(crate) fn execute_select_query_with_runtime<'a>(
     });
 
     if execution_plan.aggregate {
-        keyed = execute_aggregate_rows(
+        keyed = crate::engine::aggregate::execute_aggregate_rows(
             &lookup,
             rows_view,
             planned_groups,
@@ -293,16 +310,10 @@ pub(crate) fn execute_select_query_with_runtime<'a>(
         }
     }
 
-    let runtime_stats = runtime.stats();
-    Ok(crate::engine::QueryResult {
+    Ok(crate::engine::ExecutionOutput {
         columns: output_titles,
         rows: final_rows,
-        stats: crate::engine::QueryStats {
-            input_rows: rows_view.len(),
-            correlated_cache_hits: runtime_stats.correlated_cache_hits,
-            correlated_cache_misses: runtime_stats.correlated_cache_misses,
-            ..Default::default()
-        },
+        input_rows: rows_view.len(),
     })
 }
 
@@ -355,7 +366,7 @@ fn prepare_subqueries(
     runtime: &QueryRuntime,
 ) -> Result<HashMap<Query, SubqueryResult>, Error> {
     let mut queries = Vec::new();
-    collect_subqueries_from_query(query, &mut queries);
+    crate::engine::subquery::collect_subqueries(query, &mut queries);
     let mut results = HashMap::with_capacity(queries.len());
     for subquery in queries {
         let id = runtime.subquery_id(&subquery);
@@ -419,43 +430,9 @@ fn correlated_columns(
     collector.columns
 }
 
-fn collect_subqueries_from_query(query: &Query, output: &mut Vec<Query>) {
-    struct Collector<'a> {
-        output: &'a mut Vec<Query>,
-    }
-    impl Visitor for Collector<'_> {
-        type Break = ();
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-            match expr {
-                Expr::Subquery(query) => self.output.push((**query).clone()),
-                Expr::Exists { subquery, .. } | Expr::InSubquery { subquery, .. } => {
-                    self.output.push((**subquery).clone())
-                }
-                _ => {}
-            }
-            ControlFlow::Continue(())
-        }
-    }
-    let _ = query.visit(&mut Collector { output });
-}
-
-struct SchemaSubqueryExecutor<'a> {
-    schema: &'a Schema,
-}
-
-impl SubqueryExecutor for SchemaSubqueryExecutor<'_> {
-    fn execute(&self, query: &Query, scope: &OuterScope<'_>) -> Result<SubqueryResult, Error> {
-        let result =
-            execute_select_query_with_runtime(self.schema, query, Some(scope), scope.runtime)?;
-        Ok(SubqueryResult {
-            columns: result.columns,
-            rows: result.rows,
-        })
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn execute_aggregate_rows(
+#[allow(dead_code)]
+fn execute_aggregate_rows_legacy(
     lookup: &HashMap<String, usize>,
     rows: &[Vec<Value>],
     group_sources: &[PlannedGroupSource],
@@ -470,7 +447,15 @@ fn execute_aggregate_rows(
     outer_scope: Option<&OuterScope<'_>>,
     runtime: &QueryRuntime,
 ) -> Result<KeyedRows, Error> {
-    let groups = build_groups(lookup, rows, group_sources, active, now, expr_plan, runtime)?;
+    let groups = crate::engine::aggregate::build_groups(
+        lookup,
+        rows,
+        group_sources,
+        active,
+        now,
+        expr_plan,
+        runtime,
+    )?;
     let mut keyed = Vec::with_capacity(groups.len());
     for group in &groups {
         let group_state = RefCell::new(GroupState::default());
@@ -605,6 +590,7 @@ fn execute_regular_rows(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod plan_tests {
     use super::*;
     use sqlparser::dialect::MySqlDialect;
@@ -650,292 +636,9 @@ mod plan_tests {
     }
 }
 
-/// Load every relation in the FROM clause, folding in joins. A single plain
-/// table is borrowed straight from the schema (zero-copy); any join or
-/// multi-table FROM materializes an owned copy.
-/// Materialized FROM-clause state: the flattened column references and the
-/// combined row set (borrowed when a single plain table is selected).
-type Relations<'a> = (Vec<ColumnRef>, Cow<'a, [Vec<Value>]>);
-
-/// Decide which WHERE conjuncts can be pushed down onto individual relations.
-/// Pushdown is only valid when every join is inner/cross, and only for
-/// conjuncts that are pure scalar predicates (no subquery, aggregate, or
-/// window function) and reference columns of exactly one relation.
-fn pushdown_conjuncts(from: &[TableWithJoins], selection: Option<&Expr>) -> Option<Vec<Expr>> {
-    let selection = selection?;
-    if !from_is_inner_only(from) {
-        return None;
-    }
-    let conjuncts = split_conjuncts(selection);
-    if conjuncts.len() < 2 {
-        // A single conjunct is trivially applied by the WHERE scan; pushing it
-        // down adds no benefit.
-        return None;
-    }
-    let pushable: Vec<Expr> = conjuncts
-        .into_iter()
-        .filter(|conjunct| conjunct_is_pushable(conjunct))
-        .cloned()
-        .collect();
-    (!pushable.is_empty()).then_some(pushable)
-}
-
-fn from_is_inner_only(from: &[TableWithJoins]) -> bool {
-    from.iter().all(|item| {
-        item.joins.iter().all(|join| {
-            matches!(
-                join.join_operator,
-                JoinOperator::Inner(_) | JoinOperator::CrossJoin(_)
-            )
-        })
-    })
-}
-
-/// Split an expression into its top-level AND conjuncts.
-fn split_conjuncts(expr: &Expr) -> Vec<&Expr> {
-    let mut out = Vec::new();
-    collect_conjuncts(expr, &mut out);
-    out
-}
-
-fn collect_conjuncts<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            collect_conjuncts(left, out);
-            collect_conjuncts(right, out);
-        }
-        other => out.push(other),
-    }
-}
-
-/// A conjunct is pushable when it is a pure scalar predicate: it contains no
-/// subquery, aggregate call, or window function.
-fn conjunct_is_pushable(expr: &Expr) -> bool {
-    struct Check {
-        ok: bool,
-        query_depth: usize,
-    }
-    impl Visitor for Check {
-        type Break = ();
-        fn pre_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<()> {
-            self.query_depth += 1;
-            ControlFlow::Continue(())
-        }
-        fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<()> {
-            self.query_depth -= 1;
-            ControlFlow::Continue(())
-        }
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-            if self.query_depth > 0 {
-                return ControlFlow::Continue(());
-            }
-            match expr {
-                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-                    self.ok = false;
-                    ControlFlow::Break(())
-                }
-                Expr::Function(func) if func.over.is_some() => {
-                    self.ok = false;
-                    ControlFlow::Break(())
-                }
-                _ => ControlFlow::Continue(()),
-            }
-        }
-    }
-    // Reject expressions containing aggregates directly.
-    if crate::functions::contains_aggregate(expr) {
-        return false;
-    }
-    let mut check = Check {
-        ok: true,
-        query_depth: 0,
-    };
-    let _ = expr.visit(&mut check);
-    check.ok
-}
-
-/// The global-column names a predicate may reference, mirroring the keys used
-/// by `build_lookup` (bare, qualifier-qualified, table-qualified).
-fn referenced_column_names(expr: &Expr) -> Vec<String> {
-    struct Collector {
-        names: Vec<String>,
-        query_depth: usize,
-    }
-    impl Visitor for Collector {
-        type Break = ();
-        fn pre_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<()> {
-            self.query_depth += 1;
-            ControlFlow::Continue(())
-        }
-        fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<()> {
-            self.query_depth -= 1;
-            ControlFlow::Continue(())
-        }
-        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
-            if self.query_depth > 0 {
-                return ControlFlow::Continue(());
-            }
-            match expr {
-                Expr::Identifier(ident) => {
-                    self.names.push(ident.value.to_lowercase());
-                }
-                Expr::CompoundIdentifier(parts) => {
-                    let lower: Vec<String> = parts.iter().map(|p| p.value.to_lowercase()).collect();
-                    if lower.len() == 2 {
-                        self.names.push(format!("{}.{}", lower[0], lower[1]));
-                    }
-                }
-                _ => {}
-            }
-            ControlFlow::Continue(())
-        }
-    }
-    let mut collector = Collector {
-        names: Vec::new(),
-        query_depth: 0,
-    };
-    let _ = expr.visit(&mut collector);
-    collector.names
-}
-
-/// True if every referenced name resolves to exactly one column of `schema`.
-fn conjunct_fits_relation(names: &[String], schema: &[ColumnRef]) -> bool {
-    if names.is_empty() {
-        return false;
-    }
-    names.iter().all(|name| {
-        let mut matches = schema.iter().enumerate().filter(|(_, reference)| {
-            reference.column == *name
-                || format!("{}.{}", reference.qualifier, reference.column) == *name
-                || format!("{}.{}", reference.table_name, reference.column) == *name
-        });
-        matches.next().is_some() && matches.next().is_none()
-    })
-}
-
-fn apply_predicate<'a>(
-    relation: Relation<'a>,
-    predicates: &[&Expr],
-    now: chrono::DateTime<Local>,
-    runtime: &QueryRuntime,
-) -> Result<Relation<'a>, Error> {
-    let lookup = build_lookup(&relation.schema)?;
-    let relation_rows = relation.rows.into_owned();
-    let mut kept: Vec<Vec<Value>> = Vec::with_capacity(relation_rows.len());
-    for row in &relation_rows {
-        let ctx = EvalContext::new(&lookup, &relation_rows, &[], now, runtime);
-        let all = predicates.iter().try_fold(true, |acc, predicate| {
-            Ok::<_, Error>(acc && eval_expr(&ctx, predicate, row)?.truthy())
-        })?;
-        if all {
-            kept.push(row.clone());
-        }
-    }
-    Ok(Relation::<'_> {
-        schema: relation.schema,
-        rows: Cow::Owned(kept),
-    })
-}
-
-fn collect_relations<'a>(
-    schema: &'a Schema,
-    from: &[TableWithJoins],
-    now: chrono::DateTime<Local>,
-    pushdown: Option<&[Expr]>,
-    runtime: &'a QueryRuntime,
-) -> Result<Relations<'a>, Error> {
-    let mut schema_refs: Vec<ColumnRef> = vec![];
-    let mut rows: Cow<'a, [Vec<Value>]> = Cow::Owned(vec![]);
-
-    // Conjuncts not yet assigned to a relation. Each is dropped once it has
-    // been pushed onto the relation that owns all of its columns.
-    let mut pending: Vec<Expr> = pushdown.map_or_else(Vec::new, |list| list.to_vec());
-
-    for (index, table_with_joins) in from.iter().enumerate() {
-        let base = load_relation_filtered(
-            schema,
-            &table_with_joins.relation,
-            &mut pending,
-            now,
-            runtime,
-        )?;
-
-        if table_with_joins.joins.is_empty() {
-            if index == 0 {
-                schema_refs = base.schema;
-                rows = base.rows;
-            } else {
-                schema_refs.extend(base.schema.clone());
-                rows = Cow::Owned(cross_combine(&rows, &base.rows));
-            }
-            continue;
-        }
-
-        // This relation carries joins, so the accumulated rows are
-        // materialized and each join is folded in.
-        let mut current = rows.into_owned();
-        if index == 0 {
-            schema_refs = base.schema;
-            current = base.rows.into_owned();
-        } else {
-            schema_refs.extend(base.schema.clone());
-            current = cross_combine(&current, &base.rows);
-        }
-
-        for join in &table_with_joins.joins {
-            let right = load_relation_filtered(schema, &join.relation, &mut pending, now, runtime)?;
-            let merged = apply_join(
-                &schema_refs,
-                &current,
-                &right,
-                &join.join_operator,
-                now,
-                runtime,
-            )?;
-            schema_refs = merged.0;
-            current = merged.1;
-        }
-        rows = Cow::Owned(current);
-    }
-
-    Ok((schema_refs, rows))
-}
-
 /// Load a relation and, where possible, push candidate WHERE conjuncts onto it.
 /// A conjunct is applied to this relation only when every column it references
 /// resolves uniquely within this relation's schema.
-fn load_relation_filtered<'a>(
-    schema: &'a Schema,
-    factor: &TableFactor,
-    pending: &mut Vec<Expr>,
-    now: chrono::DateTime<Local>,
-    runtime: &'a QueryRuntime,
-) -> Result<Relation<'a>, Error> {
-    let mut relation = load_relation(schema, factor, runtime)?;
-    if !pending.is_empty() {
-        let mut assigned: Vec<Expr> = Vec::new();
-        let mut remaining: Vec<Expr> = Vec::with_capacity(pending.len());
-        for conjunct in pending.drain(..) {
-            let names = referenced_column_names(&conjunct);
-            if conjunct_fits_relation(&names, &relation.schema) {
-                assigned.push(conjunct);
-            } else {
-                remaining.push(conjunct);
-            }
-        }
-        *pending = remaining;
-        if !assigned.is_empty() {
-            let assigned_refs: Vec<&Expr> = assigned.iter().collect();
-            relation = apply_predicate(relation, &assigned_refs, now, runtime)?;
-        }
-    }
-    Ok(relation)
-}
-
 fn planned_titles(plan: &[PlannedProjectionItem]) -> Vec<String> {
     plan.iter()
         .map(|item| match item {
@@ -945,19 +648,14 @@ fn planned_titles(plan: &[PlannedProjectionItem]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) enum PlannedProjectionItem {
-    Column { index: usize, title: String },
-    Expression { id: ExprId, title: String },
-}
-
 pub(crate) enum PlannedGroupSource {
     Expr(ExprId),
     Column(usize),
 }
 
 pub(crate) struct PlannedOrderTerm {
-    source: PlannedOrderSource,
-    ascending: bool,
+    pub(crate) source: PlannedOrderSource,
+    pub(crate) ascending: bool,
 }
 
 pub(crate) enum PlannedOrderSource {
@@ -1040,7 +738,8 @@ pub(crate) enum OrderSource {
     Expr(Box<Expr>),
 }
 
-fn order_terms(
+#[allow(dead_code)]
+fn order_terms_legacy(
     query: &Query,
     plan: &[ProjectionItem],
     aliases: &HashMap<String, &Expr>,
@@ -1076,7 +775,8 @@ fn order_terms(
 /// Compute the sort keys for one output row. Ordinals read straight from the
 /// projected values; expressions evaluate against the source row through the
 /// given context (which carries `group_rows` in aggregate queries).
-fn order_keys(
+#[allow(dead_code)]
+fn order_keys_legacy(
     terms: &[PlannedOrderTerm],
     ctx: &EvalContext,
     out: &[Value],
@@ -1097,7 +797,8 @@ fn order_keys(
     Ok(keys)
 }
 
-fn sort_planned_keyed(keyed: &mut [(Vec<Value>, Vec<Value>)], terms: &[PlannedOrderTerm]) {
+#[allow(dead_code)]
+fn sort_planned_keyed_legacy(keyed: &mut [(Vec<Value>, Vec<Value>)], terms: &[PlannedOrderTerm]) {
     keyed.sort_by(|a, b| compare_planned_keys(&a.0, &b.0, terms));
 }
 
@@ -1249,630 +950,9 @@ fn eval_const_int(expr: &Expr, clause: &str) -> Result<usize, Error> {
     }
 }
 
-fn representative_row<'a>(rows: &'a [Vec<Value>], group: &[usize]) -> &'a [Value] {
+pub(crate) fn representative_row<'a>(rows: &'a [Vec<Value>], group: &[usize]) -> &'a [Value] {
     match crate::engine::aggregate::representative_index(group) {
         Some(index) => rows[index].as_slice(),
         None => &[],
     }
-}
-
-fn build_groups(
-    lookup: &HashMap<String, usize>,
-    rows: &[Vec<Value>],
-    sources: &[PlannedGroupSource],
-    active: &[usize],
-    now: chrono::DateTime<Local>,
-    expr_plan: &ExprPlan,
-    runtime: &QueryRuntime,
-) -> Result<Vec<Vec<usize>>, Error> {
-    if sources.is_empty() {
-        return Ok(vec![active.to_vec()]);
-    }
-
-    let ctx = EvalContext::new(lookup, rows, &[], now, runtime);
-    let mut groups: Vec<Vec<usize>> = vec![];
-    let mut index: HashMap<Vec<GroupKey>, usize> = HashMap::new();
-
-    for &row_index in active {
-        let row = &rows[row_index];
-        let mut key: Vec<GroupKey> = Vec::with_capacity(sources.len());
-        for source in sources {
-            let value = match source {
-                PlannedGroupSource::Expr(id) => eval_expr(&ctx, expr_plan.expression(*id), row)?,
-                PlannedGroupSource::Column(column_index) => {
-                    row.get(*column_index).cloned().unwrap_or(Value::Null)
-                }
-            };
-            key.push(group_key(&value));
-        }
-        let group_index = match index.get(&key) {
-            Some(existing) => *existing,
-            None => {
-                groups.push(vec![]);
-                let new_index = groups.len() - 1;
-                index.insert(key, new_index);
-                new_index
-            }
-        };
-        groups[group_index].push(row_index);
-    }
-
-    Ok(groups)
-}
-
-#[derive(Debug)]
-pub(crate) enum ProjectionItem {
-    Column { index: usize, title: String },
-    Expression { expr: Box<Expr>, title: String },
-}
-
-fn build_projection_plan(
-    schema: &[ColumnRef],
-    projection: &[SelectItem],
-) -> Result<Vec<ProjectionItem>, Error> {
-    let mut plan: Vec<ProjectionItem> = vec![];
-    for item in projection {
-        match item {
-            SelectItem::Wildcard(_) => {
-                for (index, column) in schema.iter().enumerate() {
-                    plan.push(ProjectionItem::Column {
-                        index,
-                        title: column.column.clone(),
-                    });
-                }
-            }
-            SelectItem::QualifiedWildcard(kind, _) => {
-                let qualifier = match kind {
-                    sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                        object_name_to_parts(name).join(".")
-                    }
-                    _ => return Err("Unsupported qualified wildcard".to_string().into()),
-                };
-                let mut matched = false;
-                for (index, column) in schema.iter().enumerate() {
-                    if column.qualifier == qualifier || column.table_name == qualifier {
-                        plan.push(ProjectionItem::Column {
-                            index,
-                            title: column.column.clone(),
-                        });
-                        matched = true;
-                    }
-                }
-                if !matched {
-                    return Err(format!("Table `{qualifier}` not found").into());
-                }
-            }
-            // Titles keep the user's spelling; stored expressions are
-            // case-normalized so per-row column resolution hits directly.
-            SelectItem::UnnamedExpr(expr) => plan.push(ProjectionItem::Expression {
-                expr: Box::new(ExprRewriter::lowercase().rewritten(expr)),
-                title: expr_title(expr),
-            }),
-            SelectItem::ExprWithAlias { expr, alias } => plan.push(ProjectionItem::Expression {
-                expr: Box::new(ExprRewriter::lowercase().rewritten(expr)),
-                title: alias.to_string(),
-            }),
-            SelectItem::ExprWithAliases { .. } => {
-                return Err("Multiple aliases are not supported".to_string().into());
-            }
-        }
-    }
-    Ok(plan)
-}
-
-fn project(
-    ctx: &EvalContext,
-    plan: &[PlannedProjectionItem],
-    row: &[Value],
-    expr_plan: &ExprPlan,
-) -> Result<Vec<Value>, Error> {
-    let mut out: Vec<Value> = Vec::with_capacity(plan.len());
-    for item in plan {
-        match item {
-            PlannedProjectionItem::Column { index, .. } => {
-                out.push(row.get(*index).cloned().unwrap_or(Value::Null));
-            }
-            PlannedProjectionItem::Expression { id, .. } => {
-                out.push(eval_expr(ctx, expr_plan.expression(*id), row)?);
-            }
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Clone)]
-struct ColumnRef {
-    table_name: String,
-    qualifier: String,
-    column: String,
-}
-
-struct Relation<'a> {
-    schema: Vec<ColumnRef>,
-    rows: Cow<'a, [Vec<Value>]>,
-}
-
-pub(crate) fn object_name_to_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
-    name.0
-        .iter()
-        .filter_map(|part| part.as_ident())
-        .map(|ident| ident.value.to_lowercase())
-        .collect()
-}
-
-fn expr_title(expr: &Expr) -> String {
-    match expr {
-        Expr::Identifier(ident) => ident.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts
-            .iter()
-            .map(|ident| ident.value.clone())
-            .collect::<Vec<_>>()
-            .join("."),
-        other => other.to_string(),
-    }
-}
-
-fn load_relation<'a>(
-    schema: &'a Schema,
-    factor: &TableFactor,
-    runtime: &'a QueryRuntime,
-) -> Result<Relation<'a>, Error> {
-    match factor {
-        TableFactor::Table { name, alias, .. } => {
-            let parts = object_name_to_parts(name);
-            let (database, table_name) = match parts.as_slice() {
-                [table_name] => (None, table_name.as_str()),
-                [database, table_name] => (Some(database.as_str()), table_name.as_str()),
-                _ => {
-                    return Err("Table reference must be `table` or `database.table`"
-                        .to_string()
-                        .into());
-                }
-            };
-            let (_, table) = schema.resolve_table(database, table_name)?;
-            let table_name = table.name.clone();
-            let qualifier = alias
-                .as_ref()
-                .map(|alias| alias.name.value.to_lowercase())
-                .unwrap_or_else(|| table_name.clone());
-            let schema_refs = table
-                .columns
-                .iter()
-                .map(|column| ColumnRef {
-                    table_name: table_name.clone(),
-                    qualifier: qualifier.clone(),
-                    column: column.clone(),
-                })
-                .collect();
-            Ok(Relation {
-                schema: schema_refs,
-                rows: Cow::Borrowed(&table.rows),
-            })
-        }
-        TableFactor::Derived {
-            subquery, alias, ..
-        } => {
-            let result = crate::engine::set::execute_query_with_runtime(schema, subquery, runtime)?;
-            let qualifier = alias
-                .as_ref()
-                .map(|alias| alias.name.value.to_lowercase())
-                .ok_or("Derived tables require an alias")?;
-            let schema_refs = result
-                .columns
-                .iter()
-                .map(|column| ColumnRef {
-                    table_name: qualifier.clone(),
-                    qualifier: qualifier.clone(),
-                    column: column.clone(),
-                })
-                .collect();
-            Ok(Relation {
-                schema: schema_refs,
-                rows: Cow::Owned(result.rows),
-            })
-        }
-        _ => Err("Only plain table references are supported in FROM"
-            .to_string()
-            .into()),
-    }
-}
-
-fn cross_combine(left_rows: &[Vec<Value>], right_rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
-    let mut output = vec![];
-    for left in left_rows {
-        for right in right_rows {
-            let mut combined = left.clone();
-            combined.extend_from_slice(right);
-            output.push(combined);
-        }
-    }
-    output
-}
-
-fn apply_join(
-    left_schema: &[ColumnRef],
-    left_rows: &[Vec<Value>],
-    right: &Relation<'_>,
-    operator: &JoinOperator,
-    now: chrono::DateTime<Local>,
-    runtime: &QueryRuntime,
-) -> Result<(Vec<ColumnRef>, Vec<Vec<Value>>), Error> {
-    let mut schema = left_schema.to_vec();
-    schema.extend(right.schema.clone());
-    let left_len = left_schema.len();
-    let right_len = right.schema.len();
-
-    // Build the column lookup once for the whole join instead of per row pair.
-    let lookup = build_lookup(&schema)?;
-
-    let mut output: Vec<Vec<Value>> = vec![];
-    let mut matched_left = vec![false; left_rows.len()];
-    let mut matched_right = vec![false; right.rows.len()];
-
-    let using_pairs = using_column_pairs(operator, left_schema, &right.schema)?;
-    let equi_pairs = using_pairs.or_else(|| on_column_pairs(operator, left_schema, &right.schema));
-
-    if let Some(pairs) = &equi_pairs {
-        hash_using_join(
-            left_rows,
-            &right.rows,
-            pairs,
-            &mut output,
-            &mut matched_left,
-            &mut matched_right,
-        );
-    } else {
-        // Nested-loop fallback: reuse one scratch buffer to build candidate
-        // combined rows so only genuinely matching pairs get cloned.
-        let mut scratch: Vec<Value> = Vec::with_capacity(left_len + right_len);
-        for (left_index, left_row) in left_rows.iter().enumerate() {
-            for (right_index, right_row) in right.rows.iter().enumerate() {
-                scratch.clear();
-                scratch.extend_from_slice(left_row);
-                scratch.extend_from_slice(right_row);
-                if join_keep(operator, &lookup, now, runtime, &scratch)? {
-                    matched_left[left_index] = true;
-                    matched_right[right_index] = true;
-                    output.push(scratch.clone());
-                }
-            }
-        }
-    }
-
-    let (is_left, is_right) = match operator {
-        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => (true, false),
-        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => (false, true),
-        JoinOperator::FullOuter(_) => (true, true),
-        _ => (false, false),
-    };
-
-    if is_left {
-        for (index, left_row) in left_rows.iter().enumerate() {
-            if !matched_left[index] {
-                let mut combined = left_row.clone();
-                combined.extend(std::iter::repeat_n(Value::Null, right_len));
-                output.push(combined);
-            }
-        }
-    }
-
-    if is_right {
-        for (index, right_row) in right.rows.iter().enumerate() {
-            if !matched_right[index] {
-                let mut combined: Vec<Value> = std::iter::repeat_n(Value::Null, left_len).collect();
-                combined.extend_from_slice(right_row);
-                output.push(combined);
-            }
-        }
-    }
-
-    Ok((schema, output))
-}
-
-fn hash_using_join(
-    left_rows: &[Vec<Value>],
-    right_rows: &[Vec<Value>],
-    pairs: &[(usize, usize)],
-    output: &mut Vec<Vec<Value>>,
-    matched_left: &mut [bool],
-    matched_right: &mut [bool],
-) {
-    // Build the hash index on the smaller input, while emitting matches in
-    // logical left-row order so changing the build side does not change the
-    // observable order of existing queries.
-    if left_rows.len() <= right_rows.len() {
-        let mut index: HashMap<Vec<GroupKey>, Vec<usize>> = HashMap::new();
-        for (left_index, row) in left_rows.iter().enumerate() {
-            if pairs
-                .iter()
-                .any(|&(left_column, _)| row[left_column].is_null())
-            {
-                continue;
-            }
-            index
-                .entry(join_key(
-                    row,
-                    pairs.iter().map(|&(left_column, _)| left_column),
-                ))
-                .or_default()
-                .push(left_index);
-        }
-        let mut matches: Vec<Vec<usize>> = vec![Vec::new(); left_rows.len()];
-        for (right_index, row) in right_rows.iter().enumerate() {
-            if pairs
-                .iter()
-                .any(|&(_, right_column)| row[right_column].is_null())
-            {
-                continue;
-            }
-            let key = join_key(row, pairs.iter().map(|&(_, right_column)| right_column));
-            if let Some(left_indices) = index.get(&key) {
-                for &left_index in left_indices {
-                    if pairs.iter().all(|&(left_column, right_column)| {
-                        values_eq(&left_rows[left_index][left_column], &row[right_column])
-                    }) {
-                        matched_left[left_index] = true;
-                        matched_right[right_index] = true;
-                        matches[left_index].push(right_index);
-                    }
-                }
-            }
-        }
-        for (left_index, right_indices) in matches.into_iter().enumerate() {
-            for right_index in right_indices {
-                let mut row = left_rows[left_index].clone();
-                row.extend_from_slice(&right_rows[right_index]);
-                output.push(row);
-            }
-        }
-        return;
-    }
-
-    let mut index: HashMap<Vec<GroupKey>, Vec<usize>> = HashMap::new();
-    for (right_index, row) in right_rows.iter().enumerate() {
-        // SQL equi-joins never match NULL keys, so they are excluded from the
-        // build side entirely (they would otherwise bucket together and
-        // compare equal under `values_eq`).
-        if pairs
-            .iter()
-            .any(|&(_, right_column)| row[right_column].is_null())
-        {
-            continue;
-        }
-        let key = join_key(row, pairs.iter().map(|&(_, right_column)| right_column));
-        index.entry(key).or_default().push(right_index);
-    }
-
-    for (left_index, left_row) in left_rows.iter().enumerate() {
-        if pairs
-            .iter()
-            .any(|&(left_column, _)| left_row[left_column].is_null())
-        {
-            continue;
-        }
-        let key = join_key(left_row, pairs.iter().map(|&(left_column, _)| left_column));
-        if let Some(right_indices) = index.get(&key) {
-            for &right_index in right_indices {
-                if !pairs.iter().all(|&(left_column, right_column)| {
-                    values_eq(
-                        &left_row[left_column],
-                        &right_rows[right_index][right_column],
-                    )
-                }) {
-                    continue;
-                }
-                matched_left[left_index] = true;
-                matched_right[right_index] = true;
-                let mut row = left_row.clone();
-                row.extend_from_slice(&right_rows[right_index]);
-                output.push(row);
-            }
-        }
-    }
-}
-
-fn on_column_pairs(
-    operator: &JoinOperator,
-    left_schema: &[ColumnRef],
-    right_schema: &[ColumnRef],
-) -> Option<Vec<(usize, usize)>> {
-    let JoinConstraint::On(expr) = join_constraint(operator)? else {
-        return None;
-    };
-    let mut pairs = Vec::new();
-    collect_equi_pairs(expr, left_schema, right_schema, &mut pairs)?;
-    (!pairs.is_empty()).then_some(pairs)
-}
-
-fn collect_equi_pairs(
-    expr: &Expr,
-    left_schema: &[ColumnRef],
-    right_schema: &[ColumnRef],
-    pairs: &mut Vec<(usize, usize)>,
-) -> Option<()> {
-    match expr {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            collect_equi_pairs(left, left_schema, right_schema, pairs)?;
-            collect_equi_pairs(right, left_schema, right_schema, pairs)
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            let left_column = resolve_join_column(left, left_schema, right_schema)?;
-            let right_column = resolve_join_column(right, left_schema, right_schema)?;
-            match (left_column, right_column) {
-                (JoinColumn::Left(left_index), JoinColumn::Right(right_index)) => {
-                    pairs.push((left_index, right_index));
-                    Some(())
-                }
-                (JoinColumn::Right(right_index), JoinColumn::Left(left_index)) => {
-                    pairs.push((left_index, right_index));
-                    Some(())
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-enum JoinColumn {
-    Left(usize),
-    Right(usize),
-}
-
-fn resolve_join_column(
-    expr: &Expr,
-    left_schema: &[ColumnRef],
-    right_schema: &[ColumnRef],
-) -> Option<JoinColumn> {
-    let parts = match expr {
-        Expr::Identifier(identifier) => vec![identifier.value.to_lowercase()],
-        Expr::CompoundIdentifier(parts) => {
-            parts.iter().map(|part| part.value.to_lowercase()).collect()
-        }
-        _ => return None,
-    };
-    let (qualifier, column) = match parts.as_slice() {
-        [column] => (None, column.as_str()),
-        [qualifier, column] => (Some(qualifier.as_str()), column.as_str()),
-        _ => return None,
-    };
-
-    let find = |schema: &[ColumnRef]| {
-        let mut matches = schema.iter().enumerate().filter(|(_, reference)| {
-            reference.column == column
-                && qualifier.is_none_or(|qualifier| {
-                    reference.qualifier == qualifier || reference.table_name == qualifier
-                })
-        });
-        let (index, _) = matches.next()?;
-        matches.next().is_none().then_some(index)
-    };
-
-    match (find(left_schema), find(right_schema)) {
-        (Some(index), None) => Some(JoinColumn::Left(index)),
-        (None, Some(index)) => Some(JoinColumn::Right(index)),
-        _ => None,
-    }
-}
-
-fn join_constraint(operator: &JoinOperator) -> Option<&JoinConstraint> {
-    match operator {
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint) => Some(constraint),
-        _ => None,
-    }
-}
-
-fn using_column_pairs(
-    operator: &JoinOperator,
-    left_schema: &[ColumnRef],
-    right_schema: &[ColumnRef],
-) -> Result<Option<Vec<(usize, usize)>>, Error> {
-    let columns = match operator {
-        JoinOperator::Join(JoinConstraint::Using(cols))
-        | JoinOperator::Inner(JoinConstraint::Using(cols))
-        | JoinOperator::Left(JoinConstraint::Using(cols))
-        | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
-        | JoinOperator::Right(JoinConstraint::Using(cols))
-        | JoinOperator::RightOuter(JoinConstraint::Using(cols))
-        | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => cols,
-        _ => return Ok(None),
-    };
-
-    let mut pairs = vec![];
-    for column in columns {
-        let name = column
-            .0
-            .last()
-            .and_then(|part| part.as_ident())
-            .map(|ident| ident.value.to_lowercase())
-            .unwrap_or_default();
-        let left_index = left_schema
-            .iter()
-            .position(|column_ref| column_ref.column == name)
-            .ok_or_else(|| format!("USING column `{name}` not found in left table"))?;
-        let right_index = right_schema
-            .iter()
-            .position(|column_ref| column_ref.column == name)
-            .ok_or_else(|| format!("USING column `{name}` not found in right table"))?;
-        pairs.push((left_index, right_index));
-    }
-    Ok(Some(pairs))
-}
-
-fn join_keep(
-    operator: &JoinOperator,
-    lookup: &HashMap<String, usize>,
-    now: chrono::DateTime<Local>,
-    runtime: &QueryRuntime,
-    combined: &[Value],
-) -> Result<bool, Error> {
-    let constraint = match operator {
-        JoinOperator::Join(constraint)
-        | JoinOperator::Inner(constraint)
-        | JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint)
-        | JoinOperator::CrossJoin(constraint) => constraint,
-        _ => return Err("Unsupported join type".to_string().into()),
-    };
-
-    match constraint {
-        JoinConstraint::On(expr) => {
-            let ctx = EvalContext::new(lookup, &[], &[], now, runtime);
-            let value = eval_expr(&ctx, expr, combined)?;
-            Ok(value.truthy())
-        }
-        JoinConstraint::Using(_) => Err("This join type cannot be combined with a USING clause"
-            .to_string()
-            .into()),
-        JoinConstraint::None => Ok(true),
-        JoinConstraint::Natural => Err("NATURAL JOIN is not supported".to_string().into()),
-    }
-}
-
-fn build_lookup(schema: &[ColumnRef]) -> Result<HashMap<String, usize>, Error> {
-    let mut map: HashMap<String, Vec<usize>> = HashMap::new();
-
-    for (index, column) in schema.iter().enumerate() {
-        for name in [
-            column.column.clone(),
-            format!("{}.{}", column.qualifier, column.column),
-            format!("{}.{}", column.table_name, column.column),
-        ] {
-            let indices = map.entry(name).or_default();
-            if !indices.contains(&index) {
-                indices.push(index);
-            }
-        }
-    }
-
-    let mut lookup: HashMap<String, usize> = HashMap::new();
-    for (name, indices) in &map {
-        lookup.insert(
-            name.clone(),
-            if indices.len() == 1 {
-                indices[0]
-            } else {
-                usize::MAX
-            },
-        );
-    }
-    Ok(lookup)
 }
