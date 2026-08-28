@@ -1,8 +1,13 @@
+mod aggregate;
+mod join;
 mod metadata;
 mod output;
+mod plan;
 pub(crate) mod rewrite;
 mod select;
+mod set;
 mod temporary;
+mod window;
 
 use sqlparser::ast::{
     ShowStatementFilter, ShowStatementFilterPosition, ShowStatementOptions, Statement,
@@ -17,8 +22,9 @@ use crate::value::Value;
 
 use crate::engine::metadata::{run_describe_table, run_show_databases, run_show_tables, run_use};
 use crate::engine::output::{strip_into_outfile, write_outfile};
-use crate::engine::select::{execute_query, object_name_to_parts};
-use crate::engine::temporary::run_create_table;
+use crate::engine::select::object_name_to_parts;
+use crate::engine::set::execute_query;
+use crate::engine::temporary::{run_create_table, run_insert};
 
 /// Split an `INTO OUTFILE 'path'` clause off a query before parsing.
 /// Exposed so the server can reject file-writing clauses up front.
@@ -31,6 +37,8 @@ pub struct QueryStats {
     pub elapsed_ms: u128,
     pub input_rows: usize,
     pub output_rows: usize,
+    pub correlated_cache_hits: usize,
+    pub correlated_cache_misses: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +46,23 @@ pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
     pub stats: QueryStats,
+}
+
+/// Internal query data before top-level execution statistics are attached.
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionOutput {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Value>>,
+}
+
+impl ExecutionOutput {
+    pub(crate) fn into_result(self) -> QueryResult {
+        QueryResult {
+            columns: self.columns,
+            rows: self.rows,
+            stats: QueryStats::default(),
+        }
+    }
 }
 
 pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
@@ -57,6 +82,7 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
     let result = match &statements[0] {
         Statement::Query(query) => execute_query(schema, query),
         Statement::CreateTable(create) => run_create_table(schema, create),
+        Statement::Insert(insert) => run_insert(schema, insert),
         Statement::ShowColumns { show_options, .. } => run_show_columns(schema, show_options),
         Statement::ShowDatabases { show_options, .. }
         | Statement::ShowSchemas { show_options, .. } => {
@@ -101,6 +127,8 @@ pub fn run_query(schema: &mut Schema, sql: &str) -> Result<QueryResult, Error> {
                 elapsed_ms: started.elapsed().as_millis(),
                 input_rows: result.stats.input_rows,
                 output_rows: result.rows.len(),
+                correlated_cache_hits: result.stats.correlated_cache_hits,
+                correlated_cache_misses: result.stats.correlated_cache_misses,
             },
         });
     }
@@ -312,7 +340,6 @@ mod tests {
         let mut schema = make_schema();
         for sql in [
             "CREATE TABLE regular AS SELECT * FROM people",
-            "CREATE TEMPORARY TABLE empty (name TEXT)",
             "CREATE TEMPORARY TABLE qualified.name AS SELECT * FROM people",
         ] {
             assert!(
@@ -811,6 +838,364 @@ mod tests {
                 Value::Int(41),
             ]
         );
+    }
+
+    #[test]
+    fn set_operations_return_union_intersection_and_left_difference() {
+        let mut schema = make_schema();
+        let union = run(
+            &mut schema,
+            "SELECT city FROM people UNION SELECT city FROM people",
+        );
+        assert_eq!(union.rows.len(), 3);
+
+        let intersection = run(
+            &mut schema,
+            "SELECT city FROM people INTERSECT SELECT city FROM people WHERE city = 'NY'",
+        );
+        assert_eq!(intersection.rows, vec![vec![Value::Text("NY".into())]]);
+
+        let difference = run(
+            &mut schema,
+            "SELECT city FROM people EXCEPT SELECT city FROM people WHERE city = 'NY'",
+        );
+        assert!(!difference.rows.contains(&vec![Value::Text("NY".into())]));
+        assert!(difference.rows.contains(&vec![Value::Text("LA".into())]));
+
+        // Reversing EXCEPT returns the right-only region of the Venn diagram.
+        let right_only = run(
+            &mut schema,
+            "SELECT city FROM people WHERE city = 'NY' EXCEPT SELECT city FROM people WHERE city = 'LA'",
+        );
+        assert_eq!(right_only.rows, vec![vec![Value::Text("NY".into())]]);
+    }
+
+    #[test]
+    fn set_operations_deduplicate_complete_rows_and_normalize_numeric_values() {
+        let mut schema = make_schema();
+        let result = run(&mut schema, "SELECT 1 AS value UNION SELECT 1.0 AS value");
+        assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+
+        let result = run(
+            &mut schema,
+            "SELECT NULL AS value UNION SELECT NULL AS value",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+
+        let result = run(
+            &mut schema,
+            "SELECT city, id FROM people WHERE id = 1 UNION SELECT city, id FROM people WHERE id = 1",
+        );
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.columns, vec!["city", "id"]);
+    }
+
+    #[test]
+    fn set_query_applies_outer_order_limit_and_offset() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT city FROM people UNION SELECT city FROM people ORDER BY city DESC LIMIT 2 OFFSET 1",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("NY".into())],
+                vec![Value::Text("LA".into())],
+            ]
+        );
+        assert_eq!(result.stats.output_rows, 2);
+    }
+
+    #[test]
+    fn set_query_applies_branch_limit_before_union() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "(SELECT city FROM people ORDER BY city LIMIT 1) UNION SELECT city FROM people WHERE city = 'NY'",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("LA".into())],
+                vec![Value::Text("NY".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn set_query_supports_outer_order_by_ordinal() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT city, id FROM people UNION SELECT city, id FROM people ORDER BY 2 DESC LIMIT 2",
+        );
+        assert_eq!(result.rows[0][1], Value::Int(5));
+        assert_eq!(result.rows[1][1], Value::Int(4));
+    }
+
+    #[test]
+    fn scalar_subquery_returns_value_or_null() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT (SELECT MAX(age) FROM people) AS max_age",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int(40)]]);
+
+        let result = run(
+            &mut schema,
+            "SELECT (SELECT age FROM people WHERE id = 999) AS missing",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn in_and_exists_subqueries_work_with_null_semantics() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT id FROM people WHERE id IN (SELECT customer_id FROM orders) ORDER BY id",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+        let result = run(
+            &mut schema,
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM people WHERE FALSE)",
+        );
+        assert!(result.rows.is_empty());
+
+        let result = run(
+            &mut schema,
+            "SELECT 3 IN (SELECT NULL) AS unknown_membership",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+    }
+
+    #[test]
+    fn scalar_subquery_rejects_multiple_rows_and_columns() {
+        let mut schema = make_schema();
+        assert!(run_query(&mut schema, "SELECT (SELECT age FROM people)").is_err());
+        assert!(run_query(&mut schema, "SELECT (SELECT id, age FROM people LIMIT 1)").is_err());
+    }
+
+    #[test]
+    fn cte_is_materialized_in_query_scope() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "WITH adults AS (SELECT name, age FROM people WHERE age >= 30) SELECT name FROM adults ORDER BY name",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("Alice".into())],
+                vec![Value::Text("Carol".into())],
+                vec![Value::Text("Dan".into())],
+            ]
+        );
+        assert!(schema.get_temporary_table("adults").is_none());
+    }
+
+    #[test]
+    fn ctes_can_reference_previous_ctes_and_rename_columns() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "WITH adults (person, years) AS (SELECT name, age FROM people WHERE age >= 35), seniors AS (SELECT person FROM adults) SELECT person FROM seniors",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("Carol".into())],
+                vec![Value::Text("Dan".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn row_number_and_rank_work_over_partitions() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT name, ROW_NUMBER() OVER (PARTITION BY city ORDER BY age) AS rn, \
+             RANK() OVER (PARTITION BY city ORDER BY age) AS rk FROM people \
+             WHERE city = 'NY' OR city = 'LA' ORDER BY city, rn",
+        );
+        // NY: Alice(30) rn=1, Dan(40) rn=2
+        // LA: Bob(25) rn=1, Eve(28) rn=2
+        assert_eq!(result.rows.len(), 4);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("Bob".into()), Value::Int(1), Value::Int(1)],
+                vec![Value::Text("Eve".into()), Value::Int(2), Value::Int(2)],
+                vec![Value::Text("Alice".into()), Value::Int(1), Value::Int(1)],
+                vec![Value::Text("Dan".into()), Value::Int(2), Value::Int(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn sum_over_partition_is_computed_per_partition() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT name, age, SUM(age) OVER (PARTITION BY city) AS city_total \
+             FROM people WHERE city IN ('NY', 'LA') ORDER BY name",
+        );
+        // NY total = 30 + 40 = 70, LA total = 25 + 28 = 53
+        assert_eq!(result.rows.len(), 4);
+        for row in &result.rows {
+            let city_total = row[2].clone();
+            match row[0].as_text() {
+                Some(name) if name == "Alice" || name == "Dan" => {
+                    assert_eq!(city_total, Value::Int(70))
+                }
+                Some(name) if name == "Bob" || name == "Eve" => {
+                    assert_eq!(city_total, Value::Int(53))
+                }
+                _ => panic!("unexpected row: {row:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn window_function_rejects_group_by_combination() {
+        let mut schema = make_schema();
+        assert!(
+            run_query(
+                &mut schema,
+                "SELECT city, COUNT(*) OVER () FROM people GROUP BY city"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn count_star_over_and_order_by_window_reference() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT name, COUNT(*) OVER () AS total \
+             FROM people WHERE city = 'NY' ORDER BY name",
+        );
+        // Two NY rows -> total = 2 for every row.
+        assert_eq!(result.rows.len(), 2);
+        for row in &result.rows {
+            assert_eq!(row[1], Value::Int(2));
+        }
+
+        // ORDER BY can reference a window function that is not projected.
+        let result = run(
+            &mut schema,
+            "SELECT name FROM people \
+             ORDER BY ROW_NUMBER() OVER (PARTITION BY city ORDER BY age)",
+        );
+        assert_eq!(result.rows.len(), 5);
+    }
+
+    #[test]
+    fn temporary_table_can_be_created_and_filled_with_values() {
+        let mut schema = make_schema();
+        run(
+            &mut schema,
+            "CREATE TEMPORARY TABLE selected (id INT, name TEXT)",
+        );
+        run(
+            &mut schema,
+            "INSERT INTO selected VALUES (1, 'Alice'), (2, 'Bob')",
+        );
+        let result = run(&mut schema, "SELECT id, name FROM selected ORDER BY id");
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            result.rows[0],
+            vec![Value::Int(1), Value::Text("Alice".into())]
+        );
+    }
+
+    #[test]
+    fn derived_table_can_be_used_as_a_relation() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT name FROM (SELECT name FROM people WHERE age >= 35) AS adults ORDER BY name",
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("Carol".into())],
+                vec![Value::Text("Dan".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn correlated_exists_subquery_uses_outer_row_scope() {
+        let mut schema = make_schema();
+        let result = run_query(
+            &mut schema,
+            "SELECT p.name FROM people p WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = p.id)",
+        )
+        .unwrap();
+        assert!(
+            result.rows
+                == vec![
+                    vec![Value::Text("Alice".into())],
+                    vec![Value::Text("Bob".into())],
+                ],
+            "got: {:?}",
+            result.rows
+        );
+    }
+
+    #[test]
+    fn correlated_scalar_and_in_subqueries_use_outer_row_scope() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT p.name, (SELECT MAX(amount) FROM orders o WHERE o.customer_id = p.id) AS max_amount FROM people p ORDER BY p.id",
+        );
+        assert_eq!(
+            result.rows[0],
+            vec![Value::Text("Alice".into()), Value::Float(99.9)]
+        );
+        assert_eq!(
+            result.rows[1],
+            vec![Value::Text("Bob".into()), Value::Float(20.0)]
+        );
+        assert_eq!(result.rows[2][1], Value::Null);
+        assert!(result.stats.correlated_cache_misses >= 3);
+
+        let result = run(
+            &mut schema,
+            "SELECT p.id FROM people p WHERE p.id IN (SELECT o.customer_id FROM orders o WHERE o.customer_id = p.id) ORDER BY p.id",
+        );
+        assert_eq!(result.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+        let result = run(
+            &mut schema,
+            "SELECT p.id, (SELECT MAX(amount) FROM orders o WHERE o.customer_id = p.id) FROM people p JOIN orders x ON x.customer_id = p.id ORDER BY p.id",
+        );
+        assert_eq!(result.rows.len(), 3);
+        assert!(result.stats.correlated_cache_hits >= 1);
+    }
+
+    #[test]
+    fn set_operations_validate_columns_and_reject_all() {
+        let mut schema = make_schema();
+        let error = run_query(
+            &mut schema,
+            "SELECT city FROM people UNION SELECT id, name FROM people",
+        )
+        .unwrap_err();
+        assert!(error.contains("same number of columns"), "got: {error}");
+        let error = run_query(
+            &mut schema,
+            "SELECT city FROM people UNION ALL SELECT city FROM people",
+        )
+        .unwrap_err();
+        assert!(error.contains("ALL"), "got: {error}");
     }
 
     #[test]
@@ -1499,5 +1884,77 @@ mod tests {
         assert!(error.contains("1 argument(s), got 2"), "got: {error}");
         let error = run_query(&mut schema, "SELECT COUNT(age, id) FROM people").unwrap_err();
         assert!(error.contains("1 argument(s), got 2"), "got: {error}");
+    }
+
+    #[test]
+    fn where_predicate_is_pushed_onto_join_sides() {
+        let mut schema = make_schema();
+        // WHERE filters on the right side (orders.amount) and a join condition
+        // keep behavior identical whether or not the predicate is pushed.
+        let pushed = run(
+            &mut schema,
+            "SELECT p.name, o.amount FROM people p \
+             INNER JOIN orders o ON p.id = o.customer_id \
+             WHERE o.amount > 60.0 AND p.city = 'NY' ORDER BY p.name",
+        );
+        // orders with amount > 60: only order 103 (customer 1, 99.9), customer
+        // 1 = Alice (NY).
+        assert_eq!(
+            pushed.rows,
+            vec![vec![Value::Text("Alice".into()), Value::Float(99.9),]]
+        );
+    }
+
+    #[test]
+    fn where_predicate_pushdown_never_changes_outer_join_results() {
+        let mut schema = make_schema();
+        // A LEFT JOIN must still produce the unmatched preserved row even
+        // though a WHERE predicate mentions only the left side.
+        let result = run(
+            &mut schema,
+            "SELECT p.name, o.amount FROM people p \
+             LEFT JOIN orders o ON p.id = o.customer_id \
+             WHERE p.city = 'SF' ORDER BY p.name",
+        );
+        // SF is Carol; she has no order -> null amount preserved once.
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Text("Carol".into()), Value::Null]]
+        );
+    }
+
+    #[test]
+    fn temporary_table_supports_insert_select_and_target_columns() {
+        let mut schema = make_schema();
+        run(
+            &mut schema,
+            "CREATE TEMPORARY TABLE copied (id INT, name TEXT, note TEXT)",
+        );
+        run(
+            &mut schema,
+            "INSERT INTO copied (name, id) SELECT name, id FROM people WHERE id <= 2",
+        );
+        let result = run(&mut schema, "SELECT id, name, note FROM copied ORDER BY id");
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int(1), Value::Text("Alice".into()), Value::Null],
+                vec![Value::Int(2), Value::Text("Bob".into()), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn non_equality_join_uses_predicate_fallback() {
+        let mut schema = make_schema();
+        let result = run(
+            &mut schema,
+            "SELECT p.name, o.amount FROM people p \
+             JOIN orders o ON p.id < o.customer_id ORDER BY p.name, o.amount",
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::Text("Alice".into()), Value::Float(20.0)],]
+        );
     }
 }

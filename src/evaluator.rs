@@ -12,6 +12,7 @@ use crate::error::Error;
 use crate::functions::{eval_function, floor_ceil};
 use crate::value::GroupKey;
 use crate::value::Value;
+use crate::value::group_key;
 
 #[derive(Debug, Clone, Default)]
 pub struct AggregateSummary {
@@ -33,6 +34,57 @@ pub struct AggregateSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ExprId(pub(crate) usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriBool {
+    True,
+    False,
+    Unknown,
+}
+
+impl TriBool {
+    fn from_value(value: &Value) -> Self {
+        if value.is_null() {
+            Self::Unknown
+        } else if value.truthy() {
+            Self::True
+        } else {
+            Self::False
+        }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            Self::True => Value::Bool(true),
+            Self::False => Value::Bool(false),
+            Self::Unknown => Value::Null,
+        }
+    }
+
+    fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+}
 use crate::value::values_eq;
 use crate::value::values_partial_cmp;
 
@@ -41,20 +93,31 @@ pub struct EvalContext<'a> {
     pub all_rows: &'a [Vec<Value>],
     pub group_rows: &'a [usize],
     pub now: DateTime<Local>,
-    pub(crate) expr_keys: &'a HashMap<String, ExprId>,
+    pub(crate) expr_ids: &'a HashMap<Expr, ExprId>,
     pub(crate) expressions: &'a [Expr],
 
     /// Values of aggregate arguments already evaluated for this group.
     /// Aggregate functions share a context, so SUM(x), AVG(x), and MAX(x)
     /// do not repeatedly evaluate the same expression for every row.
     pub(crate) group_state: Option<&'a RefCell<GroupState>>,
+    pub(crate) subqueries: &'a HashMap<sqlparser::ast::Query, SubqueryResult>,
+    pub(crate) runtime: &'a QueryRuntime,
+    pub(crate) subquery_executor: Option<&'a dyn SubqueryExecutor>,
+    pub(crate) outer_scope: Option<&'a OuterScope<'a>>,
+    /// Maps a window function expression's canonical string to the offset of
+    /// its computed value in the augmented `current` row. Set for queries that
+    /// use window functions.
+    pub(crate) window_resolver: Option<&'a HashMap<Expr, usize>>,
 }
 
 static EMPTY_COLUMNS: std::sync::OnceLock<HashMap<String, usize>> = std::sync::OnceLock::new();
 static EMPTY_ROWS: [Vec<Value>; 0] = [];
 static EMPTY_GROUP: [usize; 0] = [];
-static EMPTY_EXPR_KEYS: std::sync::OnceLock<HashMap<String, ExprId>> = std::sync::OnceLock::new();
-pub(crate) type ExprIds = HashMap<String, ExprId>;
+static EMPTY_EXPR_IDS: std::sync::OnceLock<HashMap<Expr, ExprId>> = std::sync::OnceLock::new();
+static EMPTY_SUBQUERIES: std::sync::OnceLock<HashMap<sqlparser::ast::Query, SubqueryResult>> =
+    std::sync::OnceLock::new();
+static SCALAR_RUNTIME: std::sync::OnceLock<QueryRuntime> = std::sync::OnceLock::new();
+pub(crate) type ExprIds = HashMap<Expr, ExprId>;
 
 #[derive(Debug, Default)]
 pub(crate) struct GroupState {
@@ -62,10 +125,93 @@ pub(crate) struct GroupState {
     pub(crate) summaries: HashMap<ExprId, AggregateSummary>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SubqueryResult {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CorrelatedCacheKey {
+    pub(crate) subquery: SubqueryId,
+    pub(crate) outer_values: Vec<GroupKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CorrelationExpr {
+    pub(crate) scope_level: usize,
+    pub(crate) outer_column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SubqueryId(pub(crate) usize);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeStats {
+    pub(crate) correlated_cache_hits: usize,
+    pub(crate) correlated_cache_misses: usize,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct QueryRuntime {
+    pub(crate) correlated_cache: std::sync::Mutex<HashMap<CorrelatedCacheKey, SubqueryResult>>,
+    pub(crate) correlated_cache_hits: std::sync::Mutex<usize>,
+    pub(crate) correlated_cache_misses: std::sync::Mutex<usize>,
+    pub(crate) subquery_ids: std::sync::Mutex<HashMap<sqlparser::ast::Query, SubqueryId>>,
+    pub(crate) correlations: std::sync::Mutex<HashMap<SubqueryId, Arc<[CorrelationExpr]>>>,
+}
+
+impl QueryRuntime {
+    pub(crate) fn stats(&self) -> RuntimeStats {
+        RuntimeStats {
+            correlated_cache_hits: *self.correlated_cache_hits.lock().unwrap(),
+            correlated_cache_misses: *self.correlated_cache_misses.lock().unwrap(),
+        }
+    }
+
+    pub(crate) fn subquery_id(&self, query: &sqlparser::ast::Query) -> SubqueryId {
+        let mut ids = self.subquery_ids.lock().unwrap();
+        if let Some(id) = ids.get(query).copied() {
+            return id;
+        }
+        let id = SubqueryId(ids.len());
+        ids.insert(query.clone(), id);
+        id
+    }
+
+    pub(crate) fn register_correlations(
+        &self,
+        subquery: SubqueryId,
+        correlations: Vec<CorrelationExpr>,
+    ) {
+        self.correlations
+            .lock()
+            .unwrap()
+            .insert(subquery, correlations.into());
+    }
+}
+
+pub(crate) const MAX_CORRELATED_SUBQUERY_CACHE_ENTRIES: usize = 100_000;
+
+pub(crate) struct OuterScope<'a> {
+    pub(crate) row: &'a [Value],
+    pub(crate) columns: &'a HashMap<String, usize>,
+    pub(crate) parent: Option<&'a OuterScope<'a>>,
+    pub(crate) runtime: &'a QueryRuntime,
+}
+
+pub(crate) trait SubqueryExecutor {
+    fn execute(
+        &self,
+        query: &sqlparser::ast::Query,
+        scope: &OuterScope<'_>,
+    ) -> Result<SubqueryResult, Error>;
+}
+
 impl<'a> EvalContext<'a> {
     pub(crate) fn expr_id(&self, expr: &Expr) -> ExprId {
-        self.expr_keys
-            .get(&expr.to_string())
+        self.expr_ids
+            .get(expr)
             .copied()
             .expect("all aggregate expressions must be registered in the query plan")
     }
@@ -79,15 +225,21 @@ impl<'a> EvalContext<'a> {
         all_rows: &'a [Vec<Value>],
         group_rows: &'a [usize],
         now: DateTime<Local>,
+        runtime: &'a QueryRuntime,
     ) -> Self {
         Self {
             columns,
             all_rows,
             group_rows,
             now,
-            expr_keys: EMPTY_EXPR_KEYS.get_or_init(HashMap::new),
+            expr_ids: EMPTY_EXPR_IDS.get_or_init(HashMap::new),
             expressions: &[],
             group_state: None,
+            subqueries: EMPTY_SUBQUERIES.get_or_init(HashMap::new),
+            runtime,
+            subquery_executor: None,
+            outer_scope: None,
+            window_resolver: None,
         }
     }
 
@@ -98,13 +250,15 @@ impl<'a> EvalContext<'a> {
         now: DateTime<Local>,
         expr_ids: &'a ExprIds,
         expressions: &'a [Expr],
+        runtime: &'a QueryRuntime,
     ) -> Self {
-        let mut context = Self::new(columns, all_rows, group_rows, now);
-        context.expr_keys = expr_ids;
+        let mut context = Self::new(columns, all_rows, group_rows, now, runtime);
+        context.expr_ids = expr_ids;
         context.expressions = expressions;
         context
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_group_state(
         columns: &'a HashMap<String, usize>,
         all_rows: &'a [Vec<Value>],
@@ -113,11 +267,59 @@ impl<'a> EvalContext<'a> {
         expr_ids: &'a ExprIds,
         expressions: &'a [Expr],
         group_state: &'a RefCell<GroupState>,
+        runtime: &'a QueryRuntime,
     ) -> Self {
-        let mut context =
-            Self::with_expr_ids(columns, all_rows, group_rows, now, expr_ids, expressions);
+        let mut context = Self::with_expr_ids(
+            columns,
+            all_rows,
+            group_rows,
+            now,
+            expr_ids,
+            expressions,
+            runtime,
+        );
         context.group_state = Some(group_state);
         context
+    }
+
+    pub(crate) fn with_subqueries(
+        mut self,
+        subqueries: &'a HashMap<sqlparser::ast::Query, SubqueryResult>,
+    ) -> Self {
+        self.subqueries = subqueries;
+        self
+    }
+
+    pub(crate) fn with_runtime(mut self, runtime: &'a QueryRuntime) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    pub(crate) fn with_subquery_executor(
+        mut self,
+        executor: &'a dyn SubqueryExecutor,
+        scope: Option<&'a OuterScope<'a>>,
+    ) -> Self {
+        self.subquery_executor = Some(executor);
+        self.outer_scope = scope;
+        self
+    }
+
+    pub(crate) fn with_outer_scope(mut self, scope: &'a OuterScope<'a>) -> Self {
+        self.outer_scope = Some(scope);
+        self
+    }
+
+    pub(crate) fn with_window_resolver(mut self, resolver: &'a HashMap<Expr, usize>) -> Self {
+        self.window_resolver = Some(resolver);
+        self
+    }
+
+    /// The value of the window column at the given canonical key, read from the
+    /// augmented current row.
+    pub(crate) fn window_value(&self, key: &Expr, current: &[Value]) -> Option<Value> {
+        let offset = self.window_resolver?.get(key)?;
+        current.get(*offset).cloned()
     }
 
     pub fn scalar() -> Self {
@@ -126,9 +328,14 @@ impl<'a> EvalContext<'a> {
             all_rows: &EMPTY_ROWS,
             group_rows: &EMPTY_GROUP,
             now: Local::now(),
-            expr_keys: EMPTY_EXPR_KEYS.get_or_init(HashMap::new),
+            expr_ids: EMPTY_EXPR_IDS.get_or_init(HashMap::new),
             expressions: &[],
             group_state: None,
+            subqueries: EMPTY_SUBQUERIES.get_or_init(HashMap::new),
+            runtime: SCALAR_RUNTIME.get_or_init(QueryRuntime::default),
+            subquery_executor: None,
+            outer_scope: None,
+            window_resolver: None,
         }
     }
 }
@@ -259,11 +466,118 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
             };
             Ok(Value::Text(trim_string(&value, side, what.as_deref())))
         }
-        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-            Err("Subqueries are not supported".to_string().into())
+        Expr::Subquery(query) => scalar_subquery(ctx, query),
+        Expr::Exists { subquery, negated } => {
+            let result = subquery_result(ctx, subquery)?;
+            let exists = !result.rows.is_empty();
+            Ok(Value::Bool(if *negated { !exists } else { exists }))
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let value = eval_expr(ctx, expr, current)?;
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let result = subquery_result(ctx, subquery)?;
+            let mut saw_null = false;
+            for row in &result.rows {
+                let candidate = row.first().ok_or("IN subquery must return one column")?;
+                if candidate.is_null() {
+                    saw_null = true;
+                } else if values_eq(&value, candidate) {
+                    return Ok(Value::Bool(!*negated));
+                }
+            }
+            if saw_null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Bool(*negated))
+            }
         }
         other => Err(format!("Unsupported expression: {}", expr_display(other)).into()),
     }
+}
+
+fn scalar_subquery(ctx: &EvalContext, query: &sqlparser::ast::Query) -> Result<Value, Error> {
+    let result = subquery_result(ctx, query)?;
+    if result.columns.len() != 1 {
+        return Err("Scalar subquery must return exactly one column".into());
+    }
+    match result.rows.as_slice() {
+        [] => Ok(Value::Null),
+        [row] => Ok(row.first().cloned().unwrap_or(Value::Null)),
+        _ => Err("Scalar subquery must return at most one row".into()),
+    }
+}
+
+fn subquery_result<'a>(
+    ctx: &'a EvalContext<'a>,
+    query: &sqlparser::ast::Query,
+) -> Result<std::borrow::Cow<'a, SubqueryResult>, Error> {
+    if let Some(result) = ctx.subqueries.get(query) {
+        return Ok(std::borrow::Cow::Borrowed(result));
+    }
+    let executor = ctx.subquery_executor.ok_or("Subquery was not prepared")?;
+    let scope = ctx
+        .outer_scope
+        .ok_or("Correlated subquery requires an outer row")?;
+    let subquery = ctx.runtime.subquery_id(query);
+    let correlations = ctx
+        .runtime
+        .correlations
+        .lock()
+        .unwrap()
+        .get(&subquery)
+        .cloned()
+        .unwrap_or_default();
+    // An empty dependency list means the correlation analyzer could not prove
+    // which outer values affect the subquery. Never cache such a result: using
+    // one shared entry would be incorrect for different outer rows.
+    if correlations.is_empty() {
+        return Ok(std::borrow::Cow::Owned(executor.execute(query, scope)?));
+    }
+    let outer_values = correlations
+        .iter()
+        .filter_map(|correlation| {
+            scope_at(scope, correlation.scope_level)
+                .and_then(|scope| scope.row.get(correlation.outer_column))
+        })
+        .map(group_key)
+        .collect();
+    let key = CorrelatedCacheKey {
+        subquery,
+        outer_values,
+    };
+    if let Some(result) = ctx.runtime.correlated_cache.lock().unwrap().get(&key) {
+        *ctx.runtime.correlated_cache_hits.lock().unwrap() += 1;
+        return Ok(std::borrow::Cow::Owned(result.clone()));
+    }
+    *ctx.runtime.correlated_cache_misses.lock().unwrap() += 1;
+    let result = executor.execute(query, scope)?;
+    let mut cache = ctx.runtime.correlated_cache.lock().unwrap();
+    if cache.len() < MAX_CORRELATED_SUBQUERY_CACHE_ENTRIES {
+        cache.insert(key, result.clone());
+    }
+    Ok(std::borrow::Cow::Owned(result))
+}
+
+fn scope_at<'a>(scope: &'a OuterScope<'a>, level: usize) -> Option<&'a OuterScope<'a>> {
+    let mut current = Some(scope);
+    for _ in 0..level {
+        current = current?.parent;
+    }
+    current
+}
+
+pub(crate) fn eval_predicate(
+    ctx: &EvalContext,
+    expr: &Expr,
+    current: &[Value],
+) -> Result<TriBool, Error> {
+    Ok(TriBool::from_value(&eval_expr(ctx, expr, current)?))
 }
 
 fn expr_display(expr: &Expr) -> String {
@@ -355,7 +669,20 @@ fn resolve_column(ctx: &EvalContext, name: &str, current: &[Value]) -> Result<Va
             Err(format!("Column `{lowered}` is ambiguous; qualify it with a table name").into())
         }
         Some(index) => Ok(current.get(*index).cloned().unwrap_or(Value::Null)),
-        None => Err(format!("Column `{lowered}` not found").into()),
+        None => {
+            let mut scope = ctx.outer_scope;
+            while let Some(current_scope) = scope {
+                if let Some(index) = current_scope.columns.get(&lowered) {
+                    return Ok(current_scope
+                        .row
+                        .get(*index)
+                        .cloned()
+                        .unwrap_or(Value::Null));
+                }
+                scope = current_scope.parent;
+            }
+            Err(format!("Column `{lowered}` not found").into())
+        }
     }
 }
 
@@ -485,37 +812,22 @@ fn eval_logic(
     right: &Expr,
     current: &[Value],
 ) -> Result<Value, Error> {
-    let a = tri_bool(&eval_expr(ctx, left, current)?);
+    let a = eval_predicate(ctx, left, current)?;
     let short_circuited = match op {
-        BinaryOperator::And => a == Some(false),
-        BinaryOperator::Or => a == Some(true),
+        BinaryOperator::And => a == TriBool::False,
+        BinaryOperator::Or => a == TriBool::True,
         _ => unreachable!(),
     };
     if short_circuited {
         return Ok(Value::Bool(matches!(op, BinaryOperator::Or)));
     }
-    let b = tri_bool(&eval_expr(ctx, right, current)?);
-
-    match op {
-        BinaryOperator::And => Ok(match (a, b) {
-            (Some(false), _) | (_, Some(false)) => Value::Bool(false),
-            (Some(true), Some(true)) => Value::Bool(true),
-            _ => Value::Null,
-        }),
-        BinaryOperator::Or => Ok(match (a, b) {
-            (Some(true), _) | (_, Some(true)) => Value::Bool(true),
-            (Some(false), Some(false)) => Value::Bool(false),
-            _ => Value::Null,
-        }),
+    let b = eval_predicate(ctx, right, current)?;
+    Ok(match op {
+        BinaryOperator::And => a.and(b),
+        BinaryOperator::Or => a.or(b),
         _ => unreachable!(),
     }
-}
-
-fn tri_bool(value: &Value) -> Option<bool> {
-    match value {
-        Value::Null => None,
-        other => Some(other.truthy()),
-    }
+    .into_value())
 }
 
 fn eval_unary(op: &UnaryOperator, value: Value) -> Result<Value, Error> {
@@ -534,12 +846,7 @@ fn eval_unary(op: &UnaryOperator, value: Value) -> Result<Value, Error> {
                 other => Err(format!("Cannot negate `{other}`").into()),
             }
         }
-        UnaryOperator::Not => {
-            if value.is_null() {
-                return Ok(Value::Null);
-            }
-            Ok(Value::Bool(!value.truthy()))
-        }
+        UnaryOperator::Not => Ok(TriBool::from_value(&value).not().into_value()),
         other => Err(format!("Unsupported unary operator: {other}").into()),
     }
 }
@@ -587,15 +894,32 @@ fn eval_between(
     let low = eval_expr(ctx, low, current)?;
     let high = eval_expr(ctx, high, current)?;
 
-    let result = match (
-        values_partial_cmp(&value, &low),
-        values_partial_cmp(&value, &high),
-    ) {
-        (Some(a), Some(b)) => a != std::cmp::Ordering::Less && b != std::cmp::Ordering::Greater,
-        _ => false,
-    };
+    let lower = compare_predicate(&value, &low, |ordering| {
+        ordering != std::cmp::Ordering::Less
+    });
+    let upper = compare_predicate(&value, &high, |ordering| {
+        ordering != std::cmp::Ordering::Greater
+    });
+    let result = lower.and(upper);
+    Ok(if negated {
+        result.not().into_value()
+    } else {
+        result.into_value()
+    })
+}
 
-    Ok(Value::Bool(if negated { !result } else { result }))
+fn compare_predicate(
+    left: &Value,
+    right: &Value,
+    predicate: impl FnOnce(std::cmp::Ordering) -> bool,
+) -> TriBool {
+    if left.is_null() || right.is_null() {
+        return TriBool::Unknown;
+    }
+    match values_partial_cmp(left, right) {
+        Some(ordering) => TriBool::from_value(&Value::Bool(predicate(ordering))),
+        None => TriBool::Unknown,
+    }
 }
 
 fn eval_case(
@@ -840,6 +1164,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_assigns_subquery_ids_by_query_ast() {
+        let first = Parser::new(&MySqlDialect {})
+            .try_with_sql("SELECT 1")
+            .expect("valid query")
+            .parse_query()
+            .expect("valid query");
+        let second = Parser::new(&MySqlDialect {})
+            .try_with_sql("SELECT 2")
+            .expect("valid query")
+            .parse_query()
+            .expect("valid query");
+        let runtime = QueryRuntime::default();
+        assert_ne!(runtime.subquery_id(&first), runtime.subquery_id(&second));
+        assert_eq!(runtime.subquery_id(&first), runtime.subquery_id(&first));
+    }
+
+    #[test]
+    fn runtime_stats_are_read_through_one_snapshot() {
+        let runtime = QueryRuntime::default();
+        *runtime.correlated_cache_hits.lock().unwrap() = 3;
+        *runtime.correlated_cache_misses.lock().unwrap() = 2;
+        assert_eq!(
+            runtime.stats(),
+            RuntimeStats {
+                correlated_cache_hits: 3,
+                correlated_cache_misses: 2,
+            }
+        );
+    }
+
+    #[test]
     fn arithmetic() {
         assert_eq!(scalar("1 + 2"), Value::Int(3));
         assert_eq!(scalar("10 - 4"), Value::Int(6));
@@ -939,6 +1294,33 @@ mod tests {
     }
 
     #[test]
+    fn three_valued_logic_truth_tables() {
+        assert_eq!(scalar("NULL AND TRUE"), Value::Null);
+        assert_eq!(scalar("NULL AND FALSE"), Value::Bool(false));
+        assert_eq!(scalar("NULL OR TRUE"), Value::Bool(true));
+        assert_eq!(scalar("NULL OR FALSE"), Value::Null);
+        assert_eq!(scalar("NOT NULL"), Value::Null);
+    }
+
+    #[test]
+    fn correlated_scope_lookup_walks_parent_scopes() {
+        let columns = HashMap::from([(String::from("p.id"), 0usize)]);
+        let runtime = QueryRuntime::default();
+        let outer_row = vec![Value::Int(7)];
+        let outer = OuterScope {
+            row: &outer_row,
+            columns: &columns,
+            parent: None,
+            runtime: &runtime,
+        };
+        assert_eq!(
+            scope_at(&outer, 0).map(|scope| scope.row[0].clone()),
+            Some(Value::Int(7))
+        );
+        assert!(scope_at(&outer, 1).is_none());
+    }
+
+    #[test]
     fn string_operators() {
         assert_eq!(scalar("'SheetQL' LIKE '%QL'"), Value::Bool(true));
         assert_eq!(scalar("'SheetQL' LIKE '%missing%'"), Value::Bool(false));
@@ -963,10 +1345,9 @@ mod tests {
 
     #[test]
     fn between_null_semantics() {
-        // BETWEEN does not propagate NULL: a NULL bound compares via the
-        // sentinel ordering (NULL sorts first), yielding FALSE.
-        assert_eq!(scalar("5 BETWEEN 1 AND NULL"), Value::Bool(false));
-        assert_eq!(scalar("NULL BETWEEN 1 AND 5"), Value::Bool(false));
+        // SQL three-valued logic propagates UNKNOWN from a NULL operand.
+        assert_eq!(scalar("5 BETWEEN 1 AND NULL"), Value::Null);
+        assert_eq!(scalar("NULL BETWEEN 1 AND 5"), Value::Null);
     }
 
     #[test]

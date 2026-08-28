@@ -10,7 +10,7 @@ pub struct Table {
     pub rows: Vec<Vec<Value>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Database {
     pub name: String,
     pub tables: Vec<Table>,
@@ -50,7 +50,7 @@ impl Database {
 
 /// A collection of named databases (one per file), plus the currently
 /// selected database for unqualified table references.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Schema {
     pub databases: Vec<Database>,
     current: Option<String>,
@@ -161,8 +161,20 @@ impl Schema {
         }
     }
 
+    pub(crate) fn add_query_table(&mut self, table: Table) {
+        self.temporary.add_table(table);
+    }
+
     pub fn get_temporary_table(&self, name: &str) -> Option<&Table> {
         self.temporary.get_table(name)
+    }
+
+    pub(crate) fn get_temporary_table_mut(&mut self, name: &str) -> Option<&mut Table> {
+        self.temporary
+            .by_name
+            .get(name)
+            .copied()
+            .and_then(|index| self.temporary.tables.get_mut(index))
     }
 
     pub fn temporary_table_names(&self) -> Vec<&str> {

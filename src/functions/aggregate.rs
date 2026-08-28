@@ -236,13 +236,33 @@ fn eval_min_max(ctx: &EvalContext, args: &FnArgs, is_max: bool) -> Result<Value,
 /// Detect whether `expr` (transitively) contains an aggregate function call.
 /// Uses the sqlparser visitor so every expression kind is covered.
 pub fn contains_aggregate(expr: &Expr) -> bool {
-    struct AggregateCallDetector;
+    struct AggregateCallDetector {
+        query_depth: usize,
+    }
 
     impl Visitor for AggregateCallDetector {
         type Break = ();
 
+        fn pre_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<()> {
+            self.query_depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<()> {
+            self.query_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            if self.query_depth > 0 {
+                return ControlFlow::Continue(());
+            }
             if let Expr::Function(func) = expr {
+                // Window functions such as `SUM(x) OVER (...)` are not grouping
+                // aggregates; they are computed over the active rows instead.
+                if func.over.is_some() {
+                    return ControlFlow::Continue(());
+                }
                 let mut name = func.name.to_string();
                 name.make_ascii_lowercase();
                 if AGGREGATE_FUNCTIONS.contains(&name.as_str()) {
@@ -253,5 +273,6 @@ pub fn contains_aggregate(expr: &Expr) -> bool {
         }
     }
 
-    expr.visit(&mut AggregateCallDetector).is_break()
+    expr.visit(&mut AggregateCallDetector { query_depth: 0 })
+        .is_break()
 }

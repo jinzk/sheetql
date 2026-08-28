@@ -98,7 +98,14 @@ pub fn eval_function(
 ) -> Result<Value, Error> {
     let name = func.name.to_string().to_lowercase();
     if func.over.is_some() {
-        return Err(format!("Window function `{name}` is not supported yet").into());
+        // The value of a window function call is computed up front over the
+        // whole active row set; per-row evaluation just reads the precomputed
+        // value from the augmented row.
+        let key = Expr::Function(func.clone());
+        let value = ctx.window_value(&key, current).ok_or(format!(
+            "Window function `{name}` was not computed for this row"
+        ))?;
+        return Ok(value);
     }
     let args = parse_function_args(&func.args)?;
 
