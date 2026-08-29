@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn set_operations_validate_columns_and_reject_all() {
+    fn set_operations_validate_columns_and_support_union_all() {
         let mut schema = make_schema();
         let error = run_query(
             &mut schema,
@@ -1353,12 +1353,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("same number of columns"), "got: {error}");
-        let error = run_query(
+        let result = run_query(
             &mut schema,
             "SELECT city FROM people UNION ALL SELECT city FROM people",
         )
-        .unwrap_err();
-        assert!(error.contains("ALL"), "got: {error}");
+        .unwrap();
+        assert_eq!(result.rows.len(), 10);
+
+        for operator in ["INTERSECT", "EXCEPT"] {
+            let error = run_query(
+                &mut schema,
+                &format!("SELECT city FROM people {operator} ALL SELECT city FROM people"),
+            )
+            .unwrap_err();
+            assert!(error.contains("ALL"), "got: {error}");
+        }
     }
 
     #[test]

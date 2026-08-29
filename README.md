@@ -206,6 +206,7 @@ Edge cases:
 - `GROUP BY` with aggregate functions, and `HAVING`; both accept output column aliases (`HAVING cnt > 1`) and 1-based ordinals (`GROUP BY 1`)
 - `ORDER BY` with `ASC` / `DESC`, output column aliases (including inside larger expressions) and 1-based ordinals (`ORDER BY 2 DESC`)
 - `LIMIT` / `OFFSET` and `SELECT DISTINCT`
+- Set operations: `UNION` removes duplicate rows, while `UNION ALL` preserves them; `INTERSECT ALL` and `EXCEPT ALL` are not supported
 - Metadata commands: `SHOW DATABASES` (alias `SHOW SCHEMAS`), `SHOW TABLES [FROM <database>]`, `SHOW COLUMNS FROM <table>`, `DESCRIBE <table>`, `USE <database>`; `SHOW DATABASES` / `SHOW TABLES` support `LIKE '<pattern>'` with `%` / `_` wildcards
 - `CREATE TEMPORARY TABLE <name> AS SELECT ...` or `CREATE TEMPORARY TABLE <name> (<columns>)` creates an in-memory work table for the current session. Temporary tables support `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE TABLE`, and `DROP TEMPORARY TABLE`; they disappear when the process exits.
 

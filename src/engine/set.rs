@@ -14,6 +14,17 @@ use crate::value::{GroupKey, Value, group_key};
 
 pub(crate) type RowKey = Vec<GroupKey>;
 
+fn validate_set_quantifier(op: &SetOperator, quantifier: &SetQuantifier) -> Result<bool, Error> {
+    match quantifier {
+        SetQuantifier::None | SetQuantifier::Distinct => Ok(false),
+        SetQuantifier::All if matches!(op, SetOperator::Union) => Ok(true),
+        SetQuantifier::All => Err(format!("{op} ALL set operation is not supported").into()),
+        SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName => {
+            Err(format!("{op} named set quantifier is not supported").into())
+        }
+    }
+}
+
 pub(crate) fn execute_query(
     schema: &Schema,
     query: &sqlparser::ast::Query,
@@ -193,15 +204,10 @@ fn execute_set_expr(
             set_quantifier,
             right,
         } => {
-            if !matches!(
-                set_quantifier,
-                SetQuantifier::None | SetQuantifier::Distinct
-            ) {
-                return Err("ALL set quantifiers are not supported".into());
-            }
+            let preserve_duplicates = validate_set_quantifier(op, set_quantifier)?;
             let left = execute_set_expr(schema, left, runtime)?;
             let right = execute_set_expr(schema, right, runtime)?;
-            combine_set_results(left, right, op)
+            combine_set_results(left, right, op, preserve_duplicates)
         }
         _ => Err("Only SELECT set operations are supported".into()),
     }
@@ -215,6 +221,7 @@ pub(crate) fn combine_set_results(
     left: QueryResult,
     right: QueryResult,
     op: &SetOperator,
+    preserve_duplicates: bool,
 ) -> Result<QueryResult, Error> {
     let input_rows = left.stats.input_rows + right.stats.input_rows;
     let output = combine_set_outputs(
@@ -229,6 +236,7 @@ pub(crate) fn combine_set_results(
             input_rows: right.stats.input_rows,
         },
         op,
+        preserve_duplicates,
     )?;
     let output_rows = output.rows.len();
     let mut result = output.into_result();
@@ -241,6 +249,7 @@ pub(crate) fn combine_set_outputs(
     left: ExecutionOutput,
     right: ExecutionOutput,
     op: &SetOperator,
+    preserve_duplicates: bool,
 ) -> Result<ExecutionOutput, Error> {
     if left.columns.len() != right.columns.len() {
         return Err(
@@ -264,8 +273,10 @@ pub(crate) fn combine_set_outputs(
             .collect(),
         SetOperator::Minus => return Err("MINUS set operation is not supported".into()),
     };
-    let mut seen = HashSet::new();
-    rows.retain(|row| seen.insert(row_key(row)));
+    if !preserve_duplicates {
+        let mut seen = HashSet::new();
+        rows.retain(|row| seen.insert(row_key(row)));
+    }
     Ok(ExecutionOutput {
         columns: left.columns,
         rows,
@@ -301,7 +312,7 @@ mod tests {
             rows: vec![vec![Value::Int(2)]],
             input_rows: 1,
         };
-        let output = combine_set_outputs(left, right, &SetOperator::Union).unwrap();
+        let output = combine_set_outputs(left, right, &SetOperator::Union, false).unwrap();
         assert_eq!(output.rows.len(), 2);
         assert_eq!(output.columns, vec!["n"]);
     }
@@ -322,15 +333,17 @@ mod tests {
                 vec![Value::Int(2), Value::Text("c".into())],
             ],
         );
-        let union = combine_set_results(left.clone(), right.clone(), &SetOperator::Union).unwrap();
+        let union =
+            combine_set_results(left.clone(), right.clone(), &SetOperator::Union, false).unwrap();
         assert_eq!(union.rows.len(), 3);
         let intersection =
-            combine_set_results(left.clone(), right.clone(), &SetOperator::Intersect).unwrap();
+            combine_set_results(left.clone(), right.clone(), &SetOperator::Intersect, false)
+                .unwrap();
         assert_eq!(
             intersection.rows,
             vec![vec![Value::Int(1), Value::Text("b".into())]]
         );
-        let except = combine_set_results(left, right, &SetOperator::Except).unwrap();
+        let except = combine_set_results(left, right, &SetOperator::Except, false).unwrap();
         assert_eq!(
             except.rows,
             vec![vec![Value::Int(1), Value::Text("a".into())]]
@@ -346,13 +359,28 @@ mod tests {
     }
 
     #[test]
-    fn set_operation_rejects_different_column_counts_and_all() {
+    fn set_operation_rejects_different_column_counts() {
         let left = result(&["id"], vec![vec![Value::Int(1)]]);
         let right = result(
             &["id", "name"],
             vec![vec![Value::Int(1), Value::Text("a".into())]],
         );
-        assert!(combine_set_results(left.clone(), right, &SetOperator::Union).is_err());
-        assert!(matches!(SetQuantifier::All, SetQuantifier::All));
+        assert!(combine_set_results(left.clone(), right, &SetOperator::Union, false,).is_err());
+    }
+
+    #[test]
+    fn union_all_preserves_duplicate_rows() {
+        let left = result(&["id"], vec![vec![Value::Int(1)], vec![Value::Int(1)]]);
+        let right = result(&["id"], vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        let union = combine_set_results(left, right, &SetOperator::Union, true).unwrap();
+        assert_eq!(
+            union.rows,
+            vec![
+                vec![Value::Int(1)],
+                vec![Value::Int(1)],
+                vec![Value::Int(1)],
+                vec![Value::Int(2)],
+            ]
+        );
     }
 }
