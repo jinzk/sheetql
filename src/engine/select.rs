@@ -738,85 +738,6 @@ pub(crate) enum OrderSource {
     Expr(Box<Expr>),
 }
 
-#[allow(dead_code)]
-fn order_terms_legacy(
-    query: &Query,
-    plan: &[ProjectionItem],
-    aliases: &HashMap<String, &Expr>,
-) -> Result<Vec<OrderTerm>, Error> {
-    let Some(order) = &query.order_by else {
-        return Ok(vec![]);
-    };
-    let OrderByKind::Expressions(exprs) = &order.kind else {
-        return Err("ORDER BY ALL is not supported".to_string().into());
-    };
-    // Aliases take precedence in ORDER BY (MySQL behavior).
-    let rewriter = ExprRewriter::with_aliases(aliases, AliasPrecedence::AliasFirst, None);
-    let mut terms = Vec::with_capacity(exprs.len());
-    for order_expr in exprs {
-        let source = if let Some(ordinal) = ordinal_literal(&order_expr.expr) {
-            if ordinal > plan.len() {
-                return Err(
-                    format!("ORDER BY position {ordinal} is not in the select list").into(),
-                );
-            }
-            OrderSource::Ordinal(ordinal)
-        } else {
-            OrderSource::Expr(Box::new(rewriter.rewritten(&order_expr.expr)))
-        };
-        terms.push(OrderTerm {
-            source,
-            ascending: order_expr.options.asc.unwrap_or(true),
-        });
-    }
-    Ok(terms)
-}
-
-/// Compute the sort keys for one output row. Ordinals read straight from the
-/// projected values; expressions evaluate against the source row through the
-/// given context (which carries `group_rows` in aggregate queries).
-#[allow(dead_code)]
-fn order_keys_legacy(
-    terms: &[PlannedOrderTerm],
-    ctx: &EvalContext,
-    out: &[Value],
-    source_row: &[Value],
-    expr_plan: &ExprPlan,
-) -> Result<Vec<Value>, Error> {
-    let mut keys = Vec::with_capacity(terms.len());
-    for term in terms {
-        match &term.source {
-            PlannedOrderSource::Ordinal(position) => {
-                keys.push(out[position - 1].clone());
-            }
-            PlannedOrderSource::Expr(id) => {
-                keys.push(eval_expr(ctx, expr_plan.expression(*id), source_row)?);
-            }
-        }
-    }
-    Ok(keys)
-}
-
-#[allow(dead_code)]
-fn sort_planned_keyed_legacy(keyed: &mut [(Vec<Value>, Vec<Value>)], terms: &[PlannedOrderTerm]) {
-    keyed.sort_by(|a, b| compare_planned_keys(&a.0, &b.0, terms));
-}
-
-fn compare_planned_keys(left: &[Value], right: &[Value], terms: &[PlannedOrderTerm]) -> Ordering {
-    left.iter()
-        .zip(right)
-        .zip(terms)
-        .map(|((a, b), term)| {
-            let mut ordering = values_partial_cmp(a, b).unwrap_or(Ordering::Equal);
-            if !term.ascending {
-                ordering = ordering.reverse();
-            }
-            ordering
-        })
-        .find(|ordering| *ordering != Ordering::Equal)
-        .unwrap_or_else(|| left.len().cmp(&right.len()))
-}
-
 struct TopN {
     heap: BinaryHeap<TopNEntry>,
     capacity: usize,
@@ -954,5 +875,72 @@ pub(crate) fn representative_row<'a>(rows: &'a [Vec<Value>], group: &[usize]) ->
     match crate::engine::aggregate::representative_index(group) {
         Some(index) => rows[index].as_slice(),
         None => &[],
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    use sqlparser::ast::{LimitClause, Statement};
+    use sqlparser::dialect::MySqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn limit_clause(sql: &str) -> Option<LimitClause> {
+        let mut statements = Parser::parse_sql(&MySqlDialect {}, sql).expect("parse query");
+        let Statement::Query(query) = statements.remove(0) else {
+            panic!("not a query: {sql}");
+        };
+        query.limit_clause
+    }
+
+    fn scalar_expr(sql: &str) -> Expr {
+        Parser::new(&MySqlDialect {})
+            .try_with_sql(sql)
+            .expect("valid expression")
+            .parse_expr()
+            .expect("valid expression")
+    }
+
+    #[test]
+    fn parse_limit_defaults_to_none() {
+        assert_eq!(parse_limit(&None).unwrap(), (None, None));
+        assert_eq!(
+            parse_limit(&limit_clause("SELECT 1")).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn parse_limit_reads_limit_and_offset_forms() {
+        assert_eq!(
+            parse_limit(&limit_clause("SELECT 1 LIMIT 5")).unwrap(),
+            (Some(5), None)
+        );
+        assert_eq!(
+            parse_limit(&limit_clause("SELECT 1 LIMIT 5 OFFSET 2")).unwrap(),
+            (Some(5), Some(2))
+        );
+        // Offset-first and MySQL comma forms are normalized to (limit, offset).
+        assert_eq!(
+            parse_limit(&limit_clause("SELECT 1 OFFSET 2 LIMIT 5")).unwrap(),
+            (Some(5), Some(2))
+        );
+        assert_eq!(
+            parse_limit(&limit_clause("SELECT 1 LIMIT 5, 2")).unwrap(),
+            (Some(2), Some(5))
+        );
+    }
+
+    #[test]
+    fn eval_const_int_accepts_non_negative_integers() {
+        assert_eq!(eval_const_int(&scalar_expr("0"), "LIMIT").unwrap(), 0);
+        assert_eq!(eval_const_int(&scalar_expr("5"), "LIMIT").unwrap(), 5);
+    }
+
+    #[test]
+    fn eval_const_int_rejects_invalid_bounds() {
+        assert!(eval_const_int(&scalar_expr("-1"), "LIMIT").is_err());
+        assert!(eval_const_int(&scalar_expr("1.5"), "LIMIT").is_err());
+        assert!(eval_const_int(&scalar_expr("'x'"), "LIMIT").is_err());
     }
 }

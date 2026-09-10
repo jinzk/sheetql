@@ -466,3 +466,207 @@ impl App<'_> {
         lines
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::{Database, Table};
+    use crate::value::Value;
+
+    fn make_schema() -> Schema {
+        let mut schema = Schema::new();
+        let mut database = Database::named("test");
+        database.add_table(Table {
+            name: "people".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Value::Int(1), Value::Text("Alice".into())]],
+        });
+        schema.add_database(database);
+        schema.set_current_database("test").unwrap();
+        schema
+    }
+
+    fn make_app(schema: &mut Schema) -> App<'_> {
+        App {
+            cells: Vec::new(),
+            input: String::new(),
+            cursor: 0,
+            input_scroll: 0,
+            viewport_top: None,
+            last_top: 0,
+            candidates: Vec::new(),
+            candidate_cache: completion::CandidateCache::new(),
+            selected: 0,
+            show_popup: false,
+            history: Vec::new(),
+            history_index: None,
+            draft: String::new(),
+            rendered_lines: Vec::new(),
+            rendered_cells: 0,
+            schema,
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn popup_rect_opens_above_the_input_line_when_there_is_room() {
+        let area = Rect::new(0, 0, 100, 40);
+        let popup = popup_rect(area, 5, 30, 39);
+        assert_eq!(popup.x, 5);
+        assert_eq!(popup.y, 32);
+        assert_eq!(popup.width, 50);
+        assert_eq!(popup.height, 7);
+    }
+
+    #[test]
+    fn popup_rect_falls_below_the_cursor_when_no_room_above() {
+        let area = Rect::new(0, 0, 100, 40);
+        let popup = popup_rect(area, 5, 30, 0);
+        assert_eq!(popup.y, 1);
+    }
+
+    #[test]
+    fn popup_rect_clamps_horizontally_within_the_area() {
+        let area = Rect::new(0, 0, 100, 40);
+        // A cursor near the right edge right-aligns the popup.
+        let popup = popup_rect(area, 5, 95, 39);
+        assert_eq!(popup.x, 50);
+        // Candidate count caps the popup height at 10 rows.
+        let popup = popup_rect(area, 100, 30, 39);
+        assert_eq!(popup.height, 10);
+    }
+
+    #[test]
+    fn handle_key_types_and_backspaces_unicode_text() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        for c in ['a', 'é', '中'] {
+            assert!(!app.handle_key(key(KeyCode::Char(c))));
+        }
+        assert_eq!(app.input, "aé中");
+        assert_eq!(app.cursor, app.input.len());
+        assert!(!app.handle_key(key(KeyCode::Backspace)));
+        assert_eq!(app.input, "aé");
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn handle_key_enter_executes_query_clears_input_and_records_history() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        for c in "SELECT 1".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(!app.handle_key(key(KeyCode::Enter)));
+        assert_eq!(app.cells.len(), 1);
+        assert!(app.cells[0].result.is_ok());
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.history, vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn handle_key_exit_and_quit_return_true() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        for c in "exit".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.handle_key(key(KeyCode::Enter)));
+        let mut app = make_app(&mut schema);
+        for c in "quit".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.handle_key(key(KeyCode::Enter)));
+    }
+
+#[test]
+fn handle_key_escape_closes_the_popup_before_clearing_the_line() {
+    let mut schema = make_schema();
+    let mut app = make_app(&mut schema);
+    // A partial keyword opens the completion popup; Esc closes it and leaves
+    // the input untouched.
+    app.input = "SEL".to_string();
+    app.cursor = 3;
+    app.refresh_candidates();
+    assert!(app.show_popup);
+    app.handle_key(key(KeyCode::Esc));
+    assert!(!app.show_popup);
+    assert_eq!(app.input, "SEL");
+
+    // With no popup, Esc clears the line.
+    app.handle_key(key(KeyCode::Esc));
+    assert!(app.input.is_empty());
+    assert_eq!(app.cursor, 0);
+}
+
+    #[test]
+    fn history_navigation_saves_a_draft_and_restores_it() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        for c in "SELECT 1".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        // Up restores the entry into the input line.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.input, "SELECT 1");
+        // Down returns to the empty draft.
+        app.handle_key(key(KeyCode::Down));
+        assert!(app.input.is_empty());
+        assert_eq!(app.history_index, None);
+    }
+
+    #[test]
+    fn history_prev_does_nothing_when_there_is_no_history() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        app.handle_key(key(KeyCode::Up));
+        assert!(app.input.is_empty());
+        assert_eq!(app.history_index, None);
+    }
+
+    #[test]
+    fn execute_dedupes_consecutive_history_entries() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        for _ in 0..2 {
+            for c in "SELECT 1".chars() {
+                app.handle_key(key(KeyCode::Char(c)));
+            }
+            app.handle_key(key(KeyCode::Enter));
+        }
+        assert_eq!(app.history, vec!["SELECT 1"]);
+    }
+
+    #[test]
+    fn scroll_uses_last_top_as_fallback_and_clamps_at_zero() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        app.last_top = 10;
+        app.scroll(3);
+        assert_eq!(app.viewport_top, Some(13));
+        app.scroll(-5);
+        assert_eq!(app.viewport_top, Some(8));
+        app.scroll(-100);
+        assert_eq!(app.viewport_top, Some(0));
+    }
+
+    #[test]
+    fn adjust_input_scroll_keeps_the_cursor_visible() {
+        let mut schema = make_schema();
+        let mut app = make_app(&mut schema);
+        for c in "abcdefghijklmnopqrstuvwxyz".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.adjust_input_scroll("sheetql> ", 20);
+        assert_eq!(app.input_scroll, 16);
+        // Moving to the start scrolls the prompt back into view.
+        app.handle_key(key(KeyCode::Home));
+        app.adjust_input_scroll("sheetql> ", 20);
+        assert_eq!(app.input_scroll, 9);
+    }
+}

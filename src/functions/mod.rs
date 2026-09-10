@@ -14,6 +14,7 @@ use crate::evaluator::eval_expr;
 use crate::value::Value;
 
 pub use aggregate::{AGGREGATE_FUNCTIONS, contains_aggregate};
+pub(crate) use aggregate::min_max;
 
 pub(crate) use math::floor_ceil;
 pub(crate) use string::substring;

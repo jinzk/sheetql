@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use chrono::{DateTime, Local};
 use sqlparser::ast::{
@@ -10,83 +9,27 @@ use sqlparser::ast::{
 
 use crate::error::Error;
 use crate::functions::{eval_function, floor_ceil};
-use crate::value::GroupKey;
+use crate::value::values_eq;
+use crate::value::values_partial_cmp;
 use crate::value::Value;
-use crate::value::group_key;
 
-#[derive(Debug, Clone, Default)]
-pub struct AggregateSummary {
-    pub count: i64,
-    pub distinct_count: i64,
-    pub numeric_count: usize,
-    pub is_float: bool,
-    pub sum_int: Option<i64>,
-    pub sum_int_overflow: bool,
-    pub sum_float: f64,
-    pub distinct_numeric_count: usize,
-    pub distinct_is_float: bool,
-    pub distinct_sum_int: Option<i64>,
-    pub distinct_sum_int_overflow: bool,
-    pub distinct_sum_float: f64,
-    pub distinct: std::collections::HashSet<GroupKey>,
-    pub non_numeric: Option<Value>,
-}
+mod aggregate;
+mod like;
+mod runtime;
+mod trivalue;
+
+pub use aggregate::AggregateSummary;
+pub(crate) use aggregate::GroupState;
+pub use like::like_match;
+pub(crate) use runtime::{
+    CorrelationExpr, OuterScope, QueryRuntime, SubqueryExecutor, SubqueryResult,
+};
+use like::like_values;
+use runtime::{scalar_subquery, subquery_result};
+use trivalue::TriBool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ExprId(pub(crate) usize);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TriBool {
-    True,
-    False,
-    Unknown,
-}
-
-impl TriBool {
-    fn from_value(value: &Value) -> Self {
-        if value.is_null() {
-            Self::Unknown
-        } else if value.truthy() {
-            Self::True
-        } else {
-            Self::False
-        }
-    }
-
-    fn into_value(self) -> Value {
-        match self {
-            Self::True => Value::Bool(true),
-            Self::False => Value::Bool(false),
-            Self::Unknown => Value::Null,
-        }
-    }
-
-    fn not(self) -> Self {
-        match self {
-            Self::True => Self::False,
-            Self::False => Self::True,
-            Self::Unknown => Self::Unknown,
-        }
-    }
-
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::False, _) | (_, Self::False) => Self::False,
-            (Self::True, Self::True) => Self::True,
-            _ => Self::Unknown,
-        }
-    }
-
-    fn or(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::True, _) | (_, Self::True) => Self::True,
-            (Self::False, Self::False) => Self::False,
-            _ => Self::Unknown,
-        }
-    }
-}
-use crate::value::values_eq;
-use crate::value::values_partial_cmp;
 
 pub struct EvalContext<'a> {
     pub columns: &'a HashMap<String, usize>,
@@ -118,95 +61,6 @@ static EMPTY_SUBQUERIES: std::sync::OnceLock<HashMap<sqlparser::ast::Query, Subq
     std::sync::OnceLock::new();
 static SCALAR_RUNTIME: std::sync::OnceLock<QueryRuntime> = std::sync::OnceLock::new();
 pub(crate) type ExprIds = HashMap<Expr, ExprId>;
-
-#[derive(Debug, Default)]
-pub(crate) struct GroupState {
-    pub(crate) argument_values: HashMap<ExprId, Arc<[Value]>>,
-    pub(crate) summaries: HashMap<ExprId, AggregateSummary>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SubqueryResult {
-    pub(crate) columns: Vec<String>,
-    pub(crate) rows: Vec<Vec<Value>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CorrelatedCacheKey {
-    pub(crate) subquery: SubqueryId,
-    pub(crate) outer_values: Vec<GroupKey>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct CorrelationExpr {
-    pub(crate) scope_level: usize,
-    pub(crate) outer_column: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct SubqueryId(pub(crate) usize);
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RuntimeStats {
-    pub(crate) correlated_cache_hits: usize,
-    pub(crate) correlated_cache_misses: usize,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct QueryRuntime {
-    pub(crate) correlated_cache: std::sync::Mutex<HashMap<CorrelatedCacheKey, SubqueryResult>>,
-    pub(crate) correlated_cache_hits: std::sync::Mutex<usize>,
-    pub(crate) correlated_cache_misses: std::sync::Mutex<usize>,
-    pub(crate) subquery_ids: std::sync::Mutex<HashMap<sqlparser::ast::Query, SubqueryId>>,
-    pub(crate) correlations: std::sync::Mutex<HashMap<SubqueryId, Arc<[CorrelationExpr]>>>,
-}
-
-impl QueryRuntime {
-    pub(crate) fn stats(&self) -> RuntimeStats {
-        RuntimeStats {
-            correlated_cache_hits: *self.correlated_cache_hits.lock().unwrap(),
-            correlated_cache_misses: *self.correlated_cache_misses.lock().unwrap(),
-        }
-    }
-
-    pub(crate) fn subquery_id(&self, query: &sqlparser::ast::Query) -> SubqueryId {
-        let mut ids = self.subquery_ids.lock().unwrap();
-        if let Some(id) = ids.get(query).copied() {
-            return id;
-        }
-        let id = SubqueryId(ids.len());
-        ids.insert(query.clone(), id);
-        id
-    }
-
-    pub(crate) fn register_correlations(
-        &self,
-        subquery: SubqueryId,
-        correlations: Vec<CorrelationExpr>,
-    ) {
-        self.correlations
-            .lock()
-            .unwrap()
-            .insert(subquery, correlations.into());
-    }
-}
-
-pub(crate) const MAX_CORRELATED_SUBQUERY_CACHE_ENTRIES: usize = 100_000;
-
-pub(crate) struct OuterScope<'a> {
-    pub(crate) row: &'a [Value],
-    pub(crate) columns: &'a HashMap<String, usize>,
-    pub(crate) parent: Option<&'a OuterScope<'a>>,
-    pub(crate) runtime: &'a QueryRuntime,
-}
-
-pub(crate) trait SubqueryExecutor {
-    fn execute(
-        &self,
-        query: &sqlparser::ast::Query,
-        scope: &OuterScope<'_>,
-    ) -> Result<SubqueryResult, Error>;
-}
 
 impl<'a> EvalContext<'a> {
     pub(crate) fn expr_id(&self, expr: &Expr) -> ExprId {
@@ -499,77 +353,6 @@ pub fn eval_expr(ctx: &EvalContext, expr: &Expr, current: &[Value]) -> Result<Va
         }
         other => Err(format!("Unsupported expression: {}", expr_display(other)).into()),
     }
-}
-
-fn scalar_subquery(ctx: &EvalContext, query: &sqlparser::ast::Query) -> Result<Value, Error> {
-    let result = subquery_result(ctx, query)?;
-    if result.columns.len() != 1 {
-        return Err("Scalar subquery must return exactly one column".into());
-    }
-    match result.rows.as_slice() {
-        [] => Ok(Value::Null),
-        [row] => Ok(row.first().cloned().unwrap_or(Value::Null)),
-        _ => Err("Scalar subquery must return at most one row".into()),
-    }
-}
-
-fn subquery_result<'a>(
-    ctx: &'a EvalContext<'a>,
-    query: &sqlparser::ast::Query,
-) -> Result<std::borrow::Cow<'a, SubqueryResult>, Error> {
-    if let Some(result) = ctx.subqueries.get(query) {
-        return Ok(std::borrow::Cow::Borrowed(result));
-    }
-    let executor = ctx.subquery_executor.ok_or("Subquery was not prepared")?;
-    let scope = ctx
-        .outer_scope
-        .ok_or("Correlated subquery requires an outer row")?;
-    let subquery = ctx.runtime.subquery_id(query);
-    let correlations = ctx
-        .runtime
-        .correlations
-        .lock()
-        .unwrap()
-        .get(&subquery)
-        .cloned()
-        .unwrap_or_default();
-    // An empty dependency list means the correlation analyzer could not prove
-    // which outer values affect the subquery. Never cache such a result: using
-    // one shared entry would be incorrect for different outer rows.
-    if correlations.is_empty() {
-        return Ok(std::borrow::Cow::Owned(executor.execute(query, scope)?));
-    }
-    let outer_values = correlations
-        .iter()
-        .filter_map(|correlation| {
-            scope_at(scope, correlation.scope_level)
-                .and_then(|scope| scope.row.get(correlation.outer_column))
-        })
-        .map(group_key)
-        .collect();
-    let key = CorrelatedCacheKey {
-        subquery,
-        outer_values,
-    };
-    if let Some(result) = ctx.runtime.correlated_cache.lock().unwrap().get(&key) {
-        *ctx.runtime.correlated_cache_hits.lock().unwrap() += 1;
-        return Ok(std::borrow::Cow::Owned(result.clone()));
-    }
-    *ctx.runtime.correlated_cache_misses.lock().unwrap() += 1;
-    let result = executor.execute(query, scope)?;
-    let mut cache = ctx.runtime.correlated_cache.lock().unwrap();
-    if cache.len() < MAX_CORRELATED_SUBQUERY_CACHE_ENTRIES {
-        cache.insert(key, result.clone());
-    }
-    Ok(std::borrow::Cow::Owned(result))
-}
-
-fn scope_at<'a>(scope: &'a OuterScope<'a>, level: usize) -> Option<&'a OuterScope<'a>> {
-    let mut current = Some(scope);
-    for _ in 0..level {
-        current = current?.parent;
-    }
-    current
 }
 
 pub(crate) fn eval_predicate(
@@ -976,95 +759,6 @@ fn trim_string(value: &str, side: TrimWhereField, what: Option<&str>) -> String 
     }
 }
 
-fn like_values(
-    value: &Value,
-    pattern: &Value,
-    case_insensitive: bool,
-    escape: Option<char>,
-) -> Result<bool, Error> {
-    if value.is_null() || pattern.is_null() {
-        return Ok(false);
-    }
-    let text = value.to_display_string();
-    let pattern_text = pattern.to_display_string();
-    Ok(like_match(&text, &pattern_text, case_insensitive, escape))
-}
-
-pub fn like_match(text: &str, pattern: &str, case_insensitive: bool, escape: Option<char>) -> bool {
-    let text: Vec<char> = if case_insensitive {
-        text.to_lowercase().chars().collect()
-    } else {
-        text.chars().collect()
-    };
-    let pattern_norm: String = if case_insensitive {
-        pattern.to_lowercase()
-    } else {
-        pattern.to_string()
-    };
-
-    enum Token {
-        Percent,
-        Underscore,
-        Literal(char),
-    }
-
-    let mut tokens: Vec<Token> = Vec::new();
-    let mut chars = pattern_norm.chars().peekable();
-    while let Some(c) = chars.next() {
-        if Some(c) == escape {
-            if let Some(next) = chars.next() {
-                tokens.push(Token::Literal(next));
-            }
-            // A trailing escape character with nothing after it is ignored.
-        } else if c == '%' {
-            tokens.push(Token::Percent);
-        } else if c == '_' {
-            tokens.push(Token::Underscore);
-        } else {
-            tokens.push(Token::Literal(c));
-        }
-    }
-
-    let n = tokens.len();
-
-    // Fast path: a pattern with no wildcards is a plain equality check
-    // (LIKE is anchored on both ends).
-    if n > 0
-        && tokens
-            .iter()
-            .all(|token| matches!(token, Token::Literal(_)))
-    {
-        return text.iter().eq(tokens.iter().map(|token| match token {
-            Token::Literal(c) => c,
-            _ => unreachable!("checked above"),
-        }));
-    }
-
-    // Rolling two-row DP: O(n) memory instead of O(text_len * n).
-    let mut prev = vec![false; n + 1];
-    let mut curr = vec![false; n + 1];
-    prev[0] = true;
-    for j in 0..n {
-        if matches!(tokens[j], Token::Percent) {
-            prev[j + 1] = prev[j];
-        }
-    }
-
-    for &text_char in &text {
-        curr[0] = false;
-        for j in 0..n {
-            match tokens[j] {
-                Token::Percent => curr[j + 1] = curr[j] || prev[j + 1],
-                Token::Underscore => curr[j + 1] = prev[j],
-                Token::Literal(ch) => curr[j + 1] = prev[j] && text_char == ch,
-            }
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-
-    prev[n]
-}
-
 fn cast_value(value: Value, data_type: &SqlDataType) -> Result<Value, Error> {
     match data_type {
         SqlDataType::Int(_)
@@ -1161,37 +855,6 @@ mod tests {
 
     fn scalar_result(expr: &str) -> Result<Value, Error> {
         eval_expr(&EvalContext::scalar(), &parse_expr(expr), &[])
-    }
-
-    #[test]
-    fn runtime_assigns_subquery_ids_by_query_ast() {
-        let first = Parser::new(&MySqlDialect {})
-            .try_with_sql("SELECT 1")
-            .expect("valid query")
-            .parse_query()
-            .expect("valid query");
-        let second = Parser::new(&MySqlDialect {})
-            .try_with_sql("SELECT 2")
-            .expect("valid query")
-            .parse_query()
-            .expect("valid query");
-        let runtime = QueryRuntime::default();
-        assert_ne!(runtime.subquery_id(&first), runtime.subquery_id(&second));
-        assert_eq!(runtime.subquery_id(&first), runtime.subquery_id(&first));
-    }
-
-    #[test]
-    fn runtime_stats_are_read_through_one_snapshot() {
-        let runtime = QueryRuntime::default();
-        *runtime.correlated_cache_hits.lock().unwrap() = 3;
-        *runtime.correlated_cache_misses.lock().unwrap() = 2;
-        assert_eq!(
-            runtime.stats(),
-            RuntimeStats {
-                correlated_cache_hits: 3,
-                correlated_cache_misses: 2,
-            }
-        );
     }
 
     #[test]
@@ -1303,24 +966,6 @@ mod tests {
     }
 
     #[test]
-    fn correlated_scope_lookup_walks_parent_scopes() {
-        let columns = HashMap::from([(String::from("p.id"), 0usize)]);
-        let runtime = QueryRuntime::default();
-        let outer_row = vec![Value::Int(7)];
-        let outer = OuterScope {
-            row: &outer_row,
-            columns: &columns,
-            parent: None,
-            runtime: &runtime,
-        };
-        assert_eq!(
-            scope_at(&outer, 0).map(|scope| scope.row[0].clone()),
-            Some(Value::Int(7))
-        );
-        assert!(scope_at(&outer, 1).is_none());
-    }
-
-    #[test]
     fn string_operators() {
         assert_eq!(scalar("'SheetQL' LIKE '%QL'"), Value::Bool(true));
         assert_eq!(scalar("'SheetQL' LIKE '%missing%'"), Value::Bool(false));
@@ -1368,6 +1013,28 @@ mod tests {
         assert_eq!(scalar("CAST('42' AS INTEGER)"), Value::Int(42));
         assert_eq!(scalar("CAST(3.5 AS TEXT)"), Value::Text("3.5".to_string()));
         assert_eq!(scalar("CAST('true' AS BOOLEAN)"), Value::Bool(true));
+    }
+
+    #[test]
+    fn cast_truncates_floats_and_round_trips_values() {
+        // Floats truncate toward zero when cast to an integer.
+        assert_eq!(scalar("CAST(3.7 AS INTEGER)"), Value::Int(3));
+        assert_eq!(scalar("CAST(-3.7 AS INTEGER)"), Value::Int(-3));
+        // Numeric-to-float and numeric-to-text casts.
+        assert_eq!(scalar("CAST(2 AS FLOAT)"), Value::Float(2.0));
+        assert_eq!(scalar("CAST('3.7' AS FLOAT)"), Value::Float(3.7));
+        assert_eq!(scalar("CAST(1 AS TEXT)"), Value::Text("1".to_string()));
+        assert_eq!(scalar("CAST(TRUE AS TEXT)"), Value::Text("true".to_string()));
+    }
+
+    #[test]
+    fn cast_rejects_invalid_inputs_and_targets() {
+        assert!(scalar_result("CAST('abc' AS INTEGER)").is_err());
+        assert!(scalar_result("CAST('abc' AS FLOAT)").is_err());
+        assert!(scalar_result("CAST('maybe' AS BOOLEAN)").is_err());
+        assert!(scalar_result("CAST(1 AS DATE)").is_err());
+        // A NULL input is not currently coerced to a typed NULL.
+        assert!(scalar_result("CAST(NULL AS INTEGER)").is_err());
     }
 
     #[test]

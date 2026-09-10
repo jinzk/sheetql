@@ -6,8 +6,9 @@ use sqlparser::ast::{Expr, OrderByExpr, Visit, Visitor, WindowType};
 
 use crate::error::Error;
 use crate::evaluator::eval_expr;
-use crate::evaluator::{EvalContext, QueryRuntime};
+use crate::evaluator::{AggregateSummary, EvalContext, QueryRuntime};
 use crate::functions::AGGREGATE_FUNCTIONS;
+use crate::functions::min_max;
 use crate::functions::parse_function_args;
 use crate::value::Value;
 use crate::value::group_key;
@@ -401,85 +402,66 @@ fn evaluate_aggregate(
 }
 
 fn aggregate_values(name: &str, values: &[Value], distinct: bool) -> Result<Value, Error> {
-    let mut count = 0i64;
-    let mut numeric_count = 0usize;
-    let mut sum_int: Option<i64> = None;
-    let mut sum_int_overflow = false;
-    let mut sum_float = 0.0;
-    let mut is_float = false;
-    let mut distinct_set: std::collections::HashSet<crate::value::GroupKey> =
-        std::collections::HashSet::new();
-    let mut non_numeric: Option<Value> = None;
-    for value in values.iter().filter(|value| !value.is_null()) {
-        count += 1;
-        distinct_set.insert(group_key(value));
-        let is_nan = matches!(value, Value::Float(n) if n.is_nan());
-        if matches!(value, Value::Int(_) | Value::Float(_)) && !is_nan {
-            numeric_count += 1;
-            is_float = is_float || matches!(value, Value::Float(_));
-            sum_float += value.as_f64().unwrap_or(0.0);
-            if let Value::Int(n) = value {
-                sum_int = Some(match sum_int.unwrap_or(0).checked_add(*n) {
-                    Some(sum) => sum,
-                    None => {
-                        sum_int_overflow = true;
-                        0
-                    }
-                });
-            }
-        } else if !is_nan && non_numeric.is_none() {
-            non_numeric = Some(value.clone());
-        }
-    }
-    let distinct_count = distinct_set.len() as i64;
+    // Reuse the shared summary so window aggregates keep identical COUNT/SUM/
+    // AVG semantics (distinct, NaN, integer overflow) to grouped aggregates.
+    let summary = AggregateSummary::from_values(values.iter());
     let effective_numeric = if distinct {
-        distinct_count as usize
+        summary.distinct_numeric_count
     } else {
-        numeric_count
+        summary.numeric_count
     };
     match name {
-        "count" => Ok(Value::Int(if distinct { distinct_count } else { count })),
+        "count" => Ok(Value::Int(if distinct { summary.distinct_count } else { summary.count })),
         "sum" => {
-            if let Some(value) = non_numeric {
+            if let Some(value) = summary.non_numeric {
                 return Err(format!("Aggregate expects numeric values, got `{value}`").into());
             }
             if effective_numeric == 0 {
                 return Ok(Value::Null);
             }
-            if is_float {
-                Ok(Value::Float(sum_float))
-            } else if sum_int_overflow {
-                Err("Integer overflow in SUM".into())
+            let is_float = if distinct {
+                summary.distinct_is_float
             } else {
-                Ok(Value::Int(sum_int.unwrap_or(0)))
+                summary.is_float
+            };
+            if !is_float
+                && if distinct {
+                    summary.distinct_sum_int_overflow
+                } else {
+                    summary.sum_int_overflow
+                }
+            {
+                return Err("Integer overflow in SUM".into());
+            }
+            if is_float {
+                Ok(Value::Float(if distinct {
+                    summary.distinct_sum_float
+                } else {
+                    summary.sum_float
+                }))
+            } else {
+                Ok(Value::Int(if distinct {
+                    summary.distinct_sum_int.unwrap_or(0)
+                } else {
+                    summary.sum_int.unwrap_or(0)
+                }))
             }
         }
         "avg" => {
-            if let Some(value) = non_numeric {
+            if let Some(value) = summary.non_numeric {
                 return Err(format!("Aggregate expects numeric values, got `{value}`").into());
             }
             if effective_numeric == 0 {
                 return Ok(Value::Null);
             }
-            Ok(Value::Float(sum_float / effective_numeric as f64))
+            let sum = if distinct {
+                summary.distinct_sum_float
+            } else {
+                summary.sum_float
+            };
+            Ok(Value::Float(sum / effective_numeric as f64))
         }
-        "min" | "max" => {
-            let mut best: Option<Value> = None;
-            for value in values.iter().filter(|value| !value.is_null()) {
-                best = match best {
-                    None => Some(value.clone()),
-                    Some(current) => {
-                        let ordering = values_partial_cmp(value, &current);
-                        match ordering {
-                            Some(Ordering::Less) if name == "min" => Some(value.clone()),
-                            Some(Ordering::Greater) if name == "max" => Some(value.clone()),
-                            _ => Some(current),
-                        }
-                    }
-                };
-            }
-            Ok(best.unwrap_or(Value::Null))
-        }
+        "min" | "max" => Ok(min_max(values, name == "max")),
         _ => Err(format!("Unknown window aggregate `{name}`").into()),
     }
 }

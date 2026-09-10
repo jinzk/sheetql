@@ -9,7 +9,6 @@ use crate::evaluator::{AggregateSummary, EvalContext};
 use crate::functions::FnArgs;
 use crate::functions::require_arity_len;
 use crate::value::Value;
-use crate::value::group_key;
 use crate::value::values_partial_cmp;
 
 pub const AGGREGATE_FUNCTIONS: [&str; 5] = ["count", "sum", "avg", "min", "max"];
@@ -65,54 +64,7 @@ fn cached_summary(ctx: &EvalContext, expr: &Expr) -> Result<AggregateSummary, Er
     if let Some(summary) = state.borrow().summaries.get(&key) {
         return Ok(summary.clone());
     }
-    let mut summary = AggregateSummary::default();
-    for value in cached_argument_values(ctx, expr)?.iter() {
-        if value.is_null() {
-            continue;
-        }
-        summary.count += 1;
-        let is_new_distinct = summary.distinct.insert(group_key(value));
-        let is_nan = matches!(value, Value::Float(number) if number.is_nan());
-        if let Value::Float(_) = value
-            && !is_nan
-        {
-            summary.is_float = true;
-        }
-        if matches!(value, Value::Int(_) | Value::Float(_)) && !is_nan {
-            summary.numeric_count += 1;
-            summary.sum_float += value.as_f64().unwrap_or(0.0);
-            if let Value::Int(number) = value {
-                summary.sum_int = Some(match summary.sum_int.unwrap_or(0).checked_add(*number) {
-                    Some(sum) => sum,
-                    None => {
-                        summary.sum_int_overflow = true;
-                        0
-                    }
-                });
-            }
-            if is_new_distinct {
-                summary.distinct_numeric_count += 1;
-                if let Value::Float(_) = value {
-                    summary.distinct_is_float = true;
-                }
-                summary.distinct_sum_float += value.as_f64().unwrap_or(0.0);
-                if let Value::Int(number) = value {
-                    summary.distinct_sum_int = Some(
-                        match summary.distinct_sum_int.unwrap_or(0).checked_add(*number) {
-                            Some(sum) => sum,
-                            None => {
-                                summary.distinct_sum_int_overflow = true;
-                                0
-                            }
-                        },
-                    );
-                }
-            }
-        } else if !is_nan && summary.non_numeric.is_none() {
-            summary.non_numeric = Some(value.clone());
-        }
-    }
-    summary.distinct_count = summary.distinct.len() as i64;
+    let summary = AggregateSummary::from_values(cached_argument_values(ctx, expr)?.iter());
     state.borrow_mut().summaries.insert(key, summary.clone());
     Ok(summary)
 }
@@ -213,11 +165,15 @@ fn eval_min_max(ctx: &EvalContext, args: &FnArgs, is_max: bool) -> Result<Value,
     };
     // Keep MIN/MAX on the value cache: unlike numeric aggregates, their
     // ordering semantics include mixed temporal/text values and NaN handling.
+    Ok(min_max(&cached_argument_values(ctx, expr)?, is_max))
+}
+
+/// Compute MIN/MAX over a set of values, preserving the ordering semantics
+/// (mixed temporal/text values and NaN handling) used by both grouped and
+/// window aggregates.
+pub(crate) fn min_max(values: &[Value], is_max: bool) -> Value {
     let mut best: Option<Value> = None;
-    for value in cached_argument_values(ctx, expr)?.iter() {
-        if value.is_null() {
-            continue;
-        }
+    for value in values.iter().filter(|value| !value.is_null()) {
         best = match best {
             None => Some(value.clone()),
             Some(current) => {
@@ -230,7 +186,7 @@ fn eval_min_max(ctx: &EvalContext, args: &FnArgs, is_max: bool) -> Result<Value,
             }
         };
     }
-    Ok(best.unwrap_or(Value::Null))
+    best.unwrap_or(Value::Null)
 }
 
 /// Detect whether `expr` (transitively) contains an aggregate function call.
@@ -275,4 +231,71 @@ pub fn contains_aggregate(expr: &Expr) -> bool {
 
     expr.visit(&mut AggregateCallDetector { query_depth: 0 })
         .is_break()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_max_selects_extremes() {
+        let items = vec![Value::Int(3), Value::Int(1), Value::Int(2)];
+        assert_eq!(min_max(&items, false), Value::Int(1));
+        assert_eq!(min_max(&items, true), Value::Int(3));
+    }
+
+    #[test]
+    fn min_max_ignores_null_values() {
+        let items = vec![Value::Null, Value::Int(3), Value::Null, Value::Int(1)];
+        assert_eq!(min_max(&items, false), Value::Int(1));
+        assert_eq!(min_max(&items, true), Value::Int(3));
+    }
+
+    #[test]
+    fn min_max_empty_or_all_null_returns_null() {
+        assert_eq!(min_max(&[], false), Value::Null);
+        assert_eq!(min_max(&[], true), Value::Null);
+        let all_null = vec![Value::Null, Value::Null];
+        assert_eq!(min_max(&all_null, false), Value::Null);
+        assert_eq!(min_max(&all_null, true), Value::Null);
+    }
+
+    #[test]
+    fn min_max_orders_text() {
+        let items = vec![
+            Value::Text("b".into()),
+            Value::Text("a".into()),
+            Value::Text("c".into()),
+        ];
+        assert_eq!(min_max(&items, false), Value::Text("a".into()));
+        assert_eq!(min_max(&items, true), Value::Text("c".into()));
+    }
+
+    #[test]
+    fn min_max_compares_across_int_and_float() {
+        let items = vec![Value::Int(1), Value::Float(2.5), Value::Int(0)];
+        assert_eq!(min_max(&items, false), Value::Int(0));
+        assert_eq!(min_max(&items, true), Value::Float(2.5));
+    }
+
+    #[test]
+    fn min_max_keeps_first_value_on_ties() {
+        let items = vec![Value::Float(1.0), Value::Int(1)];
+        assert_eq!(min_max(&items, false), Value::Float(1.0));
+        assert_eq!(min_max(&items, true), Value::Float(1.0));
+    }
+
+    #[test]
+    fn min_max_skips_nan_unless_it_is_already_best() {
+        // NaN yields no ordering in partial_cmp, so a later NaN cannot replace
+        // an existing best, while a NaN seen first stays.
+        let items = vec![Value::Float(3.0), Value::Float(f64::NAN), Value::Float(1.0)];
+        assert_eq!(min_max(&items, false), Value::Float(1.0));
+        assert_eq!(min_max(&items, true), Value::Float(3.0));
+        let leading_nan = vec![Value::Float(f64::NAN), Value::Float(1.0)];
+        assert!(matches!(
+            min_max(&leading_nan, false),
+            Value::Float(n) if n.is_nan()
+        ));
+    }
 }
